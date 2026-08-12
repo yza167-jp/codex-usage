@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.3 — 2026-08-12
+
+- Capped wide-terminal rendering to a stable 144-cell report column, matching the canonical `...ROTATE warnings.` status note.
+- Kept the right side intentionally blank on very wide/full-screen terminals instead of stretching session titles indefinitely.
+- Aligned the rightmost `SESSION%` edge across credit components, main/subagent, model, and agent detail tables.
+- Extended detail separators to the same report boundary for a consistent visual frame.
+- No changes to credit estimation, session attribution, rate cards, or the incremental-cache schema.
+
 ## 1.4.2 — 2026-08-12
 
 - Fixed CJK / East Asian wide-character alignment in summary and detail tables by measuring terminal cells instead of Python string length.

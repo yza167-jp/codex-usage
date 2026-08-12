@@ -64,13 +64,20 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 RATE_CARD_AS_OF = "2026-08-12"
 CACHE_SCHEMA_VERSION = 2
 TREND_MINUTES = 60
 ACTIVE_MINUTES = 15
 RECENT_MINUTES = 60
 FULL_DISCOVERY_INTERVAL_S = 15 * 60
+STATUS_NOTE = (
+    "  STATUS is actionable only for live reports: ACTIVE/RECENT + OK/WATCH/ROTATE; "
+    "old threads become IDLE instead of showing stale ROTATE warnings."
+)
+# A wide terminal should still render as a readable left-hand report column.
+# This cap intentionally matches the canonical STATUS note above.
+REPORT_MAX_WIDTH = len(STATUS_NOTE)
 
 # Official Codex ChatGPT credit rate card, credits per 1M tokens.
 # Updated for the GPT-5.6-era rate card current at script creation.
@@ -1712,6 +1719,27 @@ def pad_display(s: str, width: int, right: bool = False) -> str:
     return spaces + clipped if right else clipped + spaces
 
 
+def fit_widths_to_target(
+    base_widths: Iterable[int],
+    target_width: int,
+    flexible_indexes: Iterable[int],
+    gap: int = 2,
+) -> List[int]:
+    """Expand textual columns so a table shares a stable right edge."""
+    widths = list(base_widths)
+    flex = list(flexible_indexes)
+    if not widths or not flex:
+        return widths
+    current = sum(widths) + gap * (len(widths) - 1)
+    extra = target_width - current
+    if extra <= 0:
+        return widths
+    share, remainder = divmod(extra, len(flex))
+    for pos, idx in enumerate(flex):
+        widths[idx] += share + (1 if pos < remainder else 0)
+    return widths
+
+
 def make_buckets(
     sessions: Dict[str, RawSession],
     index: Dict[str, dict],
@@ -1818,7 +1846,7 @@ def render_table(
         lines.append("No token_count usage found for this period.")
         return "\n".join(lines)
 
-    terminal_width = max(80, shutil.get_terminal_size(fallback=(120, 24)).columns)
+    terminal_width = max(80, min(REPORT_MAX_WIDTH, shutil.get_terminal_size(fallback=(120, 24)).columns))
     gap = 2
     if wide:
         headers = ["SESSION", "MODEL(S)", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "1H BURN", "SHARE", "STATUS"]
@@ -1963,10 +1991,7 @@ def render_table(
         "* 1H BURN = credits observed in the trailing 60 minutes (not a quota limit). "
         "CACHE TAX = cached-input credit component.", color.DIM
     ))
-    lines.append(color.wrap(
-        "  STATUS is actionable only for live reports: ACTIVE/RECENT + OK/WATCH/ROTATE; "
-        "old threads become IDLE instead of showing stale ROTATE warnings.", color.DIM
-    ))
+    lines.append(color.wrap(STATUS_NOTE, color.DIM))
     if not wide:
         lines.append(color.wrap("  Use --wide to restore INPUT/CACHED/OUTPUT columns.", color.DIM))
     if fast:
@@ -1983,7 +2008,7 @@ def render_table(
     if details:
         for b, total_u, total_credits, _, total_cache_tax, state, health, burn, recent_cache, is_orphan in rows:
             lines.append("")
-            detail_width = max(72, min(120, terminal_width))
+            detail_width = terminal_width
             lines.append(color.wrap("=" * detail_width, color.BLUE))
             if is_orphan:
                 title_style = (color.BOLD, color.MAGENTA)
@@ -2039,7 +2064,7 @@ def render_table(
             component_total = uncached_c + cached_c + output_c
             lines.append(color.wrap("Credit components", color.BOLD, color.BLUE))
             ch = ["COMPONENT", "CREDITS*", "SESSION%"]
-            cw = [30, 14, 10]
+            cw = fit_widths_to_target([30, 14, 10], detail_width, (0,))
             cr = {1, 2}
             lines.append(fmt_detail(ch, cw, cr, {0: "header", 1: "header", 2: "header"}))
             lines.append(color.wrap("  ".join("-" * w for w in cw), color.DIM))
@@ -2057,7 +2082,7 @@ def render_table(
             lines.append("")
             lines.append(color.wrap("Main vs subagents", color.BOLD, color.BLUE))
             rh = ["ROLE", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "SESSION%"]
-            rw = [12, 11, 11, 11, 12, 12, 10]
+            rw = fit_widths_to_target([12, 11, 11, 11, 12, 12, 10], detail_width, (0,))
             rr = {1, 2, 3, 4, 5, 6}
             lines.append(fmt_detail(rh, rw, rr, {i: "header" for i in range(len(rh))}))
             lines.append(color.wrap("  ".join("-" * w for w in rw), color.DIM))
@@ -2082,7 +2107,7 @@ def render_table(
             lines.append("")
             lines.append(color.wrap("Model breakdown", color.BOLD, color.BLUE))
             mh = ["MODEL", "INPUT", "CACHED", "OUTPUT", "REASON", "CREDITS*", "CACHE TAX", "SESSION%"]
-            mw = [20, 10, 10, 10, 10, 11, 11, 9]
+            mw = fit_widths_to_target([20, 10, 10, 10, 10, 11, 11, 9], detail_width, (0,))
             mr = {1, 2, 3, 4, 5, 6, 7}
             lines.append(fmt_detail(mh, mw, mr, {i: "header" for i in range(len(mh))}))
             lines.append(color.wrap("  ".join("-" * w for w in mw), color.DIM))
@@ -2105,7 +2130,7 @@ def render_table(
             lines.append("")
             lines.append(color.wrap("Agent breakdown", color.BOLD, color.BLUE))
             ah = ["ROLE / SESSION", "MODEL(S)", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "SESSION%"]
-            aw = [37, 19, 9, 9, 9, 10, 10, 9]
+            aw = fit_widths_to_target([37, 19, 9, 9, 9, 10, 10, 9], detail_width, (0, 1))
             ar = {2, 3, 4, 5, 6, 7}
             lines.append(fmt_detail(ah, aw, ar, {i: "header" for i in range(len(ah))}))
             lines.append(color.wrap("  ".join("-" * w for w in aw), color.DIM))

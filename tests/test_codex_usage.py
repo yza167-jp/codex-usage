@@ -35,7 +35,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.4.2", proc.stdout)
+        self.assertIn("1.4.3", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -62,6 +62,20 @@ class CodexUsageSmokeTests(unittest.TestCase):
         # but it occupies four terminal cells. Padding must use display width.
         cell = self.mod.pad_display("请先阅读 AGENTS.md", 32)
         self.assertEqual(self.mod.display_width(cell), 32)
+
+    def test_report_width_cap_and_detail_right_edges(self):
+        self.assertEqual(self.mod.REPORT_MAX_WIDTH, self.mod.display_width(self.mod.STATUS_NOTE))
+        self.assertEqual(self.mod.REPORT_MAX_WIDTH, 144)
+        cases = (
+            ([30, 14, 10], (0,)),
+            ([12, 11, 11, 11, 12, 12, 10], (0,)),
+            ([20, 10, 10, 10, 10, 11, 11, 9], (0,)),
+            ([37, 19, 9, 9, 9, 10, 10, 9], (0, 1)),
+        )
+        for base, flex in cases:
+            widths = self.mod.fit_widths_to_target(base, self.mod.REPORT_MAX_WIDTH, flex)
+            rendered = sum(widths) + 2 * (len(widths) - 1)
+            self.assertEqual(rendered, self.mod.REPORT_MAX_WIDTH)
 
     def test_sqlite_i64_handles_unsigned_windows_file_ids(self):
         self.assertEqual(self.mod._sqlite_i64(0), 0)
