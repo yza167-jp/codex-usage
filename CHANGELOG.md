@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.1 — 2026-08-12
+
+- Kept previously learned weekly calibration available when the current weekly window contains an unpriced model; incomplete current windows no longer force `WEEKLY≈` back to `—`.
+- Displayed partial weekly attribution as a lower bound (`WEEKLY≈ ≥x%`) whenever `CREDITS*` contains priced usage plus an unpriced/unknown model.
+- Corrected the embedded token rate card to the current official values for GPT-5.6 Terra (62.5 / 6.25 / 375) and GPT-5.6 Luna (25 / 2.5 / 150 credits per 1M input/cached/output tokens).
+- Added official token rates for GPT-5.5 Cyber, GPT-5.3-Codex, and GPT-5.2. GPT-5.3-Codex-Spark remains intentionally unpriced because its official rate is still a research preview.
+- Added an internal rate-card calibration revision so observations computed with the old v1.5.0 rates are never mixed into new delta learning. An old calibration can be shown only as `LOW · prior-rate fallback` until current-revision observations become available.
+- Stopped showing `local coverage≈100%` for baseline-derived calibrations because that value is 100% by construction; local coverage is now shown only after independent delta calibration exists.
+- Added JSON/CSV lower-bound metadata for partial weekly estimates.
+
+
 ## 1.5.0 — 2026-08-12
 
 - Added subscription-aware quota attribution on top of the existing local credit estimator.

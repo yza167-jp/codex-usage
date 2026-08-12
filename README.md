@@ -8,6 +8,16 @@
 
 The core tool is a single Python script with **no mandatory third-party dependencies**. It supports macOS, Windows 10/11, and Linux.
 
+## v1.5.1: partial-model resilience
+
+v1.5.1 fixes the main edge case discovered after the first real v1.5 deployment: an unpriced model such as `GPT-5.3-Codex-Spark` no longer makes the entire weekly calibration disappear.
+
+- If a session has `543.1+ CREDITS*`, the `+` means the priced portion is known but at least one model is unpriced. If calibration exists, the weekly column now shows a lower bound such as `WEEKLY≈ ≥3.15%` instead of `—`.
+- An incomplete current weekly window is **not** saved as a new calibration observation, but an existing calibration remains usable.
+- The embedded token rate card is synchronized to the current official values: GPT-5.6 Terra `62.5 / 6.25 / 375`, GPT-5.6 Luna `25 / 2.5 / 150`, GPT-5.3-Codex and GPT-5.2 `43.75 / 4.375 / 350` credits per 1M input/cached/output tokens. GPT-5.3-Codex-Spark remains intentionally unpriced while its official rate is a research preview.
+- Rate-card revisions are isolated for calibration. A v1.5.0 calibration may temporarily appear as `LOW · prior-rate fallback`, but it is never mixed into v1.5.1 delta learning.
+- `local coverage≈` is shown only for delta-calibrated estimates; baseline-derived coverage is hidden because it would be 100% by definition.
+
 ## v1.5.0: subscription-aware estimates
 
 v1.5.0 adds two different kinds of quota information and keeps them deliberately separate:
@@ -28,7 +38,7 @@ SESSION                         MODEL(S)       CREDITS*  WEEKLY≈  CACHE TAX  1
 another task                    5.6 Sol            203.1     0.51%      125.1     203.1  15.2%  ACTIVE/OK
 ```
 
-`WEEKLY≈` is intentionally marked with `≈`: it is an attribution estimate, **not** an authoritative OpenAI billing/quota meter.
+`WEEKLY≈` is intentionally marked with `≈`: it is an attribution estimate, **not** an authoritative OpenAI billing/quota meter. When the credit total is partial because an unpriced model is present, `WEEKLY≈ ≥x%` is a **lower bound based only on the priced usage**.
 
 ## Highlights
 

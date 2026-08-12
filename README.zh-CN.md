@@ -8,6 +8,16 @@
 
 核心工具仍然只有一个 Python 脚本，**正常使用零强制第三方依赖**，支持 macOS、Windows 10/11 和 Linux。
 
+## v1.5.1：未定价模型下的连续估算
+
+v1.5.1 修复了真实使用中发现的主要边界情况：当本周出现 `GPT-5.3-Codex-Spark` 这类官方尚未给出最终 credits rate 的模型时，不再让整个 `WEEKLY≈` calibration 退回为 `—`。
+
+- 如果某个 session 显示 `543.1+ CREDITS*`，`+` 表示已定价部分可以计算，但还包含未定价模型；只要已有 calibration，`WEEKLY≈` 会显示为类似 `≥3.15%` 的**下界**。
+- 当前 weekly window 不完整时不会写入新的 calibration observation，但会继续使用已经学到的 calibration。
+- 内置 token rate card 已同步到当前官方值：GPT-5.6 Terra 为 `62.5 / 6.25 / 375`，GPT-5.6 Luna 为 `25 / 2.5 / 150`，GPT-5.3-Codex 与 GPT-5.2 为 `43.75 / 4.375 / 350` credits / 1M input、cached input、output tokens。GPT-5.3-Codex-Spark 仍保持未定价，因为官方仍将其标记为 research preview。
+- calibration 按内部 rate-card revision 隔离。v1.5.0 的旧 calibration 可以暂时作为 `LOW · prior-rate fallback` 展示，但不会和 v1.5.1 的新观测混在一起做 delta 学习。
+- baseline 阶段不再显示 `local coverage≈100%`，因为该值由定义恒等得到；只有真正产生独立 delta calibration 后才显示 local coverage。
+
 ## v1.5.0：订阅额度估算
 
 v1.5.0 增加了两种**刻意区分**的 quota 信息：
