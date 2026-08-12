@@ -5,6 +5,7 @@
 - Fixed CJK / East Asian wide-character alignment in summary and detail tables by measuring terminal cells instead of Python string length.
 - Made Unicode-aware truncation and padding shared by summary rows, detail tables, agent breakdowns, and detail headings.
 - Added regression tests for CJK, mixed Chinese/ASCII text, combining marks, truncation, and left/right padding.
+- Added an explicit regression for the original failure mode: a mixed CJK/ASCII session cell must pad to the exact requested terminal width without shifting later columns.
 - Kept the implementation dependency-free using Python's standard `unicodedata` module.
 - No changes to credit estimation, session attribution, rate cards, or the incremental-cache schema.
 
