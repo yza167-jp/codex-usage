@@ -13,6 +13,7 @@
 - Made exact rolling `Nh` windows elapsed-time correct across daylight-saving transitions.
 - Added case-normalized path de-duplication for case-insensitive Windows filesystems.
 - Added cross-platform smoke tests and GitHub Actions coverage on Windows, macOS, and Linux with Python 3.9 and 3.13.
+- Validated the Windows CLI, incremental cache, CMD launcher, and PowerShell installer on GitHub-hosted Windows runners with Python 3.9 and 3.13 before release.
 
 ## 1.3.0 — 2026-08-12
 
