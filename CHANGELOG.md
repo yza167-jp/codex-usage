@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.1 — 2026-08-12
+
+- Refined terminal colors so session titles follow health first: `OK` green, `WATCH` yellow, `ROTATE` red, with inactive rows dimmed.
+- Made summary column widths adapt to the current terminal width instead of using fixed widths.
+- Shortened detail section headings so long goal prompts no longer dominate the screen.
+- Compacted detail metadata for state, health, last activity, and trailing burn.
+- Changed `rolled-up subagents` to the more precise `subagents in window`.
+- Made timezone labels unambiguous by showing both the local abbreviation/name and UTC offset.
+
 ## 1.4.0 — 2026-08-12
 
 - Added native Windows 10/11 support while preserving macOS/Linux behavior.
