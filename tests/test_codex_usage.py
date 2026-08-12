@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.5.0", proc.stdout)
+        self.assertIn("1.5.1", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -110,6 +110,47 @@ class CodexUsageSmokeTests(unittest.TestCase):
             self.assertEqual(ctx.plan_type, "prolite")
             self.assertEqual(self.mod.plan_display_name(ctx.plan_type), "Pro 5x")
             self.assertNotEqual(ctx.account_key, "local")
+
+    def test_v151_official_rate_card_and_spark_unpriced(self):
+        self.assertEqual(self.mod.RATE_CARD["gpt-5.6-terra"], (62.5, 6.25, 375.0))
+        self.assertEqual(self.mod.RATE_CARD["gpt-5.6-luna"], (25.0, 2.5, 150.0))
+        self.assertEqual(self.mod.RATE_CARD["gpt-5.3-codex"], (43.75, 4.375, 350.0))
+        self.assertEqual(self.mod.RATE_CARD["gpt-5.2"], (43.75, 4.375, 350.0))
+        self.assertNotIn("gpt-5.3-codex-spark", self.mod.RATE_CARD)
+
+    def test_partial_weekly_estimate_is_lower_bound(self):
+        cal = self.mod.QuotaCalibration(credits_per_percent=172.3, confidence="LOW")
+        exact = self.mod.weekly_percent_text(543.1, cal, True)
+        partial = self.mod.weekly_percent_text(543.1, cal, False)
+        self.assertFalse(exact.startswith("≥"))
+        self.assertTrue(partial.startswith("≥"))
+        self.assertEqual(partial[1:], exact)
+
+    def test_legacy_calibration_survives_unpriced_current_window(self):
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
+            auth = self.mod.LocalAuthContext(plan_type="prolite", account_key="acct")
+            reset = int(now.timestamp()) + 3 * 86400
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO quota_observations(
+                        account_key,plan_type,reset_at,window_minutes,snapshot_ts,
+                        used_percent,local_credits,rate_card,credit_mode,source
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    ("acct", "prolite", reset, 10080, now.isoformat(), 92.0, 15851.6, "2026-08-12", "standard", "rollout"),
+                )
+                conn.commit()
+                snap = self.mod.QuotaSnapshot(now, 97.0, 10080, reset, plan_type="prolite")
+                cal = self.mod.load_quota_calibration(conn, auth, snap, None, False)
+                self.assertAlmostEqual(cal.credits_per_percent, 172.3, delta=0.2)
+                self.assertEqual(cal.source, "legacy_baseline")
+                self.assertEqual(cal.confidence, "LOW")
+                self.assertIsNone(cal.local_coverage_percent)
+            finally:
+                conn.close()
 
     def test_weekly_rate_limit_snapshot_prefers_seven_day_window(self):
         now = datetime.now(timezone.utc)
