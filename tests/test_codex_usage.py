@@ -77,6 +77,14 @@ class CodexUsageSmokeTests(unittest.TestCase):
             rendered = sum(widths) + 2 * (len(widths) - 1)
             self.assertEqual(rendered, self.mod.REPORT_MAX_WIDTH)
 
+        # On a narrower terminal, preserve readable base widths rather than
+        # squeezing numeric columns merely to force the wide-screen alignment.
+        narrow_base = [37, 19, 9, 9, 9, 10, 10, 9]
+        self.assertEqual(
+            self.mod.fit_widths_to_target(narrow_base, 100, (0, 1)),
+            narrow_base,
+        )
+
     def test_sqlite_i64_handles_unsigned_windows_file_ids(self):
         self.assertEqual(self.mod._sqlite_i64(0), 0)
         self.assertEqual(self.mod._sqlite_i64((1 << 63) - 1), (1 << 63) - 1)
