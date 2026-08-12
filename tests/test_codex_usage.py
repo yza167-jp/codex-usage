@@ -1,3 +1,4 @@
+import base64
 import importlib.machinery
 import importlib.util
 import json
@@ -35,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.4.3", proc.stdout)
+        self.assertIn("1.5.0", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -85,6 +86,75 @@ class CodexUsageSmokeTests(unittest.TestCase):
             narrow_base,
         )
 
+    def test_local_auth_plan_decodes_prolite(self):
+        claims = {
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "prolite",
+                "chatgpt_user_id": "test-user",
+            }
+        }
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        token = f"eyJhbGciOiJub25lIn0.{payload}.sig"
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            (home / "auth.json").write_text(json.dumps({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": token,
+                    "access_token": "secret",
+                    "refresh_token": "secret",
+                    "account_id": "acct",
+                },
+            }), encoding="utf-8")
+            ctx = self.mod.read_local_auth_context(home)
+            self.assertEqual(ctx.plan_type, "prolite")
+            self.assertEqual(self.mod.plan_display_name(ctx.plan_type), "Pro 5x")
+            self.assertNotEqual(ctx.account_key, "local")
+
+    def test_weekly_rate_limit_snapshot_prefers_seven_day_window(self):
+        now = datetime.now(timezone.utc)
+        rec = {
+            "timestamp": now.isoformat(),
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "plan_type": "prolite",
+                    "primary": {"used_percent": 12.0, "window_minutes": 300, "resets_at": int(now.timestamp()) + 1000},
+                    "secondary": {"used_percent": 37.5, "window_minutes": 10080, "resets_at": int(now.timestamp()) + 3 * 86400},
+                },
+            },
+        }
+        snap = self.mod._quota_snapshot_from_record(rec, "plus")
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.plan_type, "prolite")
+        self.assertEqual(snap.window_minutes, 10080)
+        self.assertEqual(snap.used_percent, 37.5)
+
+    def test_quota_calibration_learns_delta_ratio(self):
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
+            auth = self.mod.LocalAuthContext(plan_type="prolite", account_key="acct")
+            reset = int(now.timestamp()) + 3 * 86400
+            try:
+                samples = [
+                    (now, 20.0, 8000.0),
+                    (now + self.mod.timedelta(seconds=1), 22.0, 8800.0),
+                    (now + self.mod.timedelta(seconds=2), 25.0, 10000.0),
+                ]
+                for ts, used, credits in samples:
+                    snap = self.mod.QuotaSnapshot(ts, used, 10080, reset, plan_type="prolite")
+                    self.mod._record_quota_observation(conn, auth, snap, credits, False)
+                latest = self.mod.QuotaSnapshot(samples[-1][0], 25.0, 10080, reset, plan_type="prolite")
+                cal = self.mod.load_quota_calibration(conn, auth, latest, 10000.0, False)
+                self.assertAlmostEqual(cal.credits_per_percent, 400.0, delta=1.0)
+                self.assertGreaterEqual(cal.clean_intervals, 2)
+                self.assertIn(cal.confidence, ("MEDIUM", "HIGH"))
+            finally:
+                conn.close()
+
     def test_sqlite_i64_handles_unsigned_windows_file_ids(self):
         self.assertEqual(self.mod._sqlite_i64(0), 0)
         self.assertEqual(self.mod._sqlite_i64((1 << 63) - 1), (1 << 63) - 1)
@@ -125,7 +195,8 @@ class CodexUsageSmokeTests(unittest.TestCase):
         ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / ".codex"
-            session_dir = home / "sessions" / "2099" / "01" / "01"
+            day = datetime.now(timezone.utc)
+            session_dir = home / "sessions" / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
             session_dir.mkdir(parents=True)
             rollout = session_dir / f"rollout-{sid}.jsonl"
             records = [
@@ -159,10 +230,31 @@ class CodexUsageSmokeTests(unittest.TestCase):
                                 "total_tokens": 10500,
                             }
                         },
+                        "rate_limits": {
+                            "limit_id": "codex",
+                            "plan_type": "prolite",
+                            "primary": {
+                                "used_percent": 5.0,
+                                "window_minutes": 300,
+                                "resets_at": int(datetime.now(timezone.utc).timestamp()) + 3600,
+                            },
+                            "secondary": {
+                                "used_percent": 25.0,
+                                "window_minutes": 10080,
+                                "resets_at": int(datetime.now(timezone.utc).timestamp()) + 3 * 86400,
+                            },
+                        },
                     },
                 },
             ]
             rollout.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+            claims = {"https://api.openai.com/auth": {"chatgpt_plan_type": "prolite", "chatgpt_user_id": "integration-user"}}
+            payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+            id_token = f"eyJhbGciOiJub25lIn0.{payload}.sig"
+            (home / "auth.json").write_text(json.dumps({
+                "auth_mode": "chatgpt",
+                "tokens": {"id_token": id_token, "access_token": "secret", "refresh_token": "secret", "account_id": "acct"},
+            }), encoding="utf-8")
 
             base_cmd = [
                 sys.executable,
@@ -196,6 +288,8 @@ class CodexUsageSmokeTests(unittest.TestCase):
                 env=legacy_env,
             )
             self.assertIn("demo-project", cached.stdout)
+            self.assertIn("Subscription", cached.stdout)
+            self.assertIn("WEEKLY", cached.stdout)
             self.assertTrue(cache_db.exists())
 
 
