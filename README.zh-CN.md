@@ -2,99 +2,57 @@
 
 [English README](README.md)
 
-`codex-usage` 是一个**非官方、本地优先的 Codex 用量分析工具**。它读取本机 Codex session transcript，并按 session、模型、主 agent 和 subagent 汇总 token 活动与估算的 credit 消耗。
+`codex-usage` 是一个**非官方、本地优先的 Codex 用量分析工具**。它读取本机已经存在的 Codex 数据，主要回答一个实际问题：
 
-它主要回答官方用量视图目前不直接回答的一个问题：
+> 我的 Codex 额度花在哪个 session 上、为什么这么贵，以及这些消耗大约占 GPT/Codex 每周订阅额度的多少？
 
-> 我的 Codex 额度到底花在哪个 session 上，为什么会花这么多？
+核心工具仍然只有一个 Python 脚本，**正常使用零强制第三方依赖**，支持 macOS、Windows 10/11 和 Linux。
 
-核心工具仍然只有一个 Python 脚本，**正常使用零强制第三方依赖**。**v1.4.0 正式增加原生 Windows 支持**，同时保留 macOS 和 Linux 支持。
+## v1.5.0：订阅额度估算
 
-**v1.4.1** 是一次终端 UX polish：按 health 着色 session、动态列宽、紧凑详情标题，以及不歧义的时区显示。
+v1.5.0 增加了两种**刻意区分**的 quota 信息：
 
-**v1.4.2** 修复 Unicode 终端显示宽度计算：中文/CJK 与中英混排 session 标题现在按实际终端 cell 宽度截断和补齐，不会再把后续数值列挤到下一行；仍保持零强制第三方依赖。
+- **`WEEKLY`**：从本地 Codex rollout telemetry 中读到的最新 backend weekly 已用/剩余百分比。这是服务端返回的 quota snapshot，不是根据 token 反推出来的。
+- **`WEEKLY≈`**：估算某个本地 session 消耗了 weekly allowance 的多少。它通过本机重建的 `CREDITS*` 与多次 backend weekly 百分比观测之间的关系自适应学习。
 
-**v1.4.3** 为宽终端增加稳定的报告宽度上限，确保全屏时右侧仍保留空白，并让各 detail breakdown 最右侧的 `SESSION%` 对齐到同一边界。
+示例：
+
+```text
+Codex usage — last 6h (...) — CST (UTC+08:00)
+Credit mode: Standard credits (rate card 2026-08-12)
+Subscription  Pro 5x · WEEKLY 43.0% used / 57.0% left · reset 3d18h · snapshot 20s
+Calibration   1% weekly ≈ 397.0 credits* · MEDIUM · 4 clean / 6.0pp · local coverage≈91%
+
+SESSION                         MODEL(S)       CREDITS*  WEEKLY≈  CACHE TAX  1H BURN  SHARE  STATUS
+/goal durable ultragoal         5.6 Sol / Luna    814.1     2.05%      632.5     134.5  60.9%  ACTIVE/WATCH
+另一个任务                       5.6 Sol            203.1     0.51%      125.1     203.1  15.2%  ACTIVE/OK
+```
+
+`WEEKLY≈` 明确带 `≈`：它是**归因估算**，不是 OpenAI 官方 billing/quota meter。
 
 ## 主要功能
 
 - 按 session 统计 `today`、`yesterday`、指定日期、日期范围，以及 `6h`、`12h`、`24h` 和任意 `Nh` 滚动时间窗口。
-- 区分 GPT-5.6 Sol / Terra / Luna、GPT-5.5、GPT-5.4、GPT-5.4 mini 等模型。
-- 区分 MAIN 与 subagent；默认把 subagent 用量回卷到所属根 session。
+- 按模型、MAIN agent、subagent 估算 credits。
 - `CACHE TAX`：cached input 单独贡献的估算 credits。
-- `1H BURN`：最近 60 分钟产生的 credits，用于观察当前消耗速度。
+- `1H BURN`：最近 60 分钟观察到的 credits 消耗速度。
 - `ACTIVE` / `RECENT` / `IDLE` 和 `OK` / `WATCH` / `ROTATE` 工作流提示。
-- 终端彩色高亮；Windows 下自动尝试开启 VT/ANSI 支持。
-- 增量 SQLite 索引：首次扫描后，不再重复读取未变化的 JSONL；仍在追加的 session 只读取文件尾部。
-- 热路径 discovery：日常查询无需每次遍历全部历史 session 文件。
-- 支持 JSON / CSV 输出。
-- Windows PowerShell 安装器与 CMD 启动器。
-- Windows / macOS / Linux 三平台 CI。
+- **v1.5：** 本地 ChatGPT plan 识别、backend weekly quota snapshot、自适应 `CREDITS* → WEEKLY≈` 校准、confidence 与 local coverage。
+- 增量 SQLite 索引与 hot discovery；首次扫描后只读取有变化的 rollout 尾部。
+- 彩色终端、中文/CJK terminal-cell 对齐、最大 144-cell 阅读栏。
+- JSON / CSV 输出。
+- Windows PowerShell 安装器与 CMD launcher。
+- Windows / macOS / Linux × Python 3.9 / 3.13 CI。
 
 ## 环境要求
 
 - Python **3.9+**
-- 本机安装并使用过 Codex，session transcript 位于 `$CODEX_HOME` / `%CODEX_HOME%`，或者通过 `--codex-home` 指定路径
-- Windows 10/11、macOS 或 Linux
+- 本机安装 Codex，session transcript 位于 `$CODEX_HOME` / `%CODEX_HOME%`，或通过 `--codex-home` 指定
+- macOS、Windows 10/11 或 Linux
 
-正常按照系统本地时区使用时，不需要安装任何第三方 Python 包。
-
-### Windows 时区说明
-
-Windows 上的 Python 通常不会自带 IANA 时区数据库。默认使用**系统本地时区**时完全不需要额外依赖。
-
-如果你显式指定：
-
-```powershell
-codex-usage 24h --timezone Asia/Tokyo
-```
-
-并遇到时区不可用提示，可以安装可选的 `tzdata`：
-
-```powershell
-py -3 -m pip install tzdata
-```
+正常使用不需要额外 Python 包。
 
 ## 安装
-
-### Windows（PowerShell）
-
-```powershell
-git clone https://github.com/yza167-jp/codex-usage.git
-cd codex-usage
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
-```
-
-安装器默认将：
-
-```text
-codex-usage
-codex-usage.cmd
-```
-
-复制到：
-
-```text
-%LOCALAPPDATA%\Programs\codex-usage
-```
-
-并把该目录加入**用户级 PATH**。重新打开一个终端后验证：
-
-```powershell
-codex-usage --version
-```
-
-也可以指定安装目录：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallDir C:\Tools\codex-usage
-```
-
-如果不想安装，直接运行：
-
-```powershell
-py -3 .\codex-usage 24h
-```
 
 ### macOS / Linux
 
@@ -105,234 +63,269 @@ mkdir -p ~/.local/bin
 install -m 755 codex-usage ~/.local/bin/codex-usage
 ```
 
-如果 `~/.local/bin` 尚未加入 `PATH`，zsh 可以执行：
-
-```bash
-grep -q '.local/bin' ~/.zshrc 2>/dev/null || \
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-验证：
+确保 `~/.local/bin` 在 `PATH` 中，然后：
 
 ```bash
 codex-usage --version
+codex-usage 6h
 ```
 
-## 快速开始
+已有本地 clone 时更新：
+
+```bash
+cd /path/to/codex-usage
+git pull
+install -m 755 codex-usage ~/.local/bin/codex-usage
+```
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/yza167-jp/codex-usage.git
+cd codex-usage
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+默认安装到：
 
 ```text
-codex-usage today
-codex-usage yesterday
+%LOCALAPPDATA%\Programs\codex-usage
+```
+
+重新打开终端：
+
+```powershell
+codex-usage --version
+codex-usage 6h
+```
+
+WSL 按 Linux 使用；如有需要，用 `--codex-home` 指向 WSL 能看到的 Codex home。
+
+## 常用命令
+
+```bash
 codex-usage 6h
 codex-usage 12h
 codex-usage 24h
-codex-usage 48h
-codex-usage 168h
+codex-usage today
+codex-usage yesterday
 codex-usage week
-codex-usage 7d
-codex-usage 2026-08-10
-codex-usage 2026-08-01..2026-08-10
+codex-usage 168h
+codex-usage 2026-08-12
+codex-usage 2026-08-01..2026-08-12
 ```
 
-`24h` 与 `yesterday` 刻意保持不同语义：
+常用视图：
 
-- `24h`：从当前时刻向前精确滚动 24 小时。
-- `yesterday`：本地时区的上一个自然日，即 `00:00–24:00`。
-
-v1.4.0 的任意 `Nh` 窗口按照**实际经过时间**计算，在跨夏令时切换时也不会把 23/25 小时误当作 24 小时。
-
-## 如何阅读摘要
-
-典型输出：
-
-```text
-SESSION                        MODEL(S)            CREDITS*  CACHE TAX  1H BURN  SHARE  STATUS
-current-feature-work (+4 sub)  5.6 Sol / 5.6 Luna    812.4      501.7     184.2   28.6%  ACTIVE/WATCH
-older-long-session             5.6 Sol              2034.8     1510.3         —   71.4%  IDLE
-```
-
-### `CREDITS*`
-
-根据本地 token counter 和脚本内置 rate card 重建出的估算值。它非常适合做**相对归因**，例如比较哪个 session、哪个模型最消耗额度，但它**不是 OpenAI 服务端的 authoritative quota meter**。
-
-### `CACHE TAX`
-
-cached input 单独造成的估算 credit 成本。该值持续升高，通常说明一个长期存活的主 thread 在反复携带很大的历史上下文。
-
-### `1H BURN`
-
-最近 60 分钟实际观察到的 credits，是滚动活动指标，不是套餐限制，也不是账单预测。
-
-### `STATUS`
-
-对于实时窗口：
-
-- `ACTIVE`：最近 15 分钟有 token 活动。
-- `RECENT`：最近 1 小时有活动。
-- `IDLE`：近期无活动。
-- `OK`：暂未出现明显长上下文成本问题。
-- `WATCH`：上下文成本开始值得关注。
-- `ROTATE`：建议在自然 milestone 做 checkpoint，然后考虑新开 root session。
-
-这些只是本地工作流 heuristic，不是 OpenAI 产品告警。
-
-## 详细诊断
-
-```text
-codex-usage 24h --details
-```
-
-会增加：
-
-- cached input / uncached input / output 的 credit component
-- MAIN vs subagent 汇总
-- model breakdown
-- agent breakdown
-- 最近活动时间
-- 最近一小时 burn 与 active thread 的简单 +2h 线性外推
-
-默认每个 session 只显示最重要的前 8 个 agent：
-
-```text
-codex-usage 24h --details --top-agents 5
-codex-usage 24h --details --all-agents
-```
-
-恢复 token 列：
-
-```text
+```bash
+codex-usage 6h --details
 codex-usage 24h --wide
-```
-
-不回卷 subagent，而是分别显示：
-
-```text
 codex-usage 24h --show-subagents
-```
-
-## 彩色终端
-
-交互式终端中默认自动开启颜色。v1.4.0 在 Windows 下会尝试自动启用 Virtual Terminal Processing，因此 Windows Terminal、现代 PowerShell 以及支持 VT 的 `cmd.exe` 可以获得和 macOS/Linux 相同的状态颜色。
-
-```text
-codex-usage 24h --color always
-codex-usage 24h --color never
-```
-
-支持标准 `NO_COLOR` 环境变量。JSON / CSV 永远不会混入 ANSI 控制字符。
-
-## JSON / CSV
-
-```text
+codex-usage 24h --details --all-agents
+codex-usage 24h --perf
 codex-usage 24h --json
 codex-usage 24h --csv
-codex-usage week --csv > codex-week.csv
 ```
 
-## 增量索引与性能
+完全关闭 v1.5 的订阅/quota 读取与估算：
 
-长程 Codex session 的 transcript 可能非常大，因此 `codex-usage` 使用本地 SQLite 增量索引。
+```bash
+codex-usage 6h --no-quota
+```
 
-默认 cache 路径：
+## v1.5 如何读取订阅状态
 
-- Windows：`%LOCALAPPDATA%\codex-usage\index-v2.sqlite3`
+这是一个早期本地工具，v1.5 优先选择实现简单。
+
+### Plan 类型
+
+脚本直接读取：
+
+```text
+$CODEX_HOME/auth.json
+```
+
+并解码本地 ID token 的 payload，取得 ChatGPT plan。当前显示映射为：
+
+| Codex plan value | `codex-usage` 显示 |
+|---|---|
+| `plus` | Plus |
+| `prolite` | Pro 5x |
+| `pro` | Pro 20x |
+
+这里的 `Pro 5x / Pro 20x` 是本工具采用的显示名称；真正用于隔离校准 regime 的是 backend plan value。
+
+### Weekly quota snapshot
+
+最近的 rollout JSONL 里有 `token_count` event。当前 Codex 协议允许它携带 `rate_limits`，包括：
+
+```text
+used_percent
+window_minutes
+resets_at
+plan_type
+```
+
+`codex-usage` 会查看最近修改的多个 rollout 尾部，按 event timestamp 选择最新的 Codex rate-limit snapshot，并通过约 **10080 分钟（7 天）**识别 weekly window，而不是假定 `primary` 或 `secondary` 永远代表 weekly。
+
+因此：
+
+```text
+WEEKLY 43% used / 57% left
+```
+
+来自 backend snapshot。脚本同时显示 snapshot age，方便识别 stale telemetry。
+
+## `WEEKLY≈` 如何自适应学习
+
+脚本在原有 SQLite cache 中额外保存 quota observation，只存校准需要的元信息：
+
+```text
+哈希后的本地账户分段键
+plan type
+weekly reset timestamp
+weekly used percent
+本机 credit-equivalent usage
+rate-card version
+standard / fast credit mode
+snapshot timestamp / source
+```
+
+**不会**把原始 access token、refresh token、ID token 复制进 `codex-usage` 的数据库，也不会主动打印这些 token。
+
+### 第一次估算
+
+拿到 weekly snapshot 后，脚本会从当前 weekly window 的起点到 snapshot 时刻，重建本机累计 credits。
+
+假设 backend 显示：
+
+```text
+weekly used = 40%
+```
+
+本地历史重建得到：
+
+```text
+15,200 CREDITS*
+```
+
+则第一次会得到：
+
+```text
+1 weekly percentage point ≈ 380 CREDITS*
+effective weekly capacity ≈ 38,000 CREDITS*
+confidence: LOW
+```
+
+这里**不是**说 OpenAI 给了 38,000 个可购买 credits；它只是为了把 included weekly allowance 映射到一个有效的 credit-equivalent 坐标系。
+
+### 多次查询后逐渐校准
+
+随着 Codex 产生新的 quota snapshot，脚本在同一个 weekly reset epoch 内学习：
+
+```text
+Δ 本机 CREDITS* / Δ backend weekly used%
+```
+
+估计器使用 weighted median，并过滤明显偏低/偏高的 interval。
+
+如果 backend weekly% 增长很多、但本机 credits 几乎没变，这通常说明还有本工具看不到的 quota 消耗来源；这种 interval 不应该直接把 conversion ratio 拉低。
+
+Confidence 大致分为：
+
+- `LEARNING`：还没有可用换算关系
+- `LOW`：只有初始 baseline，或有效 quota movement 太少
+- `MEDIUM`：已有多个 clean delta interval
+- `HIGH`：已有多个相互一致的 interval，并覆盖了足够的 weekly 百分比变化
+
+校准会按 account、plan、rate-card version、credit mode、weekly reset epoch 分段。换套餐或进入新的 weekly window 时，不会简单把旧 epoch 当成同一个观测序列。
+
+## Local coverage
+
+`local coverage≈` 表示在当前 calibration 下，backend weekly used% 中有多少大致可以被本机 transcript 中的 credits 解释。
+
+如果它很低，可能意味着：
+
+- 另一台设备也在用 Codex；
+- 还有本机 transcript 看不到的 agentic usage；
+- 当前 calibration 样本还太少。
+
+它只是诊断指标，不是账户审计结果。
+
+## Credits 估算
+
+`CREDITS*` 来自本地 token counter 和内置 rate card。由于 cached input 是 input 的子集：
+
+```text
+uncached input = input - cached input
+credits* = uncached input component + cached input component + output component
+```
+
+Reasoning tokens 是 output 的细分，不会重复收费。
+
+`--fast` 会对支持的模型应用内置 Fast multiplier。由于历史 service tier 并不总是可靠写入 token event，`--fast` 的含义是“假设本次报告里的可用 usage 都使用 Fast”。
+
+`CREDITS*` 与 `WEEKLY≈` 都不是 OpenAI 官方服务端账单/额度 meter。
+
+## Cache 与性能
+
+默认 cache：
+
 - macOS：`~/Library/Caches/codex-usage/index-v2.sqlite3`
-- Linux：`${XDG_CACHE_HOME:-~/.cache}/codex-usage/index-v2.sqlite3`
+- Windows：`%LOCALAPPDATA%\codex-usage\index-v2.sqlite3`
+- Linux：`$XDG_CACHE_HOME/codex-usage/index-v2.sqlite3`，否则 `~/.cache/codex-usage/index-v2.sqlite3`
 
-性能诊断：
+cache 保存 token-event index 与 quota calibration observations，不复制完整 prompt / response。
 
-```text
+第一次扫描后，未变化的 rollout JSONL 不会重复读取；仍在追加的文件只解析新尾部。v1.5 第一次运行时，为了建立 weekly baseline，可能需要额外扫描当前 weekly window 内尚未索引的文件；之后继续走增量缓存。
+
+诊断命令：
+
+```bash
 codex-usage 24h --perf
-```
-
-例如：
-
-```text
-Perf: incremental-index | discovery=hot 0.004s | files=86 | hits=27 | cold=0 | ancestor=0 | tail=1 | skipped-old=58 | read=0.2 MiB | sync=0.006s | total=0.24s
-```
-
-维护命令：
-
-```text
 codex-usage --cache-info
-codex-usage 24h --rebuild-cache --perf
-codex-usage 24h --no-cache
 codex-usage 24h --full-discovery --perf
+codex-usage 24h --no-cache
 ```
 
-SQLite cache 只保存统计需要的 metadata 与 token counter，不会把 prompt / response 正文复制进去。
+从 v1.4.x 升级到 v1.5.0 一般**不需要** rebuild cache；`quota_observations` 是增量添加的新表。
 
-## Codex 数据路径
+## 时区
 
-默认路径：
+默认使用系统本地时区，并同时显示时区简称/名称和 UTC offset，例如：
 
 ```text
-~/.codex
+CST (UTC+08:00)
 ```
 
-在 Windows、macOS、Linux 上都会映射到当前用户 home。也可以设置 `CODEX_HOME`，或者显式：
+也可以显式指定 IANA 时区：
 
-```text
-codex-usage 24h --codex-home <path>
+```bash
+codex-usage 24h --timezone Asia/Tokyo
 ```
 
-如果你的 Codex session 实际位于 **WSL** 内，最简单、最可靠的方式仍然是在同一个 WSL distribution 内运行 `codex-usage`。原生 Windows 版本也可以通过 `--codex-home` 指向 Windows 能访问的 transcript 路径，但 profiler 自己的 SQLite cache 最好保留在 Windows 本地文件系统上。
+Windows 的 Python 不一定自带 IANA timezone database；系统本地时间无需额外包，显式 IANA zone 可能需要可选 `tzdata`。
 
-## Fast mode
+## 隐私 / 信任边界
 
-如果所选时间窗口内所有支持 Fast 的请求都使用了 Fast mode：
+本工具是 local-first，但 **v1.5 会直接读取 `auth.json`**，而这是一个包含凭据的 Codex 文件。当前实现只解码 plan / account segmentation 所需元信息，不主动打印原始 token，也不把原始 token 存进自己的 SQLite。
 
-```text
-codex-usage 24h --fast
+如果以后把工具给更多人使用，应把这段代码当作“能读取 Codex home 凭据”的代码来审计。
+
+如果不希望脚本读取订阅/auth metadata：
+
+```bash
+codex-usage 6h --no-quota
 ```
 
-由于本地 `token_count` 事件无法可靠恢复每个历史请求的 Standard/Fast tier，`--fast` 的含义是：**假设报告窗口内所有符合条件的请求都用了 Fast**。
+## 局限
 
-## 数据来源与准确性
-
-工具读取本机 Codex rollout JSONL，并在存在时读取 `state_5.sqlite` 获取 thread metadata；随后利用脚本内置 rate card 将 token counter 换算为估算 credits。
-
-重要边界：
-
-- 本地 transcript 是 telemetry，不是 authoritative server-side quota meter。
-- 历史 Fast / Standard tier 无法可靠恢复。
-- 模型和 rate card 会变化；可以查看脚本中的 `RATE_CARD_AS_OF`。
-- full-history fork / subagent 可能复制父级历史 token counter；工具利用 lineage + cumulative counter 去重继承历史。
-- lineage 无法解析的 child 会显示 `[ORPHAN SUB]`，而不会猜测父 session。
-
-## 隐私
-
-`codex-usage` 坚持 local-first：
-
-- 不上传 Codex transcript。
-- 不要求 API key。
-- SQLite cache 不保存 prompt / response 正文。
-- 终端输出可能包含本地 thread 标题和项目目录名；公开截图或日志前请自行检查。
-
-公开仓库本身不包含作者个人路径或 session 数据。
-
-## 跨平台测试
-
-仓库内置 smoke tests，覆盖：
-
-- CLI version / help
-- synthetic rollout 在无 cache / 增量 cache 两种模式下的解析
-- SQLite read-only URI，包括带空格的路径
-- 各平台默认 cache path
-
-GitHub Actions 会在 `windows-latest`、`macos-latest`、`ubuntu-latest` 上分别使用 Python 3.9 与 3.13 运行测试。
-
-本地运行：
-
-```text
-python -m unittest discover -s tests -v
-```
+- 本机 transcript 无法证明 weekly usage 全部来自这台机器。
+- OpenAI/Codex 的 quota 语义和 plan 行为可能独立变化。
+- release 内置的 credit rate card 未来可能过期。
+- `WEEKLY≈` 在积累多次观测后才更有价值；如果本周大量 usage 发生在别处，第一次 baseline 会有偏差。
+- included weekly allowance 达到 100% 后，额外购买/flexible credits 是另一套概念，不应该把 `WEEKLY≈` 理解成 100% 以上还能继续增加的订阅百分比。
 
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
-
-## Disclaimer
-
-本项目与 OpenAI 无隶属或官方背书关系。Codex 行为、transcript 格式、模型和 rate card 都可能发生变化；请把它作为本地诊断工具，而不是账单或额度的权威来源。

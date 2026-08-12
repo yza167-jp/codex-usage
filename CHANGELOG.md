@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.0 — 2026-08-12
+
+- Added subscription-aware quota attribution on top of the existing local credit estimator.
+- Added local ChatGPT plan detection by reading `$CODEX_HOME/auth.json` and decoding the ID-token metadata; raw auth tokens are not copied into the `codex-usage` cache or printed.
+- Added plan display mapping for `plus` → Plus, `prolite` → Pro 5x, and `pro` → Pro 20x.
+- Added weekly quota discovery from recent local Codex `token_count.rate_limits` telemetry, identifying the weekly window by its duration near 10080 minutes instead of assuming `primary` or `secondary`.
+- Added `Subscription` output with backend weekly used/left percentage, reset countdown, and snapshot age.
+- Added `WEEKLY≈`, an estimated per-session share of the included weekly allowance.
+- Added an additive `quota_observations` SQLite table; no rollout-index cache rebuild is required from v1.4.x.
+- Added an initial low-confidence calibration from local weekly credits / backend weekly used percent.
+- Added repeated delta calibration using local-credit changes versus backend weekly-percentage changes, a weighted median, and outlier filtering for likely unexplained/external quota movement.
+- Added `LEARNING`, `LOW`, `MEDIUM`, and `HIGH` calibration confidence levels.
+- Added `local coverage≈` to indicate how much backend weekly usage is approximately explained by local transcript-derived credits.
+- Segmented calibration by hashed local account key, backend plan, rate-card version, standard/Fast credit mode, and weekly reset epoch.
+- Added subscription/calibration fields to JSON and CSV output.
+- Added `--no-quota` to disable all auth/quota discovery and weekly calibration.
+- Extended `--cache-info` with the number of stored quota observations.
+- Preserved the 144-cell terminal report cap, Unicode/CJK-aware layout, incremental rollout cache, and Windows/macOS/Linux support.
+- Added synthetic tests for local plan decoding, weekly-window selection, repeated calibration, and quota-enabled CLI output.
+
 ## 1.4.3 — 2026-08-12
 
 - Capped wide-terminal rendering to a stable 144-cell report column, matching the canonical `...ROTATE warnings.` status note.

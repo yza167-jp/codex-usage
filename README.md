@@ -2,92 +2,57 @@
 
 [中文说明](README.zh-CN.md)
 
-`codex-usage` is an **unofficial, local-first Codex usage profiler**. It reads Codex session transcripts on your machine and summarizes token activity and estimated credit usage by session, model, main agent, and subagent.
+`codex-usage` is an **unofficial, local-first Codex usage profiler**. It reads the Codex data already stored on your machine and answers a practical question:
 
-It is designed for a question the built-in usage views do not answer directly:
+> Which Codex session is using my allowance, why is it expensive, and roughly how much of my weekly subscription allowance did it consume?
 
-> Which Codex session is using my allowance, and why?
+The core tool is a single Python script with **no mandatory third-party dependencies**. It supports macOS, Windows 10/11, and Linux.
 
-The core tool is a single Python script with **no mandatory third-party dependencies**. **v1.4.0 adds native Windows support** alongside macOS and Linux.
+## v1.5.0: subscription-aware estimates
 
-**v1.4.1** is a terminal-UX polish release: health-aware session colors, adaptive column widths, compact detail headers, and unambiguous timezone labels.
+v1.5.0 adds two different kinds of quota information and keeps them deliberately separate:
 
-**v1.4.2** fixes Unicode terminal-cell width handling so CJK and mixed-language session titles stay aligned instead of pushing numeric columns onto a new line. It remains dependency-free.
+- **`WEEKLY`** — the latest backend-reported weekly used/remaining percentage found in local Codex rollout telemetry. This is a quota snapshot, not reconstructed from tokens.
+- **`WEEKLY≈`** — an estimate of how much of that weekly allowance a local session consumed. It is learned from the relationship between locally reconstructed `CREDITS*` and repeated backend weekly-percentage observations.
 
-**v1.4.3** caps wide-terminal output to a stable readable report column and aligns the rightmost `SESSION%` edge across detailed breakdown tables.
+Example:
+
+```text
+Codex usage — last 6h (...) — CST (UTC+08:00)
+Credit mode: Standard credits (rate card 2026-08-12)
+Subscription  Pro 5x · WEEKLY 43.0% used / 57.0% left · reset 3d18h · snapshot 20s
+Calibration   1% weekly ≈ 397.0 credits* · MEDIUM · 4 clean / 6.0pp · local coverage≈91%
+
+SESSION                         MODEL(S)       CREDITS*  WEEKLY≈  CACHE TAX  1H BURN  SHARE  STATUS
+/goal durable ultragoal         5.6 Sol / Luna    814.1     2.05%      632.5     134.5  60.9%  ACTIVE/WATCH
+another task                    5.6 Sol            203.1     0.51%      125.1     203.1  15.2%  ACTIVE/OK
+```
+
+`WEEKLY≈` is intentionally marked with `≈`: it is an attribution estimate, **not** an authoritative OpenAI billing/quota meter.
 
 ## Highlights
 
 - Per-session usage for `today`, `yesterday`, exact dates, date ranges, or rolling windows such as `6h`, `12h`, `24h`, and any `Nh`.
-- Model breakdown for GPT-5.6 Sol / Terra / Luna, GPT-5.5, GPT-5.4, and GPT-5.4 mini.
-- Main-agent vs. subagent attribution, with subagents rolled into their root session by default.
-- `CACHE TAX`: estimated credits attributable to cached input tokens.
-- `1H BURN`: credits observed in the trailing 60 minutes for live usage diagnostics.
-- `ACTIVE`, `RECENT`, `IDLE`, and `OK` / `WATCH` / `ROTATE` workflow hints.
-- ANSI colors for fast terminal scanning, including automatic VT enablement on supported Windows consoles.
-- Incremental SQLite index: after the first scan, unchanged JSONL files are not re-read and append-only sessions are parsed from the tail.
-- Warm-cache discovery avoids walking the entire historical session tree on every invocation.
-- JSON and CSV output for downstream analysis.
+- Estimated credits by model, root/main agent, and subagent.
+- `CACHE TAX`: the estimated credit component attributable to cached input.
+- `1H BURN`: credits observed in the trailing 60 minutes.
+- `ACTIVE`, `RECENT`, `IDLE` plus `OK`, `WATCH`, `ROTATE` workflow hints.
+- **v1.5:** local ChatGPT plan detection, backend weekly quota snapshot, adaptive `CREDITS* → WEEKLY≈` calibration, confidence level, and local-coverage estimate.
+- Incremental SQLite index and warm-cache discovery for fast repeated queries.
+- ANSI color output, CJK-aware terminal-cell layout, and a stable 144-cell maximum report width.
+- JSON and CSV output.
 - Windows PowerShell installer and CMD launcher.
-- Cross-platform CI on Windows, macOS, and Linux.
+- CI on Windows/macOS/Linux with Python 3.9 and 3.13.
 
 ## Requirements
 
 - Python **3.9+**
-- A local Codex installation that stores session transcripts under `$CODEX_HOME` / `%CODEX_HOME%`, or a path supplied with `--codex-home`
-- Windows 10/11, macOS, or Linux
+- A local Codex installation with session transcripts under `$CODEX_HOME` / `%CODEX_HOME%`, or a directory supplied with `--codex-home`
+- macOS, Windows 10/11, or Linux
 
-No external Python packages are required for normal local-time usage.
-
-### Windows time-zone note
-
-Python on Windows does not normally ship an IANA time-zone database. You do **not** need one for the default system-local time zone. If you explicitly use a named IANA zone such as:
-
-```powershell
-codex-usage 24h --timezone Asia/Tokyo
-```
-
-and Python reports that the zone is unavailable, install the optional `tzdata` package:
-
-```powershell
-py -3 -m pip install tzdata
-```
+No external Python packages are required for normal usage.
 
 ## Install
-
-### Windows (PowerShell)
-
-Clone the repository and run the included installer:
-
-```powershell
-git clone https://github.com/yza167-jp/codex-usage.git
-cd codex-usage
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
-```
-
-The installer copies `codex-usage` and `codex-usage.cmd` to:
-
-```text
-%LOCALAPPDATA%\Programs\codex-usage
-```
-
-and adds that directory to your **user PATH**. Open a new terminal and verify:
-
-```powershell
-codex-usage --version
-```
-
-You can choose another install directory:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallDir C:\Tools\codex-usage
-```
-
-Or run without installing:
-
-```powershell
-py -3 .\codex-usage 24h
-```
 
 ### macOS / Linux
 
@@ -98,234 +63,237 @@ mkdir -p ~/.local/bin
 install -m 755 codex-usage ~/.local/bin/codex-usage
 ```
 
-Make sure `~/.local/bin` is on your `PATH`. For zsh:
-
-```bash
-grep -q '.local/bin' ~/.zshrc 2>/dev/null || \
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-Verify:
+Make sure `~/.local/bin` is on `PATH`, then:
 
 ```bash
 codex-usage --version
+codex-usage 6h
 ```
 
-## Quick start
+To update an existing clone:
+
+```bash
+cd /path/to/codex-usage
+git pull
+install -m 755 codex-usage ~/.local/bin/codex-usage
+```
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/yza167-jp/codex-usage.git
+cd codex-usage
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The installer defaults to:
 
 ```text
-codex-usage today
-codex-usage yesterday
+%LOCALAPPDATA%\Programs\codex-usage
+```
+
+Open a new terminal and run:
+
+```powershell
+codex-usage --version
+codex-usage 6h
+```
+
+WSL should be treated as Linux: use the Linux install path and point `--codex-home` at the Codex home visible inside WSL if necessary.
+
+## Basic usage
+
+```bash
 codex-usage 6h
 codex-usage 12h
 codex-usage 24h
-codex-usage 48h
-codex-usage 168h
+codex-usage today
+codex-usage yesterday
 codex-usage week
-codex-usage 7d
-codex-usage 2026-08-10
-codex-usage 2026-08-01..2026-08-10
+codex-usage 168h
+codex-usage 2026-08-12
+codex-usage 2026-08-01..2026-08-12
 ```
 
-`24h` and `yesterday` are intentionally different:
+Useful views:
 
-- `24h`: the exact trailing 24-hour interval ending now.
-- `yesterday`: the previous local calendar day, `00:00–24:00`.
-
-Rolling `Nh` windows are calculated as elapsed time, including across daylight-saving transitions.
-
-## Reading the summary
-
-A typical summary looks like this:
-
-```text
-SESSION                        MODEL(S)            CREDITS*  CACHE TAX  1H BURN  SHARE  STATUS
-current-feature-work (+4 sub)  5.6 Sol / 5.6 Luna    812.4      501.7     184.2   28.6%  ACTIVE/WATCH
-older-long-session             5.6 Sol              2034.8     1510.3         —   71.4%  IDLE
-```
-
-### `CREDITS*`
-
-An estimate reconstructed from local token counters and the embedded Codex credit rate card. It is useful for **relative attribution**—for example, comparing sessions and models—but it is **not the authoritative server-side quota meter**.
-
-### `CACHE TAX`
-
-The estimated credit component caused by cached input tokens. A large cache tax is often a sign that a long-lived main thread is repeatedly carrying a large context.
-
-### `1H BURN`
-
-Credits observed in the trailing 60 minutes. This is a rolling activity metric, not a plan limit or billing forecast.
-
-### `STATUS`
-
-For live windows the tool separates activity state from a workflow heuristic:
-
-- `ACTIVE`: token activity within the last 15 minutes.
-- `RECENT`: activity within the last hour.
-- `IDLE`: no recent activity.
-- `OK`: no strong long-context warning.
-- `WATCH`: context cost is becoming worth monitoring.
-- `ROTATE`: consider checkpointing project state and starting a fresh root session at a natural milestone.
-
-These are local heuristics, not OpenAI product warnings.
-
-## Detailed diagnostics
-
-```text
-codex-usage 24h --details
-```
-
-Adds:
-
-- credit components: cached input / uncached input / output
-- main vs. subagents
-- model breakdown
-- per-agent breakdown
-- last activity time
-- trailing one-hour burn and a simple two-hour linear projection for active threads
-
-By default only the top eight agents are shown per session:
-
-```text
-codex-usage 24h --details --top-agents 5
-codex-usage 24h --details --all-agents
-```
-
-Restore token columns in the summary:
-
-```text
+```bash
+codex-usage 6h --details
 codex-usage 24h --wide
-```
-
-Show each subagent as a separate top-level row instead of rolling it into the root session:
-
-```text
 codex-usage 24h --show-subagents
-```
-
-## Colors
-
-Color is enabled automatically when stdout is an interactive terminal. On Windows, v1.4.0 attempts to enable Virtual Terminal Processing for the current console, so Windows Terminal, modern PowerShell, and supported `cmd.exe` consoles can render the same status colors as macOS/Linux.
-
-```text
-codex-usage 24h --color always
-codex-usage 24h --color never
-```
-
-The standard `NO_COLOR` environment variable is respected. JSON and CSV output never contain ANSI color codes.
-
-## JSON / CSV
-
-```text
+codex-usage 24h --details --all-agents
+codex-usage 24h --perf
 codex-usage 24h --json
 codex-usage 24h --csv
-codex-usage week --csv > codex-week.csv
 ```
 
-## Incremental index and performance
+Disable all v1.5 subscription/quota discovery and calibration:
 
-Codex session transcripts can become large during long-running agent work. `codex-usage` therefore maintains a local SQLite index.
+```bash
+codex-usage 6h --no-quota
+```
+
+## How v1.5 reads the subscription state
+
+v1.5 favors implementation simplicity for an early local tool.
+
+### Plan type
+
+It reads:
+
+```text
+$CODEX_HOME/auth.json
+```
+
+and decodes the local ID-token payload to obtain the ChatGPT plan type. The current display mapping is:
+
+| Codex plan value | Displayed by `codex-usage` |
+|---|---|
+| `plus` | Plus |
+| `prolite` | Pro 5x |
+| `pro` | Pro 20x |
+
+These are display labels used by this tool; the backend plan value is what separates calibration regimes.
+
+### Weekly quota snapshot
+
+Recent rollout JSONL files contain `token_count` events. Current Codex protocol allows those events to carry `rate_limits`, including:
+
+```text
+used_percent
+window_minutes
+resets_at
+plan_type
+```
+
+`codex-usage` examines the tails of the most recently modified rollouts, chooses the newest Codex rate-limit event by event timestamp, and identifies the weekly window by a duration near **10080 minutes (7 days)**. It does **not** assume that `primary` or `secondary` is always the weekly window.
+
+The displayed `WEEKLY 43% used / 57% left` comes from this backend snapshot. Its age is shown so stale telemetry is visible.
+
+## How `WEEKLY≈` learns
+
+The tool keeps local quota observations in the same SQLite cache used for rollout indexing. Each observation contains only the calibration metadata it needs:
+
+```text
+hashed local account key
+plan type
+weekly reset timestamp
+weekly used percent
+local credit-equivalent usage
+rate-card version
+standard/fast credit mode
+snapshot timestamp/source
+```
+
+Raw access/refresh/ID tokens are **not** copied into the `codex-usage` database or printed.
+
+### First estimate
+
+When a weekly snapshot is available, the tool reconstructs local credits from the beginning of that weekly window through the snapshot time.
+
+If the backend says `40%` is used and local history accounts for `15,200 CREDITS*`, the initial effective conversion is:
+
+```text
+1 weekly percentage point ≈ 380 CREDITS*
+effective weekly capacity ≈ 38,000 CREDITS*
+confidence: LOW
+```
+
+This does **not** mean OpenAI granted 38,000 purchased credits. It is only an effective credit-equivalent scale for attributing the included weekly allowance.
+
+### Repeated observations
+
+As new quota snapshots appear, the tool learns from deltas inside the same weekly reset period:
+
+```text
+Δ local CREDITS* / Δ backend weekly used%
+```
+
+It uses a weighted median and rejects conspicuously low/high intervals. Low local-credit-per-percentage intervals often mean some weekly allowance moved because of activity that this machine cannot see.
+
+Confidence progresses roughly as:
+
+- `LEARNING` — no usable conversion yet
+- `LOW` — baseline or too little observed quota movement
+- `MEDIUM` — multiple clean delta intervals
+- `HIGH` — several consistent intervals covering a meaningful amount of weekly movement
+
+Calibration is segmented by account, plan, rate-card version, credit mode, and weekly reset epoch. A new plan/reset therefore does not blindly reuse an incompatible weekly observation series.
+
+## Local coverage
+
+`local coverage≈` compares the locally explained weekly movement with the backend-used percentage under the current calibration.
+
+A low value can indicate activity outside the local transcript set—for example another device or another product sharing the same agentic allowance—or simply an immature calibration. It is diagnostic, not an account audit.
+
+## Credit estimation
+
+`CREDITS*` is reconstructed from local token counters and the embedded rate card. Cached input is a subset of input, so the estimator charges:
+
+```text
+uncached input = input - cached input
+credits* = uncached input component + cached input component + output component
+```
+
+Reasoning tokens are a subset/detail of output and are not charged twice.
+
+`--fast` applies the embedded Fast multiplier to eligible usage. Historical service tier is not reliably persisted in every token event, so `--fast` means “assume eligible usage in this report was Fast.”
+
+Neither `CREDITS*` nor `WEEKLY≈` is the authoritative server-side meter.
+
+## Cache and performance
 
 Default cache locations:
 
-- Windows: `%LOCALAPPDATA%\codex-usage\index-v2.sqlite3`
 - macOS: `~/Library/Caches/codex-usage/index-v2.sqlite3`
-- Linux: `${XDG_CACHE_HOME:-~/.cache}/codex-usage/index-v2.sqlite3`
+- Windows: `%LOCALAPPDATA%\codex-usage\index-v2.sqlite3`
+- Linux: `$XDG_CACHE_HOME/codex-usage/index-v2.sqlite3` or `~/.cache/codex-usage/index-v2.sqlite3`
 
-Inspect performance:
+The cache stores token-event indexes and quota calibration observations. It does not copy full prompts/responses.
 
-```text
+After the first scan, unchanged rollout JSONL files are not re-read; active append-only files are parsed from their new tail. v1.5 may need a one-time scan of the current weekly window so it can build the first subscription calibration baseline.
+
+Diagnostics:
+
+```bash
 codex-usage 24h --perf
-```
-
-Example:
-
-```text
-Perf: incremental-index | discovery=hot 0.004s | files=86 | hits=27 | cold=0 | ancestor=0 | tail=1 | skipped-old=58 | read=0.2 MiB | sync=0.006s | total=0.24s
-```
-
-Useful maintenance commands:
-
-```text
 codex-usage --cache-info
-codex-usage 24h --rebuild-cache --perf
-codex-usage 24h --no-cache
 codex-usage 24h --full-discovery --perf
+codex-usage 24h --no-cache
 ```
 
-The index stores only the metadata and token counters needed for statistics. It does **not** copy prompt or response bodies into the SQLite cache.
+A cache rebuild is normally unnecessary when upgrading from v1.4.x to v1.5.0; the quota-observation table is additive.
 
-## Codex data location
+## Time zones
 
-The default is:
+By default the tool uses the operating system's local timezone and displays both the name/abbreviation and UTC offset, for example:
 
 ```text
-~/.codex
+CST (UTC+08:00)
 ```
 
-which maps to the user's home directory on Windows, macOS, and Linux. Override it with either the `CODEX_HOME` environment variable or:
+Explicit IANA zones are supported with `--timezone`, for example:
 
-```text
-codex-usage 24h --codex-home <path>
+```bash
+codex-usage 24h --timezone Asia/Tokyo
 ```
 
-If your Codex sessions live inside **WSL**, the simplest and most reliable option is to run `codex-usage` inside the same WSL distribution. A native Windows invocation can still use `--codex-home` for a Windows-accessible transcript path, but the persistent profiler cache should remain on a local Windows filesystem for best SQLite performance.
+Windows does not always ship the IANA timezone database with Python. System-local time works without it; explicit IANA zones may require the optional `tzdata` package.
 
-## Fast mode
+## Privacy / trust boundary
 
-If every eligible request in the selected window used Codex Fast mode, you can estimate credits with the published Fast multiplier:
+This tool is local-first, but **v1.5 reads `auth.json`**, which is a credential-bearing Codex file. The implementation only decodes metadata needed for plan/account segmentation and never intentionally prints or persists the raw tokens. Still, if you distribute or audit the tool, treat this code path with the same care as any software that can read your Codex home directory.
 
-```text
-codex-usage 24h --fast
-```
+Use `--no-quota` if you do not want `codex-usage` to inspect subscription/auth metadata.
 
-Historical speed tier is not reliably present in the local `token_count` events, so `--fast` means **assume all eligible usage in this report used Fast mode**. Do not use it for a window that mixed Standard and Fast unless that approximation is acceptable.
+## Limitations
 
-## Data sources and accuracy
-
-The tool reads local Codex rollout JSONL and, when present, `state_5.sqlite` for thread metadata. Token counters are converted into estimated credits using the rate card embedded in the script.
-
-Important limitations:
-
-- Local transcripts are telemetry, not the authoritative server-side quota meter.
-- Historical Fast/Standard service tier is not reliably recoverable from token-count events.
-- Model/rate-card changes can make older embedded rates stale; check the `RATE_CARD_AS_OF` value in the script.
-- Full-history forks/subagents can copy inherited token counters. The tool uses parent lineage and cumulative-counter de-duplication to avoid counting inherited history twice when the needed lineage is available.
-- An unresolved child can appear as `[ORPHAN SUB]` rather than being guessed into a parent session.
-
-## Privacy
-
-`codex-usage` is local-first:
-
-- It does not upload your Codex transcripts.
-- It does not require an API key.
-- Its SQLite cache stores usage metadata and counters, not prompt/response bodies.
-- Terminal output can contain local thread titles and project directory names. Review output before posting screenshots or logs publicly.
-
-The repository contains no user-specific paths or session data.
-
-## Cross-platform testing
-
-The repository includes smoke tests for:
-
-- CLI version/help
-- synthetic rollout parsing with and without the incremental cache
-- SQLite read-only URI handling, including paths containing spaces
-- platform-specific default cache paths
-
-GitHub Actions runs the suite on `windows-latest`, `macos-latest`, and `ubuntu-latest` with Python 3.9 and 3.13.
-
-Run locally:
-
-```text
-python -m unittest discover -s tests -v
-```
+- Local transcripts cannot prove that all weekly usage came from this machine.
+- Backend quota semantics and plan behavior can change independently of this project.
+- The credit rate card embedded in a release can become stale.
+- `WEEKLY≈` is most useful after several observations; the first baseline can be biased if much of the weekly usage happened elsewhere.
+- At or after an exhausted included allowance, purchased/flexible credits are a separate concept; `WEEKLY≈` should not be interpreted as extra percentage beyond 100%.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Disclaimer
-
-This project is not affiliated with or endorsed by OpenAI. Codex behavior, transcript formats, models, and rate cards may change. Treat the tool as a local diagnostic aid, not as a billing or quota authority.
