@@ -10,6 +10,8 @@ It is designed for a question the built-in usage views do not answer directly:
 
 The core tool is a single Python script with **no mandatory third-party dependencies**. **v1.4.0 adds native Windows support** alongside macOS and Linux.
 
+**v1.4.1** is a terminal-UX polish release: health-aware session colors, adaptive column widths, compact detail headers, and unambiguous timezone labels.
+
 ## Highlights
 
 - Per-session usage for `today`, `yesterday`, exact dates, date ranges, or rolling windows such as `6h`, `12h`, `24h`, and any `Nh`.

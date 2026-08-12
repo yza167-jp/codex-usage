@@ -55,6 +55,7 @@ import re
 import sqlite3
 import sys
 import time
+import shutil
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -62,7 +63,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 RATE_CARD_AS_OF = "2026-08-12"
 CACHE_SCHEMA_VERSION = 2
 TREND_MINUTES = 60
@@ -1239,6 +1240,21 @@ def _tz_label(tz) -> str:
     return local.tzname() or "local"
 
 
+def _tz_display(tz, now: datetime) -> str:
+    """Human-readable zone label with an unambiguous UTC offset."""
+    label = _tz_label(tz)
+    current = now.astimezone(tz) if tz is not None else now.astimezone()
+    off = current.utcoffset()
+    if off is None:
+        return label
+    total = int(off.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    total = abs(total)
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    return f"{label} (UTC{sign}{hours:02d}:{minutes:02d})"
+
+
 def parse_period(spec: str, tz) -> Tuple[datetime, datetime, str]:
     now = _now_in_tz(tz)
     today = now.date()
@@ -1736,7 +1752,7 @@ def render_table(
     )
 
     lines: List[str] = []
-    tzname = _tz_label(tz)
+    tzname = _tz_display(tz, now)
     mode = "Fast-assumed credits" if fast else "Standard credits"
     lines.append(color.wrap(f"Codex usage — {period_label} — {tzname}", color.BOLD, color.CYAN))
     lines.append(color.wrap(f"Credit mode: {mode} (rate card {RATE_CARD_AS_OF})", color.DIM))
@@ -1746,13 +1762,25 @@ def render_table(
         lines.append("No token_count usage found for this period.")
         return "\n".join(lines)
 
+    terminal_width = max(80, shutil.get_terminal_size(fallback=(120, 24)).columns)
+    gap = 2
     if wide:
         headers = ["SESSION", "MODEL(S)", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "1H BURN", "SHARE", "STATUS"]
-        widths = [36, 18, 9, 9, 9, 10, 10, 9, 7, 13]
+        fixed = [9, 9, 9, 10, 10, 9, 7, 13]
+        fixed_total = sum(fixed) + gap * (len(headers) - 1)
+        flexible = max(28, terminal_width - fixed_total)
+        model_w = max(14, min(24, flexible // 3))
+        session_w = max(18, flexible - model_w)
+        widths = [session_w, model_w] + fixed
         align_right = {2, 3, 4, 5, 6, 7, 8}
     else:
         headers = ["SESSION", "MODEL(S)", "CREDITS*", "CACHE TAX", "1H BURN", "SHARE", "STATUS"]
-        widths = [38, 20, 10, 10, 9, 7, 13]
+        fixed = [10, 10, 9, 7, 13]
+        fixed_total = sum(fixed) + gap * (len(headers) - 1)
+        flexible = max(30, terminal_width - fixed_total)
+        model_w = max(14, min(24, flexible // 3))
+        session_w = max(20, flexible - model_w)
+        widths = [session_w, model_w] + fixed
         align_right = {2, 3, 4, 5}
 
     def styled_cell(padded: str, style: Optional[str]) -> str:
@@ -1821,10 +1849,12 @@ def render_table(
         if is_orphan:
             styles[status_idx] = "orphan"
             styles[title_idx] = "orphan"
-        elif state == "ACTIVE":
-            styles[title_idx] = "active"
-        elif state == "RECENT":
-            styles[title_idx] = "recent"
+        elif state in ("ACTIVE", "RECENT") and health == "ROTATE":
+            styles[title_idx] = "rotate"
+        elif state in ("ACTIVE", "RECENT") and health == "WATCH":
+            styles[title_idx] = "watch"
+        elif state in ("ACTIVE", "RECENT") and health == "OK":
+            styles[title_idx] = "ok" if state == "ACTIVE" else "recent"
         else:
             styles[title_idx] = "idle"
 
@@ -1898,38 +1928,46 @@ def render_table(
     if details:
         for b, total_u, total_credits, _, total_cache_tax, state, health, burn, recent_cache, is_orphan in rows:
             lines.append("")
-            lines.append(color.wrap("=" * 104, color.BLUE))
-            title_style = (color.BOLD, color.GREEN) if state == "ACTIVE" else (color.BOLD, color.CYAN)
+            detail_width = max(72, min(120, terminal_width))
+            lines.append(color.wrap("=" * detail_width, color.BLUE))
             if is_orphan:
                 title_style = (color.BOLD, color.MAGENTA)
-            lines.append(color.wrap(b.title, *title_style))
+            elif health == "ROTATE" and state in ("ACTIVE", "RECENT"):
+                title_style = (color.BOLD, color.RED)
+            elif health == "WATCH" and state in ("ACTIVE", "RECENT"):
+                title_style = (color.BOLD, color.YELLOW)
+            elif health == "OK" and state == "ACTIVE":
+                title_style = (color.BOLD, color.GREEN)
+            else:
+                title_style = (color.BOLD, color.CYAN) if state == "RECENT" else (color.DIM,)
+            short_title = truncate(b.title, max(30, detail_width - 9))
+            lines.append(color.wrap(f"DETAILS  {short_title}", *title_style))
             lines.append(f"session: {b.session_id}")
             if b.cwd:
                 lines.append(f"cwd: {b.cwd}")
             if b.child_sessions:
-                lines.append(f"rolled-up subagents: {len(b.child_sessions)}")
+                lines.append(f"subagents in window: {len(b.child_sessions)}")
             if is_orphan:
                 lines.append(color.wrap(
                     "lineage: ORPHAN SUBAGENT (parent unavailable/unresolved locally)",
                     color.BOLD, color.MAGENTA,
                 ))
 
-            lines.append(
-                f"state: {styled_cell(state, 'active' if state == 'ACTIVE' else 'recent' if state == 'RECENT' else 'idle').strip()}  "
-                f"last activity: {human_age(b.last_activity, now)} ago"
-            )
+            state_style = 'active' if state == 'ACTIVE' else 'recent' if state == 'RECENT' else 'idle'
+            state_text = styled_cell(state, state_style).strip()
+            health_text = "—"
             if health != "—":
                 hstyle = "rotate" if health == "ROTATE" else "watch" if health == "WATCH" else "ok"
-                lines.append(f"thread health: {styled_cell(health, hstyle).strip()}")
-            else:
-                lines.append("thread health: —")
+                health_text = styled_cell(health, hstyle).strip()
+            lines.append(
+                f"{state_text} · last {human_age(b.last_activity, now)} · health {health_text}"
+            )
 
             if burn is not None and burn > 0:
                 projection = burn * 2.0
+                projection_text = f" · +2h ≈{projection:.1f}" if state == "ACTIVE" else ""
                 lines.append(
-                    f"trailing 1h burn: {burn:.1f} credits "
-                    f"(cache {recent_cache:.1f}); "
-                    + (f"simple +2h projection: ≈{projection:.1f}" if state == "ACTIVE" else "projection: —")
+                    f"1H BURN {burn:.1f} · cache {recent_cache:.1f}{projection_text}"
                 )
             lines.append("")
 

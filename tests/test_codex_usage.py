@@ -35,7 +35,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.4.0", proc.stdout)
+        self.assertIn("1.4.1", proc.stdout)
 
     def test_sqlite_i64_handles_unsigned_windows_file_ids(self):
         self.assertEqual(self.mod._sqlite_i64(0), 0)
