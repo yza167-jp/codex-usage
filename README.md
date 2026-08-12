@@ -12,6 +12,8 @@ The core tool is a single Python script with **no mandatory third-party dependen
 
 **v1.4.1** is a terminal-UX polish release: health-aware session colors, adaptive column widths, compact detail headers, and unambiguous timezone labels.
 
+**v1.4.2** fixes Unicode terminal-cell width handling so CJK and mixed-language session titles stay aligned instead of pushing numeric columns onto a new line. It remains dependency-free.
+
 ## Highlights
 
 - Per-session usage for `today`, `yesterday`, exact dates, date ranges, or rolling windows such as `6h`, `12h`, `24h`, and any `Nh`.

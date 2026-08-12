@@ -35,7 +35,33 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.4.1", proc.stdout)
+        self.assertIn("1.4.2", proc.stdout)
+
+    def test_terminal_display_width_handles_cjk_and_combining(self):
+        self.assertEqual(self.mod.display_width("ASCII"), 5)
+        self.assertEqual(self.mod.display_width("中文"), 4)
+        self.assertEqual(self.mod.display_width("A中B"), 4)
+        self.assertEqual(self.mod.display_width("e\u0301"), 1)
+        self.assertEqual(self.mod.display_width("\u200d"), 0)
+
+    def test_terminal_truncate_and_padding_are_cell_aware(self):
+        sample = "请先阅读 AGENTS.md、README.md"
+        for width in (1, 2, 5, 10, 20, 30):
+            clipped = self.mod.truncate(sample, width)
+            self.assertLessEqual(self.mod.display_width(clipped), width)
+
+        left = self.mod.pad_display("中文 session", 18)
+        right = self.mod.pad_display("中文 session", 18, right=True)
+        self.assertEqual(self.mod.display_width(left), 18)
+        self.assertEqual(self.mod.display_width(right), 18)
+        self.assertTrue(left.startswith("中文"))
+        self.assertTrue(right.endswith("session"))
+
+    def test_terminal_rows_do_not_underpad_cjk(self):
+        # This is the regression seen in a wide terminal: len("中文") == 2,
+        # but it occupies four terminal cells. Padding must use display width.
+        cell = self.mod.pad_display("请先阅读 AGENTS.md", 32)
+        self.assertEqual(self.mod.display_width(cell), 32)
 
     def test_sqlite_i64_handles_unsigned_windows_file_ids(self):
         self.assertEqual(self.mod._sqlite_i64(0), 0)

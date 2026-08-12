@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.2 — 2026-08-12
+
+- Fixed CJK / East Asian wide-character alignment in summary and detail tables by measuring terminal cells instead of Python string length.
+- Made Unicode-aware truncation and padding shared by summary rows, detail tables, agent breakdowns, and detail headings.
+- Added regression tests for CJK, mixed Chinese/ASCII text, combining marks, truncation, and left/right padding.
+- Kept the implementation dependency-free using Python's standard `unicodedata` module.
+- No changes to credit estimation, session attribution, rate cards, or the incremental-cache schema.
+
 ## 1.4.1 — 2026-08-12
 
 - Refined terminal colors so session titles follow health first: `OK` green, `WATCH` yellow, `ROTATE` red, with inactive rows dimmed.

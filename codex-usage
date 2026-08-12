@@ -56,6 +56,7 @@ import sqlite3
 import sys
 import time
 import shutil
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -63,7 +64,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 RATE_CARD_AS_OF = "2026-08-12"
 CACHE_SCHEMA_VERSION = 2
 TREND_MINUTES = 60
@@ -1648,12 +1649,67 @@ def model_label(models: Iterable[str]) -> str:
     return " / ".join(items) if items else "?"
 
 
+def _terminal_char_width(ch: str) -> int:
+    """Approximate the number of terminal cells occupied by one Unicode code point.
+
+    The standard library has no full wcwidth implementation, but East Asian
+    Width plus Unicode categories covers the important table-layout cases:
+    CJK wide/fullwidth characters use two cells; combining/format characters
+    use zero; ordinary characters use one. Ambiguous-width characters stay at
+    one cell, matching modern terminals in their default locale behavior.
+    """
+    if not ch:
+        return 0
+    category = unicodedata.category(ch)
+    if category in ("Mn", "Me", "Cf"):
+        return 0
+    # C0/C1 controls should never be used to advance a table cursor estimate.
+    if category == "Cc":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def display_width(s: str) -> int:
+    """Return terminal display width in cells, not Python code-point length."""
+    return sum(_terminal_char_width(ch) for ch in s)
+
+
 def truncate(s: str, width: int) -> str:
-    if width <= 1:
-        return s[:width]
-    if len(s) <= width:
+    """Truncate to at most ``width`` terminal cells, preserving Unicode marks."""
+    if width <= 0:
+        return ""
+    if display_width(s) <= width:
         return s
-    return s[: max(1, width - 1)] + "…"
+
+    ellipsis = "…"
+    ellipsis_width = display_width(ellipsis)
+    if width <= ellipsis_width:
+        return ellipsis if width == ellipsis_width else ""
+
+    budget = width - ellipsis_width
+    out = []
+    used = 0
+    for ch in s:
+        cell_width = _terminal_char_width(ch)
+        if cell_width == 0:
+            # Keep marks/format characters only when they can attach to content
+            # already emitted; avoid returning a leading orphan mark.
+            if out:
+                out.append(ch)
+            continue
+        if used + cell_width > budget:
+            break
+        out.append(ch)
+        used += cell_width
+    return "".join(out).rstrip("\u200d") + ellipsis
+
+
+def pad_display(s: str, width: int, right: bool = False) -> str:
+    """Truncate and pad a table cell using terminal-cell width."""
+    clipped = truncate(s, width)
+    padding = max(0, width - display_width(clipped))
+    spaces = " " * padding
+    return spaces + clipped if right else clipped + spaces
 
 
 def make_buckets(
@@ -1809,8 +1865,7 @@ def render_table(
         styles = styles or {}
         cells = []
         for i, (cell, width) in enumerate(zip(row, use_widths)):
-            t = truncate(str(cell), width)
-            padded = t.rjust(width) if i in use_right else t.ljust(width)
+            padded = pad_display(str(cell), width, right=(i in use_right))
             cells.append(styled_cell(padded, styles.get(i)))
         return "  ".join(cells)
 
@@ -1975,8 +2030,7 @@ def render_table(
                 styles = styles or {}
                 cells = []
                 for i, (cell, width) in enumerate(zip(row, widths_)):
-                    t = truncate(str(cell), width)
-                    padded = t.rjust(width) if i in right_ else t.ljust(width)
+                    padded = pad_display(str(cell), width, right=(i in right_))
                     cells.append(styled_cell(padded, styles.get(i)))
                 return "  ".join(cells)
 
