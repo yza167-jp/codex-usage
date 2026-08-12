@@ -1,0 +1,2262 @@
+#!/usr/bin/env python3
+"""
+codex-usage: per-session Codex token/credit usage from local rollout JSONL files.
+
+Reads:
+  $CODEX_HOME/sessions/**/rollout-*.jsonl
+  $CODEX_HOME/archived_sessions/**/rollout-*.jsonl
+  $CODEX_HOME/state_5.sqlite   (optional, for thread titles)
+
+No third-party Python packages required.
+
+Examples:
+  codex-usage today
+  codex-usage yesterday
+  codex-usage 6h
+  codex-usage 12h
+  codex-usage 24h
+  codex-usage 48h
+  codex-usage week
+  codex-usage 7d
+  codex-usage 2026-08-12
+  codex-usage 2026-08-01..2026-08-12
+  codex-usage today --show-subagents
+  codex-usage today --fast
+  codex-usage today --json
+  codex-usage 24h --details --perf
+  codex-usage 24h --wide
+  codex-usage 24h --details --all-agents
+  codex-usage --cache-info
+
+Notes:
+- `input_tokens` in Codex usage includes cached input tokens. Credit estimation
+  charges only (input - cached) at the normal input rate, and cached input at
+  the cached-input rate.
+- reasoning_output_tokens is a subset/detail of output_tokens and is NOT added
+  again when estimating credits.
+- Fast/priority service tier is not reliably persisted in token_count JSONL
+  events. `--fast` means "assume all eligible OpenAI-model usage in this
+  report was Fast".
+- Session JSONL is local telemetry, not the authoritative server-side meter.
+- v1.3 keeps the incremental SQLite index, adds a hot-path discovery mode,
+  live/idle thread state, trailing-1h burn diagnostics, compact/colorized terminal
+  output, and bounded agent detail. On macOS the cache lives under
+  ~/Library/Caches/codex-usage/.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import platform
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+VERSION = "1.3.0"
+RATE_CARD_AS_OF = "2026-08-12"
+CACHE_SCHEMA_VERSION = 2
+TREND_MINUTES = 60
+ACTIVE_MINUTES = 15
+RECENT_MINUTES = 60
+FULL_DISCOVERY_INTERVAL_S = 15 * 60
+
+# Official Codex ChatGPT credit rate card, credits per 1M tokens.
+# Updated for the GPT-5.6-era rate card current at script creation.
+RATE_CARD: Dict[str, Tuple[float, float, float]] = {
+    "gpt-5.6-sol": (125.0, 12.5, 750.0),
+    "gpt-5.6": (125.0, 12.5, 750.0),  # Codex default alias -> Sol family
+    "daybreak-blue": (125.0, 12.5, 750.0),
+    "daybreak-red": (312.5, 31.25, 1875.0),
+    "gpt-5.6-terra": (50.0, 5.0, 300.0),
+    "gpt-5.6-luna": (5.0, 0.5, 30.0),
+    "gpt-5.5": (125.0, 12.5, 750.0),
+    "gpt-5.4": (62.5, 6.25, 375.0),
+    "gpt-5.4-mini": (18.75, 1.875, 113.0),
+}
+
+# Fast mode multipliers published by OpenAI.
+FAST_MULTIPLIERS: Dict[str, float] = {
+    "gpt-5.6-sol": 2.5,
+    "gpt-5.6": 2.5,
+    "gpt-5.6-terra": 2.5,
+    "gpt-5.6-luna": 2.5,
+    "gpt-5.5": 2.5,
+    "gpt-5.4": 2.0,
+}
+
+UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+CORE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+@dataclass(frozen=True)
+class Usage:
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    total_tokens: int = 0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Usage":
+        def n(key: str) -> int:
+            try:
+                return max(0, int(d.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        return cls(
+            input_tokens=n("input_tokens"),
+            cached_input_tokens=n("cached_input_tokens"),
+            output_tokens=n("output_tokens"),
+            reasoning_output_tokens=n("reasoning_output_tokens"),
+            total_tokens=n("total_tokens"),
+        )
+
+    def key(self) -> Tuple[int, int, int, int, int]:
+        return (
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+            self.total_tokens,
+        )
+
+    def minus(self, prev: "Usage") -> "Usage":
+        # Normal case: cumulative counters only increase.
+        vals = {}
+        reset = any(
+            getattr(self, f) < getattr(prev, f)
+            for f in ("input_tokens", "cached_input_tokens", "output_tokens")
+        )
+        for f in CORE_FIELDS:
+            cur = getattr(self, f)
+            old = getattr(prev, f)
+            vals[f] = cur if reset else max(0, cur - old)
+        return Usage(**vals)
+
+    def __add__(self, other: "Usage") -> "Usage":
+        return Usage(**{
+            f: getattr(self, f) + getattr(other, f)
+            for f in CORE_FIELDS
+        })
+
+    def nonzero(self) -> bool:
+        return any(
+            getattr(self, f) > 0
+            for f in ("input_tokens", "cached_input_tokens", "output_tokens")
+        )
+
+
+@dataclass
+class UsageEvent:
+    ts: datetime
+    cumulative: Usage
+    model: str
+
+
+@dataclass
+class CacheStats:
+    discovered_files: int = 0
+    cache_hits: int = 0
+    cold_scans: int = 0
+    incremental_scans: int = 0
+    skipped_old_uncached: int = 0
+    ancestor_scans: int = 0
+    bytes_read: int = 0
+    parsed_records: int = 0
+    elapsed_s: float = 0.0
+    discovery_s: float = 0.0
+    discovery_mode: str = "full"
+
+
+@dataclass
+class RawSession:
+    session_id: str
+    path: Path
+    created_at: Optional[datetime] = None
+    cwd: str = ""
+    source: object = ""
+    thread_source: object = ""
+    originator: str = ""
+    parent_id: str = ""
+    forked_from_id: str = ""
+    model_provider: str = ""
+    usage_events: List[UsageEvent] = field(default_factory=list)
+    malformed_lines: int = 0
+
+    def is_subagent(self) -> bool:
+        if str(self.thread_source).lower() == "subagent":
+            return True
+        if isinstance(self.source, dict) and "subagent" in self.source:
+            return True
+        s = str(self.source).lower()
+        return "subagent" in s
+
+    def lineage_parent(self) -> str:
+        return self.parent_id or self.forked_from_id
+
+
+@dataclass
+class Bucket:
+    session_id: str
+    title: str = ""
+    cwd: str = ""
+    source: str = ""
+    usage_by_model: Dict[str, Usage] = field(default_factory=dict)
+    # source session -> model -> usage. This preserves the main/subagent split
+    # even when the default top-level view rolls child agents into their root.
+    usage_by_source: Dict[str, Dict[str, Usage]] = field(default_factory=dict)
+    source_titles: Dict[str, str] = field(default_factory=dict)
+    source_is_subagent: set = field(default_factory=set)
+    # Trailing TREND_MINUTES usage is kept separately for live burn-rate hints.
+    recent_usage_by_model: Dict[str, Usage] = field(default_factory=dict)
+    first_activity: Optional[datetime] = None
+    last_activity: Optional[datetime] = None
+    event_count: int = 0
+    child_sessions: set = field(default_factory=set)
+
+    def add(
+        self,
+        model: str,
+        usage: Usage,
+        source_session_id: str,
+        source_title: str = "",
+        is_subagent: bool = False,
+        activity_ts: Optional[datetime] = None,
+        recent: bool = False,
+    ) -> None:
+        model = model or "unknown"
+        self.usage_by_model[model] = self.usage_by_model.get(model, Usage()) + usage
+
+        by_model = self.usage_by_source.setdefault(source_session_id, {})
+        by_model[model] = by_model.get(model, Usage()) + usage
+        if source_title:
+            self.source_titles[source_session_id] = source_title
+        if is_subagent:
+            self.source_is_subagent.add(source_session_id)
+
+        if activity_ts is not None:
+            if self.first_activity is None or activity_ts < self.first_activity:
+                self.first_activity = activity_ts
+            if self.last_activity is None or activity_ts > self.last_activity:
+                self.last_activity = activity_ts
+        if recent:
+            self.recent_usage_by_model[model] = (
+                self.recent_usage_by_model.get(model, Usage()) + usage
+            )
+
+        self.event_count += 1
+        if source_session_id != self.session_id:
+            self.child_sessions.add(source_session_id)
+
+    def total_usage(self) -> Usage:
+        out = Usage()
+        for u in self.usage_by_model.values():
+            out = out + u
+        return out
+
+    def source_usage(self, source_session_id: str) -> Usage:
+        out = Usage()
+        for u in self.usage_by_source.get(source_session_id, {}).values():
+            out = out + u
+        return out
+
+
+class Colorizer:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+
+    def __init__(self, mode: str = "auto"):
+        if mode == "always":
+            self.enabled = True
+        elif mode == "never":
+            self.enabled = False
+        else:
+            self.enabled = (
+                sys.stdout.isatty()
+                and os.environ.get("TERM", "") != "dumb"
+                and "NO_COLOR" not in os.environ
+            )
+
+    def wrap(self, text: str, *styles: str) -> str:
+        if not self.enabled or not styles:
+            return text
+        return "".join(styles) + text + self.RESET
+
+
+def eprint(*args, **kwargs) -> None:
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def short_sid(sid: str) -> str:
+    # 8 hex chars collide frequently for UUIDv7 threads created close together.
+    return sid[:13] if len(sid) >= 13 else sid
+
+
+def human_age(ts: Optional[datetime], now: datetime) -> str:
+    if ts is None:
+        return "—"
+    seconds = max(0, int((now - ts).total_seconds()))
+    if seconds < 60:
+        return "now" if seconds < 10 else f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        rem = minutes % 60
+        return f"{hours}h{rem:02d}m" if rem else f"{hours}h"
+    days = hours // 24
+    return f"{days}d"
+
+
+def parse_ts(value: object) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def id_from_filename(path: Path) -> str:
+    matches = UUID_RE.findall(path.name)
+    return matches[-1] if matches else path.stem
+
+
+def normalize_model(model: object) -> str:
+    if not model:
+        return "unknown"
+    s = str(model).strip().lower()
+    # Bedrock IDs can still be recognized for token comparison, but ChatGPT
+    # credits do not apply to API-key/Bedrock usage. We leave the provider
+    # check to credit calculation.
+    if s.startswith("openai."):
+        s = s[len("openai."):]
+    return s
+
+
+def _full_discover_rollouts(codex_home: Path, include_archived: bool) -> List[Path]:
+    roots = [codex_home / "sessions"]
+    if include_archived:
+        roots.append(codex_home / "archived_sessions")
+
+    # Do not resolve() every path: on APFS that creates needless metadata I/O.
+    seen = set()
+    out: List[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*.jsonl"):
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def _epoch_seconds(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        x = float(value)
+        # Be tolerant of ms/us/ns epoch encodings.
+        while x > 100_000_000_000:
+            x /= 1000.0
+        return x
+    dt = parse_ts(value)
+    return dt.timestamp() if dt is not None else None
+
+
+def _recent_state_rollouts(codex_home: Path, since_epoch: float) -> List[Path]:
+    """Best-effort recent rollout paths from Codex's local thread index."""
+    db = codex_home / "state_5.sqlite"
+    if not db.exists():
+        return []
+    out: List[Path] = []
+    try:
+        conn = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True, timeout=0.5)
+        conn.row_factory = sqlite3.Row
+    except (sqlite3.Error, OSError):
+        return out
+    try:
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(threads)")}
+        if "rollout_path" not in cols:
+            return out
+        wanted = ["rollout_path"]
+        if "updated_at" in cols:
+            wanted.append("updated_at")
+        q = "SELECT " + ",".join(f'"{c}"' for c in wanted) + ' FROM "threads"'
+        for row in conn.execute(q):
+            raw = row["rollout_path"]
+            if not raw:
+                continue
+            if "updated_at" in wanted:
+                updated = _epoch_seconds(row["updated_at"])
+                if updated is not None and updated < since_epoch:
+                    continue
+            p = Path(str(raw)).expanduser()
+            if not p.is_absolute():
+                p = codex_home / p
+            out.append(p)
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return out
+
+
+def _recent_date_rollouts(
+    codex_home: Path,
+    start: datetime,
+    end: datetime,
+) -> List[Path]:
+    """Scan only date buckets intersecting the report window."""
+    root = codex_home / "sessions"
+    if not root.exists():
+        return []
+    # Include one prior date for sessions created just before a rolling window.
+    d = (start - timedelta(days=1)).date()
+    last = min(end, datetime.now(end.tzinfo) + timedelta(days=1)).date()
+    out: List[Path] = []
+    max_days = 45
+    days = 0
+    while d <= last and days <= max_days:
+        folder = root / f"{d.year:04d}" / f"{d.month:02d}" / f"{d.day:02d}"
+        if folder.exists():
+            out.extend(folder.rglob("*.jsonl"))
+        d += timedelta(days=1)
+        days += 1
+    return out
+
+
+def discover_rollouts(
+    codex_home: Path,
+    include_archived: bool,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    cache_conn: Optional[sqlite3.Connection] = None,
+    force_full: bool = False,
+) -> Tuple[List[Path], str, float]:
+    """
+    Full discovery is the reliability baseline. On a warm cache, a hot path
+    avoids walking the entire historical tree on every invocation by combining:
+      1) all already-indexed rollout paths,
+      2) date buckets overlapping the requested window,
+      3) recently updated rollout paths from state_5.sqlite.
+    A full tree walk still runs periodically as a safety net.
+    """
+    t0 = time.perf_counter()
+    if cache_conn is None or start is None or end is None:
+        paths = _full_discover_rollouts(codex_home, include_archived)
+        return paths, "full", time.perf_counter() - t0
+
+    row = cache_conn.execute(
+        "SELECT value FROM meta WHERE key='last_full_discovery_epoch'"
+    ).fetchone()
+    last_full = float(row[0]) if row is not None else 0.0
+    indexed_n = int(cache_conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+    now_epoch = time.time()
+
+    must_full = (
+        force_full
+        or indexed_n == 0
+        or (now_epoch - last_full) >= FULL_DISCOVERY_INTERVAL_S
+        or (end - start) > timedelta(days=45)
+    )
+    if must_full:
+        paths = _full_discover_rollouts(codex_home, include_archived)
+        cache_conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('last_full_discovery_epoch',?)",
+            (str(now_epoch),),
+        )
+        cache_conn.commit()
+        return paths, "full", time.perf_counter() - t0
+
+    seen: Dict[str, Path] = {}
+
+    # Indexed files are few after the cold-window optimization and include
+    # long-lived sessions that were created outside the current date buckets.
+    for row in cache_conn.execute("SELECT path FROM files"):
+        p = Path(str(row[0]))
+        seen[str(p)] = p
+
+    for p in _recent_date_rollouts(codex_home, start, end):
+        seen[str(p)] = p
+
+    # state_5 catches an old thread that becomes active again after its original
+    # date directory has fallen outside the current rolling window.
+    state_since = start.timestamp() - 3600.0
+    for p in _recent_state_rollouts(codex_home, state_since):
+        seen[str(p)] = p
+
+    paths = list(seen.values())
+    return paths, "hot", time.perf_counter() - t0
+
+
+def _line_is_relevant(raw: bytes) -> bool:
+    # Record type is near the beginning of Codex JSONL lines. Restricting the
+    # substring search to the first 4 KiB avoids scanning giant compacted/image
+    # payloads for keywords that may happen to occur in user content.
+    head = raw[:4096]
+    if b"session_meta" in head:
+        return True
+    if b"turn_context" in head:
+        return True
+    return b"event_msg" in head and b"token_count" in head
+
+
+def _apply_record(session: RawSession, rec: dict, current_model: str, own_meta_seen: bool):
+    """Apply one relevant JSONL record; return (model, own_meta_seen, event)."""
+    rtype = rec.get("type")
+    payload = rec.get("payload") or {}
+    ts = parse_ts(rec.get("timestamp"))
+    event = None
+
+    if rtype == "session_meta" and isinstance(payload, dict):
+        if not own_meta_seen:
+            own_meta_seen = True
+            sid = payload.get("id") or payload.get("session_id")
+            if sid:
+                session.session_id = str(sid)
+            session.cwd = str(payload.get("cwd") or "")
+            session.source = payload.get("source") or ""
+            session.thread_source = payload.get("thread_source") or ""
+            session.originator = str(payload.get("originator") or "")
+            session.parent_id = str(payload.get("parent_thread_id") or "")
+            session.forked_from_id = str(payload.get("forked_from_id") or "")
+            session.model_provider = str(payload.get("model_provider") or "")
+            session.created_at = (
+                parse_ts(payload.get("created_at"))
+                or parse_ts(payload.get("timestamp"))
+                or ts
+            )
+        return current_model, own_meta_seen, None
+
+    if rtype == "turn_context" and isinstance(payload, dict):
+        current_model = normalize_model(payload.get("model") or current_model)
+        return current_model, own_meta_seen, None
+
+    if (
+        rtype == "event_msg"
+        and isinstance(payload, dict)
+        and payload.get("type") == "token_count"
+    ):
+        info = payload.get("info") or {}
+        total = info.get("total_token_usage") if isinstance(info, dict) else None
+        if isinstance(total, dict) and ts is not None:
+            event = UsageEvent(ts=ts, cumulative=Usage.from_dict(total), model=current_model)
+    return current_model, own_meta_seen, event
+
+
+def parse_rollout(path: Path) -> Optional[RawSession]:
+    """Full parse used by --no-cache; binary/pre-filtered to minimize allocations."""
+    session = RawSession(session_id=id_from_filename(path), path=path)
+    own_meta_seen = False
+    current_model = "unknown"
+
+    try:
+        fh = path.open("rb", buffering=4 * 1024 * 1024)
+    except OSError:
+        return None
+
+    with fh:
+        for raw in fh:
+            if not raw.startswith(b"{") or not _line_is_relevant(raw):
+                continue
+            try:
+                rec = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, MemoryError):
+                session.malformed_lines += 1
+                continue
+            current_model, own_meta_seen, event = _apply_record(
+                session, rec, current_model, own_meta_seen
+            )
+            if event is not None:
+                session.usage_events.append(event)
+
+    if not own_meta_seen and not session.usage_events:
+        return None
+    if session.created_at is None and session.usage_events:
+        session.created_at = session.usage_events[0].ts
+    return session
+
+
+def default_cache_path() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "codex-usage" / "index-v2.sqlite3"
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "codex-usage" / "index-v2.sqlite3"
+
+
+def _cache_connect(cache_path: Path) -> sqlite3.Connection:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(cache_path), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+
+    # Apple Silicon optimized profile: the index itself is typically small, so keep
+    # a generous SQLite page cache and mmap the *index database only*.
+    # Raw rollout JSONL remains sequentially streamed instead of mmap'd.
+    if sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64"):
+        cache_kib = 128 * 1024
+        mmap_bytes = 256 * 1024 * 1024
+    else:
+        cache_kib = 32 * 1024
+        mmap_bytes = 64 * 1024 * 1024
+
+    for pragma in (
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA temp_store=MEMORY",
+        f"PRAGMA cache_size=-{cache_kib}",
+        f"PRAGMA mmap_size={mmap_bytes}",
+    ):
+        try:
+            conn.execute(pragma)
+        except sqlite3.Error:
+            pass
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            dev INTEGER NOT NULL DEFAULT 0,
+            ino INTEGER NOT NULL DEFAULT 0,
+            observed_size INTEGER NOT NULL DEFAULT 0,
+            mtime_ns INTEGER NOT NULL DEFAULT 0,
+            offset INTEGER NOT NULL DEFAULT 0,
+            session_id TEXT NOT NULL,
+            current_model TEXT NOT NULL DEFAULT 'unknown',
+            own_meta_seen INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT,
+            cwd TEXT NOT NULL DEFAULT '',
+            source_json TEXT NOT NULL DEFAULT '""',
+            thread_source_json TEXT NOT NULL DEFAULT '""',
+            originator TEXT NOT NULL DEFAULT '',
+            parent_id TEXT NOT NULL DEFAULT '',
+            forked_from_id TEXT NOT NULL DEFAULT '',
+            model_provider TEXT NOT NULL DEFAULT '',
+            malformed_lines INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS events (
+            path TEXT NOT NULL,
+            byte_offset INTEGER NOT NULL,
+            ts TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            cached_input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            reasoning_output_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            PRIMARY KEY(path, byte_offset)
+        );
+        CREATE INDEX IF NOT EXISTS events_path_offset ON events(path, byte_offset);
+        CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+        """
+    )
+
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row is not None and int(row[0]) != CACHE_SCHEMA_VERSION:
+        conn.executescript("DELETE FROM events; DELETE FROM files; DELETE FROM meta;")
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
+        (str(CACHE_SCHEMA_VERSION),),
+    )
+    conn.commit()
+    return conn
+
+
+def _json_text(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+def _json_value(value: object) -> object:
+    if value is None:
+        return ""
+    try:
+        return json.loads(str(value))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return str(value)
+
+
+def _session_from_cache_row(row: sqlite3.Row, path: Path) -> RawSession:
+    return RawSession(
+        session_id=str(row["session_id"]),
+        path=path,
+        created_at=parse_ts(row["created_at"]),
+        cwd=str(row["cwd"] or ""),
+        source=_json_value(row["source_json"]),
+        thread_source=_json_value(row["thread_source_json"]),
+        originator=str(row["originator"] or ""),
+        parent_id=str(row["parent_id"] or ""),
+        forked_from_id=str(row["forked_from_id"] or ""),
+        model_provider=str(row["model_provider"] or ""),
+        malformed_lines=int(row["malformed_lines"] or 0),
+    )
+
+
+def _scan_file_into_cache(
+    conn: sqlite3.Connection,
+    path: Path,
+    stats: CacheStats,
+    force_reset: bool = False,
+) -> None:
+    p = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return
+
+    row = conn.execute("SELECT * FROM files WHERE path=?", (p,)).fetchone()
+    reset = force_reset
+    start_offset = 0
+    current_model = "unknown"
+    own_meta_seen = False
+
+    if row is not None and not force_reset:
+        same_identity = int(row["dev"]) == int(st.st_dev) and int(row["ino"]) == int(st.st_ino)
+        old_size = int(row["observed_size"])
+        old_offset = int(row["offset"])
+        same_snapshot = (
+            same_identity
+            and old_size == int(st.st_size)
+            and int(row["mtime_ns"]) == int(st.st_mtime_ns)
+            and old_offset >= int(st.st_size)
+        )
+        if same_snapshot:
+            stats.cache_hits += 1
+            return
+
+        # Codex rollout files are append-only. A same-inode size increase is the
+        # normal incremental case. Same-size content modification or truncation
+        # is treated conservatively as a rewrite.
+        append_only = same_identity and int(st.st_size) >= old_size
+        if int(st.st_size) == old_size and int(st.st_mtime_ns) != int(row["mtime_ns"]):
+            append_only = False
+        if append_only:
+            start_offset = min(old_offset, int(st.st_size))
+            current_model = str(row["current_model"] or "unknown")
+            own_meta_seen = bool(row["own_meta_seen"])
+            session = _session_from_cache_row(row, path)
+            stats.incremental_scans += 1
+        else:
+            reset = True
+    else:
+        session = RawSession(session_id=id_from_filename(path), path=path)
+        stats.cold_scans += 1
+
+    if reset:
+        conn.execute("DELETE FROM events WHERE path=?", (p,))
+        conn.execute("DELETE FROM files WHERE path=?", (p,))
+        session = RawSession(session_id=id_from_filename(path), path=path)
+        start_offset = 0
+        current_model = "unknown"
+        own_meta_seen = False
+        if row is not None:
+            stats.cold_scans += 1
+
+    last_complete_offset = start_offset
+    try:
+        fh = path.open("rb", buffering=4 * 1024 * 1024)
+    except OSError:
+        return
+
+    with fh:
+        fh.seek(start_offset)
+        while True:
+            line_start = fh.tell()
+            raw = fh.readline()
+            if not raw:
+                break
+            stats.bytes_read += len(raw)
+            # Active rollout may be observed in the middle of an append. Leave
+            # the incomplete final line for the next run instead of caching it.
+            if not raw.endswith(b"\n"):
+                break
+            last_complete_offset = fh.tell()
+            if not raw.startswith(b"{") or not _line_is_relevant(raw):
+                continue
+            try:
+                rec = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, MemoryError):
+                session.malformed_lines += 1
+                continue
+            stats.parsed_records += 1
+            current_model, own_meta_seen, event = _apply_record(
+                session, rec, current_model, own_meta_seen
+            )
+            if event is not None:
+                u = event.cumulative
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO events(
+                        path,byte_offset,ts,model,input_tokens,cached_input_tokens,
+                        output_tokens,reasoning_output_tokens,total_tokens
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        p, line_start, event.ts.astimezone(timezone.utc).isoformat(), event.model,
+                        u.input_tokens, u.cached_input_tokens, u.output_tokens,
+                        u.reasoning_output_tokens, u.total_tokens,
+                    ),
+                )
+
+    try:
+        st2 = path.stat()
+    except OSError:
+        st2 = st
+
+    if session.created_at is None:
+        first = conn.execute(
+            "SELECT ts FROM events WHERE path=? ORDER BY byte_offset LIMIT 1", (p,)
+        ).fetchone()
+        if first is not None:
+            session.created_at = parse_ts(first[0])
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO files(
+            path,dev,ino,observed_size,mtime_ns,offset,session_id,current_model,
+            own_meta_seen,created_at,cwd,source_json,thread_source_json,originator,
+            parent_id,forked_from_id,model_provider,malformed_lines
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            p, int(st2.st_dev), int(st2.st_ino), int(st2.st_size), int(st2.st_mtime_ns),
+            int(last_complete_offset), session.session_id, current_model,
+            1 if own_meta_seen else 0,
+            session.created_at.astimezone(timezone.utc).isoformat() if session.created_at else None,
+            session.cwd, _json_text(session.source), _json_text(session.thread_source),
+            session.originator, session.parent_id, session.forked_from_id,
+            session.model_provider, session.malformed_lines,
+        ),
+    )
+
+
+def _prune_missing_cache_files(conn: sqlite3.Connection, live_paths: set) -> None:
+    stale = []
+    for row in conn.execute("SELECT path FROM files"):
+        if str(row[0]) not in live_paths:
+            stale.append(str(row[0]))
+    for p in stale:
+        conn.execute("DELETE FROM events WHERE path=?", (p,))
+        conn.execute("DELETE FROM files WHERE path=?", (p,))
+
+
+def _load_sessions_from_cache(conn: sqlite3.Connection, live_paths: set) -> Dict[str, RawSession]:
+    sessions: Dict[str, RawSession] = {}
+    rows = list(conn.execute("SELECT * FROM files ORDER BY mtime_ns"))
+    for row in rows:
+        p = str(row["path"])
+        if p not in live_paths:
+            continue
+        session = _session_from_cache_row(row, Path(p))
+        for erow in conn.execute(
+            """
+            SELECT ts,model,input_tokens,cached_input_tokens,output_tokens,
+                   reasoning_output_tokens,total_tokens
+            FROM events WHERE path=? ORDER BY byte_offset
+            """,
+            (p,),
+        ):
+            ts = parse_ts(erow["ts"])
+            if ts is None:
+                continue
+            session.usage_events.append(
+                UsageEvent(
+                    ts=ts,
+                    model=str(erow["model"]),
+                    cumulative=Usage(
+                        input_tokens=int(erow["input_tokens"]),
+                        cached_input_tokens=int(erow["cached_input_tokens"]),
+                        output_tokens=int(erow["output_tokens"]),
+                        reasoning_output_tokens=int(erow["reasoning_output_tokens"]),
+                        total_tokens=int(erow["total_tokens"]),
+                    ),
+                )
+            )
+        if session.created_at is None and session.usage_events:
+            session.created_at = session.usage_events[0].ts
+        sessions[session.session_id] = session
+    return sessions
+
+
+def _ensure_relevant_ancestors(
+    conn: sqlite3.Connection,
+    paths: List[Path],
+    start: datetime,
+    end: datetime,
+    stats: CacheStats,
+) -> None:
+    # Build cheap filename-ID lookup without reading file contents.
+    by_id = {id_from_filename(p): p for p in paths}
+    start_utc = start.astimezone(timezone.utc).isoformat()
+    end_utc = end.astimezone(timezone.utc).isoformat()
+    relevant_paths = {
+        str(r[0]) for r in conn.execute(
+            "SELECT DISTINCT path FROM events WHERE ts>=? AND ts<?", (start_utc, end_utc)
+        )
+    }
+
+    queue = list(relevant_paths)
+    seen = set(queue)
+    while queue:
+        p = queue.pop()
+        row = conn.execute("SELECT parent_id,forked_from_id FROM files WHERE path=?", (p,)).fetchone()
+        if row is None:
+            continue
+        parent_id = str(row[0] or row[1] or "")
+        if not parent_id:
+            continue
+        parent_path = by_id.get(parent_id)
+        if parent_path is None:
+            continue
+        pp = str(parent_path)
+        cached = conn.execute("SELECT 1 FROM files WHERE path=?", (pp,)).fetchone()
+        if cached is None:
+            # If this ancestor was previously counted as "skipped old" during
+            # the same full discovery, move it into the cold/ancestor bucket so
+            # Perf categories remain mutually exclusive.
+            try:
+                pst = parent_path.stat()
+                if pst.st_mtime < start.timestamp() and stats.skipped_old_uncached > 0:
+                    stats.skipped_old_uncached -= 1
+            except OSError:
+                pass
+            stats.ancestor_scans += 1
+            _scan_file_into_cache(conn, parent_path, stats)
+        if pp not in seen:
+            seen.add(pp)
+            queue.append(pp)
+
+
+def sync_incremental_cache(
+    conn: sqlite3.Connection,
+    paths: List[Path],
+    start: datetime,
+    end: datetime,
+    rebuild: bool,
+) -> CacheStats:
+    stats = CacheStats(discovered_files=len(paths))
+    t0 = time.perf_counter()
+
+    if rebuild:
+        conn.execute("DELETE FROM events")
+        conn.execute("DELETE FROM files")
+        conn.commit()
+
+    live_paths = {str(p) for p in paths}
+    _prune_missing_cache_files(conn, live_paths)
+
+    start_epoch = start.timestamp()
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        row = conn.execute(
+            "SELECT observed_size,mtime_ns,offset,dev,ino FROM files WHERE path=?",
+            (str(path),),
+        ).fetchone()
+
+        if rebuild:
+            _scan_file_into_cache(conn, path, stats)
+            continue
+
+        if row is not None:
+            unchanged = (
+                int(row["observed_size"]) == int(st.st_size)
+                and int(row["mtime_ns"]) == int(st.st_mtime_ns)
+                and int(row["offset"]) >= int(st.st_size)
+                and int(row["dev"]) == int(st.st_dev)
+                and int(row["ino"]) == int(st.st_ino)
+            )
+            if unchanged:
+                stats.cache_hits += 1
+                continue
+            # Changed cache entries only need syncing if the file could have
+            # activity in/after the requested window. Otherwise defer I/O.
+            if st.st_mtime < start_epoch:
+                continue
+            _scan_file_into_cache(conn, path, stats)
+        else:
+            # Cold first-run optimization: an unindexed file whose *last* write
+            # predates the report start cannot contribute usage to this window.
+            if st.st_mtime < start_epoch:
+                stats.skipped_old_uncached += 1
+                continue
+            _scan_file_into_cache(conn, path, stats)
+
+    conn.commit()
+    _ensure_relevant_ancestors(conn, paths, start, end, stats)
+    conn.commit()
+    stats.elapsed_s = time.perf_counter() - t0
+    return stats
+
+
+def cache_info(conn: sqlite3.Connection, cache_path: Path) -> str:
+    files_n = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+    events_n = int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+    try:
+        size = cache_path.stat().st_size
+    except OSError:
+        size = 0
+    machine = f"{platform.system()} {platform.machine()}"
+    return (
+        f"Cache: {cache_path}\n"
+        f"Indexed rollouts: {files_n}\n"
+        f"Token events: {events_n}\n"
+        f"DB size: {size / (1024 * 1024):.2f} MiB\n"
+        f"Runtime profile: {machine}"
+    )
+
+
+def load_thread_index(codex_home: Path) -> Dict[str, dict]:
+    """Best-effort read of Codex's local thread index for titles/cwd."""
+    db = codex_home / "state_5.sqlite"
+    if not db.exists():
+        return {}
+
+    result: Dict[str, dict] = {}
+    try:
+        uri = f"file:{db.resolve()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except (sqlite3.Error, OSError):
+        return {}
+
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(threads)")]
+        if "id" not in cols:
+            return {}
+        wanted = [
+            c for c in (
+                "id", "title", "cwd", "source", "thread_source",
+                "model_provider", "created_at", "updated_at", "rollout_path"
+            ) if c in cols
+        ]
+        q = "SELECT " + ", ".join('"' + c.replace('"', '""') + '"' for c in wanted) + ' FROM "threads"'
+        for row in conn.execute(q):
+            item = dict(zip(wanted, row))
+            sid = str(item.get("id") or "")
+            if sid:
+                result[sid] = item
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return result
+
+
+def session_title(session: RawSession, index: Dict[str, dict]) -> str:
+    dbrow = index.get(session.session_id, {})
+    title = str(dbrow.get("title") or "").strip()
+    if title:
+        return " ".join(title.split())
+    cwd = str(dbrow.get("cwd") or session.cwd or "").strip()
+    if cwd:
+        name = Path(cwd).name
+        if name:
+            return name
+    return session.session_id[:12]
+
+
+def get_tz(name: Optional[str]):
+    if name:
+        try:
+            return ZoneInfo(name)
+        except ZoneInfoNotFoundError:
+            raise SystemExit(f"Unknown timezone: {name}")
+    # System local timezone, preserving DST behavior where the OS exposes it.
+    return datetime.now().astimezone().tzinfo
+
+
+def parse_period(spec: str, tz) -> Tuple[datetime, datetime, str]:
+    now = datetime.now(tz)
+    today = now.date()
+    s = spec.strip().lower()
+
+    # Rolling wall-clock windows, e.g. 6h / 12h / 24h / 48h.
+    # Unlike today/yesterday, these are exact "now minus N hours" intervals.
+    m = re.fullmatch(r"(\d+)h", s)
+    if m:
+        hours = int(m.group(1))
+        if hours <= 0:
+            raise SystemExit("Rolling hour window must be greater than 0h.")
+        if hours > 24 * 365:
+            raise SystemExit("Rolling hour window is limited to 8760h (365 days).")
+        end_dt = now
+        start_dt = now - timedelta(hours=hours)
+        label = (
+            f"last {hours}h "
+            f"({start_dt.strftime('%Y-%m-%d %H:%M')} → "
+            f"{end_dt.strftime('%Y-%m-%d %H:%M')})"
+        )
+        return start_dt, end_dt, label
+
+    if s == "today":
+        start_d, end_d = today, today + timedelta(days=1)
+        label = today.isoformat()
+    elif s == "yesterday":
+        start_d, end_d = today - timedelta(days=1), today
+        label = start_d.isoformat()
+    elif s == "week":
+        # Calendar week to date, Monday through now/today.
+        start_d = today - timedelta(days=today.weekday())
+        end_d = today + timedelta(days=1)
+        label = f"{start_d.isoformat()}..{today.isoformat()} (week-to-date)"
+    elif s in ("7d", "last7", "last-7-days"):
+        # Kept for backward compatibility: 7 calendar dates including today.
+        # Use 168h when an exact rolling seven-day window is desired.
+        start_d = today - timedelta(days=6)
+        end_d = today + timedelta(days=1)
+        label = f"{start_d.isoformat()}..{today.isoformat()} (7 calendar days)"
+    elif ".." in s:
+        a, b = s.split("..", 1)
+        try:
+            start_d = date.fromisoformat(a)
+            last_d = date.fromisoformat(b)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid date range: {spec}") from exc
+        if last_d < start_d:
+            raise SystemExit("Range end must be on/after range start.")
+        end_d = last_d + timedelta(days=1)
+        label = f"{start_d.isoformat()}..{last_d.isoformat()}"
+    else:
+        try:
+            start_d = date.fromisoformat(s)
+        except ValueError as exc:
+            raise SystemExit(
+                f"Unknown period '{spec}'. Use 6h/12h/24h/48h (or any Nh), "
+                "today, yesterday, week, 7d, YYYY-MM-DD, or "
+                "YYYY-MM-DD..YYYY-MM-DD."
+            ) from exc
+        end_d = start_d + timedelta(days=1)
+        label = start_d.isoformat()
+
+    return (
+        datetime.combine(start_d, datetime.min.time(), tzinfo=tz),
+        datetime.combine(end_d, datetime.min.time(), tzinfo=tz),
+        label,
+    )
+
+
+def ancestor_ids(session: RawSession, sessions: Dict[str, RawSession]) -> List[str]:
+    out = []
+    seen = {session.session_id}
+    cur = session.lineage_parent()
+    while cur and cur not in seen:
+        seen.add(cur)
+        out.append(cur)
+        parent = sessions.get(cur)
+        if parent is None:
+            break
+        cur = parent.lineage_parent()
+    return out
+
+
+def inherited_usage_keys(
+    session: RawSession,
+    sessions: Dict[str, RawSession],
+) -> set:
+    """
+    Usage tuples present in ancestors at/before the child's creation time.
+
+    Full-history forks/subagents can physically copy historical token_count
+    events into child JSONL. Matching cumulative totals are skipped so those
+    inherited counters are not billed twice locally.
+    """
+    keys = set()
+    cutoff = session.created_at
+    if cutoff is None:
+        return keys
+    # Small tolerance for timestamp skew around fork creation.
+    cutoff = cutoff + timedelta(seconds=10)
+    for aid in ancestor_ids(session, sessions):
+        anc = sessions.get(aid)
+        if not anc:
+            continue
+        for ev in anc.usage_events:
+            if ev.ts <= cutoff:
+                keys.add(ev.cumulative.key())
+    return keys
+
+
+def baseline_from_parent(
+    session: RawSession,
+    sessions: Dict[str, RawSession],
+) -> Optional[Usage]:
+    pid = session.lineage_parent()
+    parent = sessions.get(pid) if pid else None
+    if not parent or session.created_at is None:
+        return None
+    cutoff = session.created_at + timedelta(seconds=10)
+    baseline = None
+    for ev in parent.usage_events:
+        if ev.ts <= cutoff:
+            baseline = ev.cumulative
+    return baseline
+
+
+def compute_deltas(
+    session: RawSession,
+    sessions: Dict[str, RawSession],
+) -> List[Tuple[datetime, str, Usage]]:
+    inherited = inherited_usage_keys(session, sessions)
+    parent_baseline = baseline_from_parent(session, sessions)
+    has_parent = bool(session.lineage_parent())
+
+    prev = Usage()
+    if parent_baseline is not None:
+        prev = parent_baseline
+
+    deltas: List[Tuple[datetime, str, Usage]] = []
+    first_usage_seen = False
+
+    for ev in session.usage_events:
+        cur = ev.cumulative
+
+        if cur.key() in inherited:
+            prev = cur
+            first_usage_seen = True
+            continue
+
+        # If parent metadata exists but its rollout isn't available, the first
+        # cumulative counter may include inherited usage. Baseline it rather
+        # than reporting a potentially huge false child charge.
+        if has_parent and parent_baseline is None and not inherited and not first_usage_seen:
+            prev = cur
+            first_usage_seen = True
+            continue
+
+        delta = cur.minus(prev)
+        prev = cur
+        first_usage_seen = True
+        if delta.nonzero():
+            deltas.append((ev.ts, ev.model, delta))
+
+    return deltas
+
+
+def rollup_target(session: RawSession, sessions: Dict[str, RawSession], show_subagents: bool) -> str:
+    if show_subagents or not session.is_subagent():
+        return session.session_id
+
+    cur = session
+    seen = {cur.session_id}
+    while cur.is_subagent():
+        pid = cur.lineage_parent()
+        if not pid or pid in seen or pid not in sessions:
+            break
+        seen.add(pid)
+        cur = sessions[pid]
+    return cur.session_id
+
+
+def model_is_chatgpt_openai(session: RawSession, model: str) -> bool:
+    provider = (session.model_provider or "").strip().lower()
+    # Empty/openai are normal ChatGPT-authenticated Codex cases. Bedrock and
+    # custom providers should not be assigned ChatGPT credits.
+    if provider and provider not in ("openai", "chatgpt"):
+        return False
+    return model in RATE_CARD
+
+
+def credit_for_usage(model: str, usage: Usage, fast: bool) -> Optional[float]:
+    rate = RATE_CARD.get(model)
+    if rate is None:
+        return None
+    input_rate, cached_rate, output_rate = rate
+    cached = min(usage.input_tokens, usage.cached_input_tokens)
+    uncached = max(0, usage.input_tokens - cached)
+    credits = (
+        uncached * input_rate
+        + cached * cached_rate
+        + usage.output_tokens * output_rate
+    ) / 1_000_000.0
+    if fast:
+        credits *= FAST_MULTIPLIERS.get(model, 1.0)
+    return credits
+
+
+def bucket_credits(
+    bucket: Bucket,
+    sessions: Dict[str, RawSession],
+    fast: bool,
+) -> Tuple[Optional[float], bool]:
+    total = 0.0
+    any_priced = False
+    all_priced = True
+    # Once usage is rolled up we no longer have provider per-model-per-child.
+    # For standard OpenAI model IDs, use the published card. Unknown/custom
+    # model IDs remain unpriced.
+    for model, usage in bucket.usage_by_model.items():
+        c = credit_for_usage(model, usage, fast)
+        if c is None:
+            all_priced = False
+        else:
+            any_priced = True
+            total += c
+    if not any_priced:
+        return None, False
+    return total, all_priced
+
+
+def model_map_credits(
+    usage_by_model: Dict[str, Usage],
+    fast: bool,
+) -> Tuple[Optional[float], bool]:
+    total = 0.0
+    any_priced = False
+    all_priced = True
+    for model, usage in usage_by_model.items():
+        c = credit_for_usage(model, usage, fast)
+        if c is None:
+            all_priced = False
+        else:
+            any_priced = True
+            total += c
+    if not any_priced:
+        return None, False
+    return total, all_priced
+
+
+def credit_components_for_usage(
+    model: str,
+    usage: Usage,
+    fast: bool,
+) -> Optional[Tuple[float, float, float]]:
+    """Return (uncached_input_credits, cached_input_credits, output_credits)."""
+    rate = RATE_CARD.get(model)
+    if rate is None:
+        return None
+    input_rate, cached_rate, output_rate = rate
+    cached = min(usage.input_tokens, usage.cached_input_tokens)
+    uncached = max(0, usage.input_tokens - cached)
+    mult = FAST_MULTIPLIERS.get(model, 1.0) if fast else 1.0
+    return (
+        uncached * input_rate * mult / 1_000_000.0,
+        cached * cached_rate * mult / 1_000_000.0,
+        usage.output_tokens * output_rate * mult / 1_000_000.0,
+    )
+
+
+def cost_components_for_map(
+    usage_by_model: Dict[str, Usage],
+    fast: bool,
+) -> Tuple[float, float, float, bool]:
+    uncached = cached = output = 0.0
+    complete = True
+    any_priced = False
+    for model, usage in usage_by_model.items():
+        c = credit_components_for_usage(model, usage, fast)
+        if c is None:
+            complete = False
+            continue
+        any_priced = True
+        uncached += c[0]
+        cached += c[1]
+        output += c[2]
+    return uncached, cached, output, complete and any_priced
+
+
+def main_sub_maps(bucket: Bucket) -> Tuple[Dict[str, Usage], Dict[str, Usage]]:
+    main_map: Dict[str, Usage] = {}
+    sub_map: Dict[str, Usage] = {}
+    for sid, by_model in bucket.usage_by_source.items():
+        target = sub_map if sid in bucket.source_is_subagent else main_map
+        for model, usage in by_model.items():
+            target[model] = target.get(model, Usage()) + usage
+    return main_map, sub_map
+
+
+def thread_health(bucket: Bucket, fast: bool) -> str:
+    # Workflow heuristic, not a quota warning. It intentionally focuses on the
+    # root/main thread because that is where long-context cache tax compounds.
+    main_map, _ = main_sub_maps(bucket)
+    main_credits, _ = model_map_credits(main_map, fast)
+    if main_credits is None:
+        return "—"
+    _, cache_tax, _, _ = cost_components_for_map(main_map, fast)
+    main_cached = sum(u.cached_input_tokens for u in main_map.values())
+    if main_credits >= 1500 and (cache_tax >= 1000 or main_cached >= 100_000_000):
+        return "ROTATE"
+    if main_credits >= 500 and (cache_tax >= 300 or main_cached >= 50_000_000):
+        return "WATCH"
+    return "OK"
+
+
+def report_is_live(start: datetime, end: datetime, now: datetime) -> bool:
+    # Rolling windows end at "now"; allow a little execution-time drift.
+    return start <= now and end >= now - timedelta(minutes=2)
+
+
+def thread_state(bucket: Bucket, now: datetime, live_report: bool) -> str:
+    if not live_report:
+        return "HIST"
+    if bucket.last_activity is None:
+        return "IDLE"
+    age_min = max(0.0, (now - bucket.last_activity).total_seconds() / 60.0)
+    if age_min <= ACTIVE_MINUTES:
+        return "ACTIVE"
+    if age_min <= RECENT_MINUTES:
+        return "RECENT"
+    return "IDLE"
+
+
+def effective_health(bucket: Bucket, fast: bool, state: str) -> str:
+    if state not in ("ACTIVE", "RECENT"):
+        return "—"
+    return thread_health(bucket, fast)
+
+
+def recent_burn(bucket: Bucket, fast: bool) -> Tuple[Optional[float], float]:
+    credits, _ = model_map_credits(bucket.recent_usage_by_model, fast)
+    _, cache_tax, _, _ = cost_components_for_map(bucket.recent_usage_by_model, fast)
+    return credits, cache_tax
+
+
+def status_text(state: str, health: str, orphan: bool = False) -> str:
+    if orphan:
+        return "ORPHAN"
+    if state in ("IDLE", "HIST"):
+        return state
+    return f"{state}/{health}" if health != "—" else state
+
+
+def orphan_subagent(bucket: Bucket, sessions: Dict[str, RawSession]) -> bool:
+    s = sessions.get(bucket.session_id)
+    if not s or not s.is_subagent():
+        return False
+    pid = s.lineage_parent()
+    return not pid or pid not in sessions
+
+
+def human_tokens(n: int) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def pretty_model(model: str) -> str:
+    aliases = {
+        "gpt-5.6-sol": "5.6 Sol",
+        "gpt-5.6": "5.6 Sol",
+        "gpt-5.6-terra": "5.6 Terra",
+        "gpt-5.6-luna": "5.6 Luna",
+        "gpt-5.5": "5.5",
+        "gpt-5.4": "5.4",
+        "gpt-5.4-mini": "5.4 mini",
+        "daybreak-blue": "Daybreak B",
+        "daybreak-red": "Daybreak R",
+        "unknown": "?",
+    }
+    return aliases.get(model, model)
+
+
+def model_label(models: Iterable[str]) -> str:
+    items = [pretty_model(m) for m in models]
+    return " / ".join(items) if items else "?"
+
+
+def truncate(s: str, width: int) -> str:
+    if width <= 1:
+        return s[:width]
+    if len(s) <= width:
+        return s
+    return s[: max(1, width - 1)] + "…"
+
+
+def make_buckets(
+    sessions: Dict[str, RawSession],
+    index: Dict[str, dict],
+    start: datetime,
+    end: datetime,
+    tz,
+    show_subagents: bool,
+    trend_start: Optional[datetime] = None,
+) -> Dict[str, Bucket]:
+    buckets: Dict[str, Bucket] = {}
+
+    for session in sessions.values():
+        deltas = compute_deltas(session, sessions)
+        if not deltas:
+            continue
+
+        target_id = rollup_target(session, sessions, show_subagents)
+        target_session = sessions.get(target_id, session)
+
+        bucket = buckets.get(target_id)
+        if bucket is None:
+            dbrow = index.get(target_id, {})
+            title = session_title(target_session, index)
+            if show_subagents and target_session.is_subagent():
+                title += f" [sub {short_sid(target_session.session_id)}]"
+            elif (
+                not show_subagents
+                and target_session.is_subagent()
+                and (not target_session.lineage_parent() or target_session.lineage_parent() not in sessions)
+            ):
+                title = "[ORPHAN SUB] " + title
+            bucket = Bucket(
+                session_id=target_id,
+                title=title,
+                cwd=str(dbrow.get("cwd") or target_session.cwd or ""),
+                source=str(dbrow.get("source") or target_session.source or ""),
+            )
+            buckets[target_id] = bucket
+
+        for ts, model, delta in deltas:
+            local_ts = ts.astimezone(tz)
+            if start <= local_ts < end:
+                bucket.add(
+                    model,
+                    delta,
+                    session.session_id,
+                    source_title=session_title(session, index),
+                    is_subagent=session.is_subagent(),
+                    activity_ts=local_ts,
+                    recent=(trend_start is not None and local_ts >= trend_start),
+                )
+
+    # Remove buckets that had deltas, but none in the selected period.
+    return {sid: b for sid, b in buckets.items() if b.total_usage().nonzero()}
+
+
+def render_table(
+    buckets: Dict[str, Bucket],
+    sessions: Dict[str, RawSession],
+    period_label: str,
+    tz,
+    fast: bool,
+    details: bool,
+    now: datetime,
+    live_report: bool,
+    color: Colorizer,
+    wide: bool = False,
+    top_agents: int = 8,
+    all_agents: bool = False,
+) -> str:
+    rows = []
+    known_credit_total = 0.0
+    any_partial = False
+
+    for b in buckets.values():
+        u = b.total_usage()
+        credits, complete = bucket_credits(b, sessions, fast)
+        _, cache_tax, _, _ = cost_components_for_map(b.usage_by_model, fast)
+        state = thread_state(b, now, live_report)
+        health = effective_health(b, fast, state)
+        burn, recent_cache = recent_burn(b, fast)
+        is_orphan = orphan_subagent(b, sessions)
+        if credits is not None:
+            known_credit_total += credits
+        if credits is not None and not complete:
+            any_partial = True
+        rows.append((b, u, credits, complete, cache_tax, state, health, burn, recent_cache, is_orphan))
+
+    rows.sort(
+        key=lambda x: (
+            0 if x[5] == "ACTIVE" else 1 if x[5] == "RECENT" else 2,
+            -(x[2] if x[2] is not None else -1.0),
+        )
+    )
+
+    lines: List[str] = []
+    tzname = getattr(tz, "key", None) or str(tz)
+    mode = "Fast-assumed credits" if fast else "Standard credits"
+    lines.append(color.wrap(f"Codex usage — {period_label} — {tzname}", color.BOLD, color.CYAN))
+    lines.append(color.wrap(f"Credit mode: {mode} (rate card {RATE_CARD_AS_OF})", color.DIM))
+    lines.append("")
+
+    if not rows:
+        lines.append("No token_count usage found for this period.")
+        return "\n".join(lines)
+
+    if wide:
+        headers = ["SESSION", "MODEL(S)", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "1H BURN", "SHARE", "STATUS"]
+        widths = [36, 18, 9, 9, 9, 10, 10, 9, 7, 13]
+        align_right = {2, 3, 4, 5, 6, 7, 8}
+    else:
+        headers = ["SESSION", "MODEL(S)", "CREDITS*", "CACHE TAX", "1H BURN", "SHARE", "STATUS"]
+        widths = [38, 20, 10, 10, 9, 7, 13]
+        align_right = {2, 3, 4, 5}
+
+    def styled_cell(padded: str, style: Optional[str]) -> str:
+        if not style:
+            return padded
+        styles = {
+            "header": (color.BOLD, color.CYAN),
+            "active": (color.BOLD, color.GREEN),
+            "recent": (color.CYAN,),
+            "idle": (color.DIM,),
+            "ok": (color.GREEN,),
+            "watch": (color.BOLD, color.YELLOW),
+            "rotate": (color.BOLD, color.RED),
+            "orphan": (color.BOLD, color.MAGENTA),
+            "warn": (color.YELLOW,),
+            "hot": (color.BOLD, color.RED),
+            "total": (color.BOLD, color.CYAN),
+            "dim": (color.DIM,),
+            "section": (color.BOLD, color.BLUE),
+        }.get(style, ())
+        return color.wrap(padded, *styles)
+
+    def fmt_row(row, styles=None, custom_widths=None, custom_right=None):
+        use_widths = custom_widths or widths
+        use_right = align_right if custom_right is None else custom_right
+        styles = styles or {}
+        cells = []
+        for i, (cell, width) in enumerate(zip(row, use_widths)):
+            t = truncate(str(cell), width)
+            padded = t.rjust(width) if i in use_right else t.ljust(width)
+            cells.append(styled_cell(padded, styles.get(i)))
+        return "  ".join(cells)
+
+    lines.append(fmt_row(headers, {i: "header" for i in range(len(headers))}))
+    lines.append(color.wrap("  ".join("-" * w for w in widths), color.DIM))
+
+    for b, u, credits, complete, cache_tax, state, health, burn, recent_cache, is_orphan in rows:
+        credit_text = "—"
+        share_text = "—"
+        if credits is not None:
+            credit_text = f"{credits:.1f}" + ("" if complete else "+")
+            if known_credit_total > 0:
+                share_text = f"{100.0 * credits / known_credit_total:.1f}%"
+        title = b.title + (f" (+{len(b.child_sessions)} sub)" if b.child_sessions else "")
+        status = status_text(state, health, is_orphan)
+        burn_text = "—" if burn is None or burn <= 0 else f"{burn:.1f}"
+
+        if wide:
+            row = [
+                title, model_label(b.usage_by_model.keys()),
+                human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
+                human_tokens(u.output_tokens), credit_text,
+                f"{cache_tax:.1f}" if cache_tax > 0 else "—",
+                burn_text, share_text, status,
+            ]
+            status_idx, title_idx, burn_idx, cache_idx = 9, 0, 7, 6
+        else:
+            row = [
+                title, model_label(b.usage_by_model.keys()), credit_text,
+                f"{cache_tax:.1f}" if cache_tax > 0 else "—",
+                burn_text, share_text, status,
+            ]
+            status_idx, title_idx, burn_idx, cache_idx = 6, 0, 4, 3
+
+        styles = {}
+        if is_orphan:
+            styles[status_idx] = "orphan"
+            styles[title_idx] = "orphan"
+        elif state == "ACTIVE":
+            styles[title_idx] = "active"
+        elif state == "RECENT":
+            styles[title_idx] = "recent"
+        else:
+            styles[title_idx] = "idle"
+
+        if health == "ROTATE":
+            styles[status_idx] = "rotate"
+        elif health == "WATCH":
+            styles[status_idx] = "watch"
+        elif health == "OK" and state in ("ACTIVE", "RECENT"):
+            styles[status_idx] = "ok"
+        elif not is_orphan:
+            styles[status_idx] = "idle"
+
+        if credits and cache_tax / credits >= 0.70:
+            styles[cache_idx] = "warn"
+        if burn is not None:
+            if burn >= 500:
+                styles[burn_idx] = "hot"
+            elif burn >= 100:
+                styles[burn_idx] = "warn"
+
+        lines.append(fmt_row(row, styles))
+
+    total_usage = Usage()
+    total_cache_tax = 0.0
+    total_recent = 0.0
+    for _, u, _, _, cache_tax, _, _, burn, _, _ in rows:
+        total_usage = total_usage + u
+        total_cache_tax += cache_tax
+        if burn is not None:
+            total_recent += burn
+    total_credit_text = f"{known_credit_total:.1f}" if known_credit_total > 0 else "—"
+    if wide:
+        total_row = [
+            "TOTAL", "", human_tokens(total_usage.input_tokens),
+            human_tokens(total_usage.cached_input_tokens), human_tokens(total_usage.output_tokens),
+            total_credit_text, f"{total_cache_tax:.1f}" if total_cache_tax else "—",
+            f"{total_recent:.1f}" if total_recent else "—",
+            "100%" if known_credit_total > 0 else "—", "",
+        ]
+    else:
+        total_row = [
+            "TOTAL", "", total_credit_text,
+            f"{total_cache_tax:.1f}" if total_cache_tax else "—",
+            f"{total_recent:.1f}" if total_recent else "—",
+            "100%" if known_credit_total > 0 else "—", "",
+        ]
+    lines.append(color.wrap("  ".join("-" * w for w in widths), color.DIM))
+    lines.append(fmt_row(total_row, {i: "total" for i in range(len(total_row))}))
+    lines.append("")
+    lines.append(color.wrap(
+        "* 1H BURN = credits observed in the trailing 60 minutes (not a quota limit). "
+        "CACHE TAX = cached-input credit component.", color.DIM
+    ))
+    lines.append(color.wrap(
+        "  STATUS is actionable only for live reports: ACTIVE/RECENT + OK/WATCH/ROTATE; "
+        "old threads become IDLE instead of showing stale ROTATE warnings.", color.DIM
+    ))
+    if not wide:
+        lines.append(color.wrap("  Use --wide to restore INPUT/CACHED/OUTPUT columns.", color.DIM))
+    if fast:
+        lines.append(color.wrap(
+            "  --fast applies the published Fast multiplier to all eligible usage in the selected period.",
+            color.DIM,
+        ))
+    if any_partial:
+        lines.append(color.wrap(
+            "  '+' means the row also contains usage from an unpriced/unknown model.",
+            color.DIM,
+        ))
+
+    if details:
+        for b, total_u, total_credits, _, total_cache_tax, state, health, burn, recent_cache, is_orphan in rows:
+            lines.append("")
+            lines.append(color.wrap("=" * 104, color.BLUE))
+            title_style = (color.BOLD, color.GREEN) if state == "ACTIVE" else (color.BOLD, color.CYAN)
+            if is_orphan:
+                title_style = (color.BOLD, color.MAGENTA)
+            lines.append(color.wrap(b.title, *title_style))
+            lines.append(f"session: {b.session_id}")
+            if b.cwd:
+                lines.append(f"cwd: {b.cwd}")
+            if b.child_sessions:
+                lines.append(f"rolled-up subagents: {len(b.child_sessions)}")
+            if is_orphan:
+                lines.append(color.wrap(
+                    "lineage: ORPHAN SUBAGENT (parent unavailable/unresolved locally)",
+                    color.BOLD, color.MAGENTA,
+                ))
+
+            lines.append(
+                f"state: {styled_cell(state, 'active' if state == 'ACTIVE' else 'recent' if state == 'RECENT' else 'idle').strip()}  "
+                f"last activity: {human_age(b.last_activity, now)} ago"
+            )
+            if health != "—":
+                hstyle = "rotate" if health == "ROTATE" else "watch" if health == "WATCH" else "ok"
+                lines.append(f"thread health: {styled_cell(health, hstyle).strip()}")
+            else:
+                lines.append("thread health: —")
+
+            if burn is not None and burn > 0:
+                projection = burn * 2.0
+                lines.append(
+                    f"trailing 1h burn: {burn:.1f} credits "
+                    f"(cache {recent_cache:.1f}); "
+                    + (f"simple +2h projection: ≈{projection:.1f}" if state == "ACTIVE" else "projection: —")
+                )
+            lines.append("")
+
+            def fmt_detail(row, widths_, right_, styles=None):
+                styles = styles or {}
+                cells = []
+                for i, (cell, width) in enumerate(zip(row, widths_)):
+                    t = truncate(str(cell), width)
+                    padded = t.rjust(width) if i in right_ else t.ljust(width)
+                    cells.append(styled_cell(padded, styles.get(i)))
+                return "  ".join(cells)
+
+            # COST COMPONENTS
+            uncached_c, cached_c, output_c, comp_complete = cost_components_for_map(b.usage_by_model, fast)
+            component_total = uncached_c + cached_c + output_c
+            lines.append(color.wrap("Credit components", color.BOLD, color.BLUE))
+            ch = ["COMPONENT", "CREDITS*", "SESSION%"]
+            cw = [30, 14, 10]
+            cr = {1, 2}
+            lines.append(fmt_detail(ch, cw, cr, {0: "header", 1: "header", 2: "header"}))
+            lines.append(color.wrap("  ".join("-" * w for w in cw), color.DIM))
+            for name, value in (
+                ("Cached input (CACHE TAX)", cached_c),
+                ("Uncached input", uncached_c),
+                ("Output", output_c),
+            ):
+                pct = f"{100.0 * value / component_total:.1f}%" if component_total > 0 else "—"
+                st = {0: "warn"} if name.startswith("Cached") and component_total and value / component_total >= 0.70 else {}
+                lines.append(fmt_detail([name, f"{value:.1f}", pct], cw, cr, st))
+
+            # MAIN / SUB SUMMARY
+            main_map, sub_map = main_sub_maps(b)
+            lines.append("")
+            lines.append(color.wrap("Main vs subagents", color.BOLD, color.BLUE))
+            rh = ["ROLE", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "SESSION%"]
+            rw = [12, 11, 11, 11, 12, 12, 10]
+            rr = {1, 2, 3, 4, 5, 6}
+            lines.append(fmt_detail(rh, rw, rr, {i: "header" for i in range(len(rh))}))
+            lines.append(color.wrap("  ".join("-" * w for w in rw), color.DIM))
+            for role, mmap in (("MAIN", main_map), ("SUB", sub_map)):
+                ru = Usage()
+                for u in mmap.values():
+                    ru = ru + u
+                rcost, rcomplete = model_map_credits(mmap, fast)
+                _, rcache, _, _ = cost_components_for_map(mmap, fast)
+                pct = (
+                    f"{100.0 * rcost / total_credits:.1f}%"
+                    if rcost is not None and total_credits not in (None, 0)
+                    else "—"
+                )
+                lines.append(fmt_detail([
+                    role, human_tokens(ru.input_tokens), human_tokens(ru.cached_input_tokens),
+                    human_tokens(ru.output_tokens), "—" if rcost is None else f"{rcost:.1f}",
+                    f"{rcache:.1f}" if rcache else "—", pct,
+                ], rw, rr, {0: "active" if role == "MAIN" and state == "ACTIVE" else None}))
+
+            # MODEL BREAKDOWN
+            lines.append("")
+            lines.append(color.wrap("Model breakdown", color.BOLD, color.BLUE))
+            mh = ["MODEL", "INPUT", "CACHED", "OUTPUT", "REASON", "CREDITS*", "CACHE TAX", "SESSION%"]
+            mw = [20, 10, 10, 10, 10, 11, 11, 9]
+            mr = {1, 2, 3, 4, 5, 6, 7}
+            lines.append(fmt_detail(mh, mw, mr, {i: "header" for i in range(len(mh))}))
+            lines.append(color.wrap("  ".join("-" * w for w in mw), color.DIM))
+            model_rows = []
+            for model, u in b.usage_by_model.items():
+                c = credit_for_usage(model, u, fast)
+                comp = credit_components_for_usage(model, u, fast)
+                cache_part = comp[1] if comp else 0.0
+                model_rows.append((model, u, c, cache_part))
+            model_rows.sort(key=lambda x: (x[2] if x[2] is not None else -1), reverse=True)
+            for model, u, c, cache_part in model_rows:
+                pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
+                lines.append(fmt_detail([
+                    pretty_model(model), human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
+                    human_tokens(u.output_tokens), human_tokens(u.reasoning_output_tokens),
+                    "—" if c is None else f"{c:.1f}", f"{cache_part:.1f}" if cache_part else "—", pct,
+                ], mw, mr))
+
+            # AGENT BREAKDOWN
+            lines.append("")
+            lines.append(color.wrap("Agent breakdown", color.BOLD, color.BLUE))
+            ah = ["ROLE / SESSION", "MODEL(S)", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "SESSION%"]
+            aw = [37, 19, 9, 9, 9, 10, 10, 9]
+            ar = {2, 3, 4, 5, 6, 7}
+            lines.append(fmt_detail(ah, aw, ar, {i: "header" for i in range(len(ah))}))
+            lines.append(color.wrap("  ".join("-" * w for w in aw), color.DIM))
+            agent_rows = []
+            for sid, by_model in b.usage_by_source.items():
+                u = b.source_usage(sid)
+                c, complete = model_map_credits(by_model, fast)
+                _, cache_part, _, _ = cost_components_for_map(by_model, fast)
+                role = "SUB" if sid in b.source_is_subagent else "MAIN"
+                title = b.source_titles.get(sid, short_sid(sid))
+                label = f"{role} {short_sid(sid)} {title}"
+                agent_rows.append((sid, label, by_model, u, c, complete, cache_part))
+            agent_rows.sort(
+                key=lambda x: (0 if x[0] not in b.source_is_subagent else 1, -(x[4] if x[4] is not None else -1))
+            )
+            visible_agents = agent_rows if all_agents else agent_rows[:max(0, top_agents)]
+            for sid, label, by_model, u, c, complete, cache_part in visible_agents:
+                pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
+                credit_text = "—" if c is None else f"{c:.1f}" + ("" if complete else "+")
+                role_style = "active" if sid not in b.source_is_subagent and state == "ACTIVE" else None
+                lines.append(fmt_detail([
+                    label, model_label(by_model.keys()), human_tokens(u.input_tokens),
+                    human_tokens(u.cached_input_tokens), human_tokens(u.output_tokens), credit_text,
+                    f"{cache_part:.1f}" if cache_part else "—", pct,
+                ], aw, ar, {0: role_style} if role_style else {}))
+            hidden = len(agent_rows) - len(visible_agents)
+            if hidden > 0:
+                lines.append(color.wrap(
+                    f"… {hidden} more agents hidden; use --all-agents to show all.",
+                    color.DIM,
+                ))
+
+    return "\n".join(lines)
+
+
+def render_json(
+    buckets: Dict[str, Bucket],
+    sessions: Dict[str, RawSession],
+    period_label: str,
+    tz,
+    fast: bool,
+    now: datetime,
+    live_report: bool,
+) -> str:
+    out = {
+        "period": period_label,
+        "timezone": getattr(tz, "key", None) or str(tz),
+        "credit_mode": "fast_assumed" if fast else "standard",
+        "sessions": [],
+    }
+    for b in buckets.values():
+        u = b.total_usage()
+        credits, complete = bucket_credits(b, sessions, fast)
+
+        model_breakdown = []
+        for model, mu in b.usage_by_model.items():
+            mc = credit_for_usage(model, mu, fast)
+            mcomp = credit_components_for_usage(model, mu, fast)
+            model_breakdown.append({
+                "model": model,
+                "input_tokens": mu.input_tokens,
+                "cached_input_tokens": mu.cached_input_tokens,
+                "output_tokens": mu.output_tokens,
+                "reasoning_output_tokens": mu.reasoning_output_tokens,
+                "credit_estimate": mc,
+                "cache_tax_credits": mcomp[1] if mcomp else None,
+            })
+        model_breakdown.sort(
+            key=lambda x: x["credit_estimate"] if x["credit_estimate"] is not None else -1,
+            reverse=True,
+        )
+
+        agent_breakdown = []
+        for sid, by_model in b.usage_by_source.items():
+            au = b.source_usage(sid)
+            ac, acomplete = model_map_credits(by_model, fast)
+            _, acache, _, _ = cost_components_for_map(by_model, fast)
+            agent_breakdown.append({
+                "session_id": sid,
+                "role": "subagent" if sid in b.source_is_subagent else "main",
+                "title": b.source_titles.get(sid, ""),
+                "models": list(by_model.keys()),
+                "input_tokens": au.input_tokens,
+                "cached_input_tokens": au.cached_input_tokens,
+                "output_tokens": au.output_tokens,
+                "reasoning_output_tokens": au.reasoning_output_tokens,
+                "credit_estimate": ac,
+                "cache_tax_credits": acache,
+                "credit_estimate_complete": acomplete,
+            })
+        agent_breakdown.sort(
+            key=lambda x: (
+                0 if x["role"] == "main" else 1,
+                -(x["credit_estimate"] if x["credit_estimate"] is not None else -1),
+            )
+        )
+
+        main_map, sub_map = main_sub_maps(b)
+        _, cache_tax, _, _ = cost_components_for_map(b.usage_by_model, fast)
+        main_credits, _ = model_map_credits(main_map, fast)
+        sub_credits, _ = model_map_credits(sub_map, fast)
+        state = thread_state(b, now, live_report)
+        health = effective_health(b, fast, state)
+        burn, recent_cache = recent_burn(b, fast)
+        out["sessions"].append({
+            "session_id": b.session_id,
+            "title": b.title,
+            "cwd": b.cwd,
+            "thread_state": state,
+            "thread_health": health,
+            "last_activity": b.last_activity.isoformat() if b.last_activity else None,
+            "trailing_1h_credit_burn": burn,
+            "trailing_1h_cache_tax": recent_cache,
+            "cache_tax_credits": cache_tax,
+            "main_credit_estimate": main_credits,
+            "subagent_credit_estimate": sub_credits,
+            "models": list(b.usage_by_model.keys()),
+            "input_tokens": u.input_tokens,
+            "cached_input_tokens": u.cached_input_tokens,
+            "uncached_input_tokens": max(0, u.input_tokens - min(u.input_tokens, u.cached_input_tokens)),
+            "output_tokens": u.output_tokens,
+            "reasoning_output_tokens": u.reasoning_output_tokens,
+            "credit_estimate": credits,
+            "credit_estimate_complete": complete,
+            "rolled_up_subagents": sorted(b.child_sessions),
+            "model_breakdown": model_breakdown,
+            "agent_breakdown": agent_breakdown,
+        })
+    out["sessions"].sort(
+        key=lambda x: (
+            x["credit_estimate"] if x["credit_estimate"] is not None else -1,
+            x["input_tokens"] + x["output_tokens"],
+        ),
+        reverse=True,
+    )
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+def render_csv(
+    buckets: Dict[str, Bucket],
+    sessions: Dict[str, RawSession],
+    fast: bool,
+    now: datetime,
+    live_report: bool,
+) -> str:
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    writer.writerow([
+        "session_id", "title", "cwd", "models", "input_tokens",
+        "cached_input_tokens", "uncached_input_tokens", "output_tokens",
+        "reasoning_output_tokens", "credit_estimate", "cache_tax_credits",
+        "main_credit_estimate", "subagent_credit_estimate", "thread_state",
+        "thread_health", "last_activity", "trailing_1h_credit_burn",
+        "trailing_1h_cache_tax", "rolled_up_subagents",
+    ])
+    for b in buckets.values():
+        u = b.total_usage()
+        credits, _ = bucket_credits(b, sessions, fast)
+        _, cache_tax, _, _ = cost_components_for_map(b.usage_by_model, fast)
+        main_map, sub_map = main_sub_maps(b)
+        main_c, _ = model_map_credits(main_map, fast)
+        sub_c, _ = model_map_credits(sub_map, fast)
+        state = thread_state(b, now, live_report)
+        health = effective_health(b, fast, state)
+        burn, recent_cache = recent_burn(b, fast)
+        writer.writerow([
+            b.session_id,
+            b.title,
+            b.cwd,
+            ",".join(b.usage_by_model.keys()),
+            u.input_tokens,
+            u.cached_input_tokens,
+            max(0, u.input_tokens - min(u.input_tokens, u.cached_input_tokens)),
+            u.output_tokens,
+            u.reasoning_output_tokens,
+            "" if credits is None else f"{credits:.6f}",
+            f"{cache_tax:.6f}",
+            "" if main_c is None else f"{main_c:.6f}",
+            "" if sub_c is None else f"{sub_c:.6f}",
+            state,
+            health,
+            b.last_activity.isoformat() if b.last_activity else "",
+            "" if burn is None else f"{burn:.6f}",
+            f"{recent_cache:.6f}",
+            len(b.child_sessions),
+        ])
+    return sio.getvalue()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="codex-usage",
+        description="Show per-session Codex token/credit usage from local session transcripts.",
+    )
+    p.add_argument(
+        "period",
+        nargs="?",
+        default="today",
+        help="6h | 12h | 24h | 48h | any Nh | today | yesterday | week | 7d | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD",
+    )
+    p.add_argument(
+        "--codex-home",
+        default=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")),
+        help="Codex home directory (default: $CODEX_HOME or ~/.codex)",
+    )
+    p.add_argument(
+        "--timezone",
+        help="IANA timezone, e.g. Asia/Tokyo. Default: system local timezone.",
+    )
+    p.add_argument(
+        "--show-subagents",
+        action="store_true",
+        help="Show subagent threads separately instead of rolling them into the visible/root session.",
+    )
+    p.add_argument(
+        "--no-archived",
+        action="store_true",
+        help="Do not scan archived_sessions.",
+    )
+    p.add_argument(
+        "--fast",
+        action="store_true",
+        help="Assume all eligible usage was Fast mode and apply published Fast multipliers.",
+    )
+    p.add_argument("--details", action="store_true", help="Show credit components, MAIN/SUB totals, models, agents and live trend diagnostics.")
+    p.add_argument("--wide", action="store_true", help="Show INPUT/CACHED/OUTPUT columns in the summary table.")
+    p.add_argument("--top-agents", type=int, default=8, metavar="N", help="With --details, show the top N agents per session (default: 8).")
+    p.add_argument("--all-agents", action="store_true", help="With --details, show every agent instead of truncating the agent table.")
+    p.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="ANSI color mode for terminal output (default: auto; NO_COLOR is respected).")
+    p.add_argument("--perf", action="store_true", help="Show index/read timing and bytes scanned.")
+    p.add_argument("--no-cache", action="store_true", help="Bypass the persistent incremental index and parse JSONL directly.")
+    p.add_argument("--rebuild-cache", action="store_true", help="Clear and rebuild the incremental index from all discovered rollouts.")
+    p.add_argument("--cache-info", action="store_true", help="Show cache path/size/index counts and exit.")
+    p.add_argument("--cache-path", help="Override the incremental SQLite cache path.")
+    p.add_argument("--full-discovery", action="store_true", help="Force a full rollout tree walk instead of the warm-cache hot discovery path.")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--json", action="store_true", help="Emit JSON.")
+    group.add_argument("--csv", action="store_true", help="Emit CSV.")
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    codex_home = Path(args.codex_home).expanduser()
+    tz = get_tz(args.timezone)
+    start, end, period_label = parse_period(args.period, tz)
+
+    cache_path = Path(args.cache_path).expanduser() if args.cache_path else default_cache_path()
+    if args.cache_info:
+        conn = _cache_connect(cache_path)
+        try:
+            print(cache_info(conn, cache_path))
+        finally:
+            conn.close()
+        return 0
+
+    t_total = time.perf_counter()
+    sessions: Dict[str, RawSession] = {}
+    malformed = 0
+    perf_stats = None
+
+    if args.no_cache:
+        paths, discovery_mode, discovery_s = discover_rollouts(
+            codex_home, include_archived=not args.no_archived
+        )
+        if not paths:
+            eprint(f"No session JSONL files found under {codex_home}")
+            return 2
+        # No-cache mode remains available for verification/debugging.
+        try:
+            paths.sort(key=lambda p: p.stat().st_mtime)
+        except OSError:
+            pass
+        parse_start = time.perf_counter()
+        bytes_read = 0
+        for path in paths:
+            try:
+                bytes_read += path.stat().st_size
+            except OSError:
+                pass
+            parsed = parse_rollout(path)
+            if parsed is None:
+                continue
+            sessions[parsed.session_id] = parsed
+            malformed += parsed.malformed_lines
+        perf_stats = CacheStats(
+            discovered_files=len(paths), bytes_read=bytes_read,
+            cold_scans=len(paths), elapsed_s=time.perf_counter() - parse_start,
+            discovery_s=discovery_s, discovery_mode=discovery_mode,
+        )
+    else:
+        conn = _cache_connect(cache_path)
+        try:
+            paths, discovery_mode, discovery_s = discover_rollouts(
+                codex_home,
+                include_archived=not args.no_archived,
+                start=start,
+                end=end,
+                cache_conn=conn,
+                force_full=(args.rebuild_cache or args.full_discovery),
+            )
+            if not paths:
+                eprint(f"No session JSONL files found under {codex_home}")
+                return 2
+            perf_stats = sync_incremental_cache(
+                conn, paths, start, end, rebuild=args.rebuild_cache
+            )
+            perf_stats.discovery_s = discovery_s
+            perf_stats.discovery_mode = discovery_mode
+            sessions = _load_sessions_from_cache(conn, {str(p) for p in paths})
+        finally:
+            conn.close()
+        malformed = sum(s.malformed_lines for s in sessions.values())
+
+    # An empty session set is valid for narrow windows on a fresh cache: all
+    # discovered files may simply predate the requested interval. Render the
+    # normal "No token_count usage" result rather than treating it as an error.
+    now = datetime.now(tz)
+    effective_end = min(end, now)
+    trend_start = effective_end - timedelta(minutes=TREND_MINUTES)
+    live_report = report_is_live(start, end, now)
+
+    index = load_thread_index(codex_home)
+    buckets = make_buckets(
+        sessions=sessions,
+        index=index,
+        start=start,
+        end=end,
+        tz=tz,
+        show_subagents=args.show_subagents,
+        trend_start=trend_start,
+    )
+
+    color_mode = "never" if (args.json or args.csv) else args.color
+    color = Colorizer(color_mode)
+    if args.json:
+        print(render_json(buckets, sessions, period_label, tz, args.fast, now, live_report))
+    elif args.csv:
+        print(render_csv(buckets, sessions, args.fast, now, live_report), end="")
+    else:
+        print(render_table(
+            buckets, sessions, period_label, tz, args.fast, args.details,
+            now, live_report, color, wide=args.wide,
+            top_agents=max(0, args.top_agents), all_agents=args.all_agents,
+        ))
+
+    if malformed and not (args.json or args.csv):
+        eprint(f"Warning: skipped {malformed} malformed/oversized JSONL line(s).")
+
+    if args.perf:
+        total_s = time.perf_counter() - t_total
+        if args.no_cache:
+            eprint(
+                f"Perf: no-cache | discovery={perf_stats.discovery_mode} "
+                f"{perf_stats.discovery_s:.3f}s | files={perf_stats.discovered_files} | "
+                f"read≈{perf_stats.bytes_read / (1024*1024):.1f} MiB | "
+                f"parse={perf_stats.elapsed_s:.3f}s | total={total_s:.3f}s"
+            )
+        else:
+            eprint(
+                f"Perf: incremental-index | discovery={perf_stats.discovery_mode} "
+                f"{perf_stats.discovery_s:.3f}s | files={perf_stats.discovered_files} | "
+                f"hits={perf_stats.cache_hits} | cold={perf_stats.cold_scans} | "
+                f"ancestor={perf_stats.ancestor_scans} | tail={perf_stats.incremental_scans} | "
+                f"skipped-old={perf_stats.skipped_old_uncached} | "
+                f"read={perf_stats.bytes_read / (1024*1024):.1f} MiB | "
+                f"sync={perf_stats.elapsed_s:.3f}s | total={total_s:.3f}s"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
