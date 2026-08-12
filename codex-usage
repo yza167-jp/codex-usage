@@ -38,10 +38,9 @@ Notes:
   events. `--fast` means "assume all eligible OpenAI-model usage in this
   report was Fast".
 - Session JSONL is local telemetry, not the authoritative server-side meter.
-- v1.3 keeps the incremental SQLite index, adds a hot-path discovery mode,
-  live/idle thread state, trailing-1h burn diagnostics, compact/colorized terminal
-  output, and bounded agent detail. On macOS the cache lives under
-  ~/Library/Caches/codex-usage/.
+- v1.4 adds native Windows support: Windows cache locations, Windows-safe
+  SQLite read-only URIs, automatic VT/ANSI terminal enablement, PowerShell/CMD
+  launchers, and Windows CI coverage. macOS and Linux behavior is preserved.
 """
 
 from __future__ import annotations
@@ -63,7 +62,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 RATE_CARD_AS_OF = "2026-08-12"
 CACHE_SCHEMA_VERSION = 2
 TREND_MINUTES = 60
@@ -283,6 +282,80 @@ class Bucket:
         return out
 
 
+def _path_key(path: Path) -> str:
+    """Case-normalized absolute key for cross-platform path de-duplication."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _sqlite_i64(value: int) -> int:
+    """Map an OS integer identifier into SQLite's signed 64-bit INTEGER range.
+
+    Windows file IDs can use the full unsigned 64-bit range. SQLite INTEGER is
+    signed 64-bit, so preserve the low 64 bits via two's-complement mapping.
+    The mapping is one-to-one for 64-bit identifiers and stable for comparisons.
+    """
+    v = int(value) & ((1 << 64) - 1)
+    return v if v < (1 << 63) else v - (1 << 64)
+
+
+def _sqlite_ro_uri(path: Path) -> str:
+    """
+    Portable SQLite read-only URI.
+
+    Path.as_uri() correctly encodes Windows drive letters, spaces and UNC-ish
+    path characters, unlike string interpolation such as ``file:C:\\...``.
+    """
+    return path.resolve().as_uri() + "?mode=ro"
+
+
+def _ensure_utf8_stdio() -> None:
+    """Use UTF-8 when the inherited stdio encoding cannot represent rich output.
+
+    Windows console streams are usually Unicode-capable, but redirected Python
+    stdout/stderr can still inherit a legacy code page such as cp1252. Session
+    titles and the terminal UI may contain arrows, CJK text, or other Unicode,
+    so switch non-UTF-8 text wrappers to UTF-8 when Python allows it.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("_", "-")
+        if encoding in ("utf-8", "utf8"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+def _enable_windows_vt(stream) -> bool:
+    """Enable ANSI/VT processing on a real Windows console when possible."""
+    if os.name != "nt":
+        return True
+    try:
+        if not stream.isatty():
+            return False
+        import ctypes
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        mode = ctypes.c_uint()
+        kernel32 = ctypes.windll.kernel32
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+            return True
+        return bool(
+            kernel32.SetConsoleMode(
+                handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            )
+        )
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 class Colorizer:
     RESET = "\033[0m"
     BOLD = "\033[1m"
@@ -296,15 +369,20 @@ class Colorizer:
 
     def __init__(self, mode: str = "auto"):
         if mode == "always":
+            if os.name == "nt" and sys.stdout.isatty():
+                _enable_windows_vt(sys.stdout)
             self.enabled = True
         elif mode == "never":
             self.enabled = False
         else:
-            self.enabled = (
+            enabled = (
                 sys.stdout.isatty()
                 and os.environ.get("TERM", "") != "dumb"
                 and "NO_COLOR" not in os.environ
             )
+            if enabled and os.name == "nt":
+                enabled = _enable_windows_vt(sys.stdout)
+            self.enabled = enabled
 
     def wrap(self, text: str, *styles: str) -> str:
         if not self.enabled or not styles:
@@ -382,7 +460,7 @@ def _full_discover_rollouts(codex_home: Path, include_archived: bool) -> List[Pa
         if not root.exists():
             continue
         for path in root.rglob("*.jsonl"):
-            key = str(path)
+            key = _path_key(path)
             if key in seen:
                 continue
             seen.add(key)
@@ -410,7 +488,7 @@ def _recent_state_rollouts(codex_home: Path, since_epoch: float) -> List[Path]:
         return []
     out: List[Path] = []
     try:
-        conn = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True, timeout=0.5)
+        conn = sqlite3.connect(_sqlite_ro_uri(db), uri=True, timeout=0.5)
         conn.row_factory = sqlite3.Row
     except (sqlite3.Error, OSError):
         return out
@@ -514,16 +592,16 @@ def discover_rollouts(
     # long-lived sessions that were created outside the current date buckets.
     for row in cache_conn.execute("SELECT path FROM files"):
         p = Path(str(row[0]))
-        seen[str(p)] = p
+        seen[_path_key(p)] = p
 
     for p in _recent_date_rollouts(codex_home, start, end):
-        seen[str(p)] = p
+        seen[_path_key(p)] = p
 
     # state_5 catches an old thread that becomes active again after its original
     # date directory has fallen outside the current rolling window.
     state_since = start.timestamp() - 3600.0
     for p in _recent_state_rollouts(codex_home, state_since):
-        seen[str(p)] = p
+        seen[_path_key(p)] = p
 
     paths = list(seen.values())
     return paths, "hot", time.perf_counter() - t0
@@ -618,6 +696,17 @@ def parse_rollout(path: Path) -> Optional[RawSession]:
 
 
 def default_cache_path() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "codex-usage" / "index-v2.sqlite3"
+        return (
+            Path.home()
+            / "AppData"
+            / "Local"
+            / "codex-usage"
+            / "index-v2.sqlite3"
+        )
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Caches" / "codex-usage" / "index-v2.sqlite3"
     base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -629,12 +718,15 @@ def _cache_connect(cache_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(cache_path), timeout=5.0)
     conn.row_factory = sqlite3.Row
 
-    # Apple Silicon optimized profile: the index itself is typically small, so keep
-    # a generous SQLite page cache and mmap the *index database only*.
-    # Raw rollout JSONL remains sequentially streamed instead of mmap'd.
+    # Platform-tuned profile: the index itself is typically small, so keep a
+    # useful SQLite page cache and mmap the *index database only*. Raw rollout
+    # JSONL remains sequentially streamed instead of mmap'd.
     if sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64"):
         cache_kib = 128 * 1024
         mmap_bytes = 256 * 1024 * 1024
+    elif os.name == "nt":
+        cache_kib = 64 * 1024
+        mmap_bytes = 128 * 1024 * 1024
     else:
         cache_kib = 32 * 1024
         mmap_bytes = 64 * 1024 * 1024
@@ -756,7 +848,10 @@ def _scan_file_into_cache(
     own_meta_seen = False
 
     if row is not None and not force_reset:
-        same_identity = int(row["dev"]) == int(st.st_dev) and int(row["ino"]) == int(st.st_ino)
+        same_identity = (
+            int(row["dev"]) == _sqlite_i64(st.st_dev)
+            and int(row["ino"]) == _sqlite_i64(st.st_ino)
+        )
         old_size = int(row["observed_size"])
         old_offset = int(row["offset"])
         same_snapshot = (
@@ -864,7 +959,7 @@ def _scan_file_into_cache(
         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
-            p, int(st2.st_dev), int(st2.st_ino), int(st2.st_size), int(st2.st_mtime_ns),
+            p, _sqlite_i64(st2.st_dev), _sqlite_i64(st2.st_ino), int(st2.st_size), int(st2.st_mtime_ns),
             int(last_complete_offset), session.session_id, current_model,
             1 if own_meta_seen else 0,
             session.created_at.astimezone(timezone.utc).isoformat() if session.created_at else None,
@@ -1010,8 +1105,8 @@ def sync_incremental_cache(
                 int(row["observed_size"]) == int(st.st_size)
                 and int(row["mtime_ns"]) == int(st.st_mtime_ns)
                 and int(row["offset"]) >= int(st.st_size)
-                and int(row["dev"]) == int(st.st_dev)
-                and int(row["ino"]) == int(st.st_ino)
+                and int(row["dev"]) == _sqlite_i64(st.st_dev)
+                and int(row["ino"]) == _sqlite_i64(st.st_ino)
             )
             if unchanged:
                 stats.cache_hits += 1
@@ -1061,7 +1156,7 @@ def load_thread_index(codex_home: Path) -> Dict[str, dict]:
 
     result: Dict[str, dict] = {}
     try:
-        uri = f"file:{db.resolve()}?mode=ro"
+        uri = _sqlite_ro_uri(db)
         conn = sqlite3.connect(uri, uri=True, timeout=1.0)
     except (sqlite3.Error, OSError):
         return {}
@@ -1107,13 +1202,45 @@ def get_tz(name: Optional[str]):
         try:
             return ZoneInfo(name)
         except ZoneInfoNotFoundError:
-            raise SystemExit(f"Unknown timezone: {name}")
-    # System local timezone, preserving DST behavior where the OS exposes it.
-    return datetime.now().astimezone().tzinfo
+            hint = ""
+            if os.name == "nt":
+                hint = (
+                    " Windows does not ship the IANA time-zone database with "
+                    "Python; either omit --timezone to use the Windows system "
+                    "time zone, or install the optional 'tzdata' package."
+                )
+            raise SystemExit(f"Unknown timezone: {name}.{hint}")
+    # None is intentional: datetime.astimezone() with no argument asks the OS
+    # for the local zone at the timestamp being converted. This works on
+    # Windows without the optional IANA tzdata package and respects local DST.
+    return None
+
+
+def _now_in_tz(tz) -> datetime:
+    return datetime.now(tz) if tz is not None else datetime.now().astimezone()
+
+
+def _to_tz(dt: datetime, tz) -> datetime:
+    return dt.astimezone(tz) if tz is not None else dt.astimezone()
+
+
+def _localize_wall_time(dt: datetime, tz) -> datetime:
+    if tz is not None:
+        return dt.replace(tzinfo=tz)
+    # A naive datetime passed to astimezone() is interpreted as system local
+    # time, letting Windows/macOS/Linux supply the appropriate historical offset.
+    return dt.astimezone()
+
+
+def _tz_label(tz) -> str:
+    if tz is not None:
+        return getattr(tz, "key", None) or str(tz)
+    local = datetime.now().astimezone()
+    return local.tzname() or "local"
 
 
 def parse_period(spec: str, tz) -> Tuple[datetime, datetime, str]:
-    now = datetime.now(tz)
+    now = _now_in_tz(tz)
     today = now.date()
     s = spec.strip().lower()
 
@@ -1127,7 +1254,8 @@ def parse_period(spec: str, tz) -> Tuple[datetime, datetime, str]:
         if hours > 24 * 365:
             raise SystemExit("Rolling hour window is limited to 8760h (365 days).")
         end_dt = now
-        start_dt = now - timedelta(hours=hours)
+        start_utc = now.astimezone(timezone.utc) - timedelta(hours=hours)
+        start_dt = _to_tz(start_utc, tz)
         label = (
             f"last {hours}h "
             f"({start_dt.strftime('%Y-%m-%d %H:%M')} → "
@@ -1176,8 +1304,8 @@ def parse_period(spec: str, tz) -> Tuple[datetime, datetime, str]:
         label = start_d.isoformat()
 
     return (
-        datetime.combine(start_d, datetime.min.time(), tzinfo=tz),
-        datetime.combine(end_d, datetime.min.time(), tzinfo=tz),
+        _localize_wall_time(datetime.combine(start_d, datetime.min.time()), tz),
+        _localize_wall_time(datetime.combine(end_d, datetime.min.time()), tz),
         label,
     )
 
@@ -1552,7 +1680,7 @@ def make_buckets(
             buckets[target_id] = bucket
 
         for ts, model, delta in deltas:
-            local_ts = ts.astimezone(tz)
+            local_ts = _to_tz(ts, tz)
             if start <= local_ts < end:
                 bucket.add(
                     model,
@@ -1608,7 +1736,7 @@ def render_table(
     )
 
     lines: List[str] = []
-    tzname = getattr(tz, "key", None) or str(tz)
+    tzname = _tz_label(tz)
     mode = "Fast-assumed credits" if fast else "Standard credits"
     lines.append(color.wrap(f"Codex usage — {period_label} — {tzname}", color.BOLD, color.CYAN))
     lines.append(color.wrap(f"Credit mode: {mode} (rate card {RATE_CARD_AS_OF})", color.DIM))
@@ -1932,7 +2060,7 @@ def render_json(
 ) -> str:
     out = {
         "period": period_label,
-        "timezone": getattr(tz, "key", None) or str(tz),
+        "timezone": _tz_label(tz),
         "credit_mode": "fast_assumed" if fast else "standard",
         "sessions": [],
     }
@@ -2093,7 +2221,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--timezone",
-        help="IANA timezone, e.g. Asia/Tokyo. Default: system local timezone.",
+        help="IANA timezone, e.g. Asia/Tokyo. Default: system local timezone. On Windows, named IANA zones may require the optional tzdata package.",
     )
     p.add_argument(
         "--show-subagents",
@@ -2129,6 +2257,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    _ensure_utf8_stdio()
     args = build_parser().parse_args(argv)
     codex_home = Path(args.codex_home).expanduser()
     tz = get_tz(args.timezone)
@@ -2204,7 +2333,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # An empty session set is valid for narrow windows on a fresh cache: all
     # discovered files may simply predate the requested interval. Render the
     # normal "No token_count usage" result rather than treating it as an error.
-    now = datetime.now(tz)
+    now = _now_in_tz(tz)
     effective_end = min(end, now)
     trend_start = effective_end - timedelta(minutes=TREND_MINUTES)
     live_report = report_is_live(start, end, now)

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.0 — 2026-08-12
+
+- Added native Windows 10/11 support while preserving macOS/Linux behavior.
+- Added `%LOCALAPPDATA%\codex-usage\index-v2.sqlite3` as the Windows cache location.
+- Fixed SQLite read-only URIs for Windows drive-letter paths and paths containing spaces.
+- Added automatic Windows Virtual Terminal Processing enablement for ANSI status colors.
+- Added a `codex-usage.cmd` launcher and `install.ps1` PowerShell installer with user-PATH setup.
+- Removed the default dependency on IANA `zoneinfo` data for system-local time on Windows; named `--timezone` values can use the optional `tzdata` package.
+- Made exact rolling `Nh` windows elapsed-time correct across daylight-saving transitions.
+- Added case-normalized path de-duplication for case-insensitive Windows filesystems.
+- Added cross-platform smoke tests and GitHub Actions coverage on Windows, macOS, and Linux with Python 3.9 and 3.13.
+
 ## 1.3.0 — 2026-08-12
 
 - Added compact, colorized terminal summary output.

@@ -8,7 +8,7 @@ It is designed for a question the built-in usage views do not answer directly:
 
 > Which Codex session is using my allowance, and why?
 
-The tool is a single Python script with **no third-party dependencies**.
+The core tool is a single Python script with **no mandatory third-party dependencies**. **v1.4.0 adds native Windows support** alongside macOS and Linux.
 
 ## Highlights
 
@@ -18,22 +18,72 @@ The tool is a single Python script with **no third-party dependencies**.
 - `CACHE TAX`: estimated credits attributable to cached input tokens.
 - `1H BURN`: credits observed in the trailing 60 minutes for live usage diagnostics.
 - `ACTIVE`, `RECENT`, `IDLE`, and `OK` / `WATCH` / `ROTATE` workflow hints.
-- ANSI colors for fast terminal scanning; automatically disabled for pipes, JSON, and CSV.
+- ANSI colors for fast terminal scanning, including automatic VT enablement on supported Windows consoles.
 - Incremental SQLite index: after the first scan, unchanged JSONL files are not re-read and append-only sessions are parsed from the tail.
 - Warm-cache discovery avoids walking the entire historical session tree on every invocation.
 - JSON and CSV output for downstream analysis.
+- Windows PowerShell installer and CMD launcher.
+- Cross-platform CI on Windows, macOS, and Linux.
 
 ## Requirements
 
 - Python **3.9+**
-- A local Codex installation that stores session transcripts under `$CODEX_HOME`
-- macOS or Linux
+- A local Codex installation that stores session transcripts under `$CODEX_HOME` / `%CODEX_HOME%`, or a path supplied with `--codex-home`
+- Windows 10/11, macOS, or Linux
 
-No external Python packages are required.
+No external Python packages are required for normal local-time usage.
+
+### Windows time-zone note
+
+Python on Windows does not normally ship an IANA time-zone database. You do **not** need one for the default system-local time zone. If you explicitly use a named IANA zone such as:
+
+```powershell
+codex-usage 24h --timezone Asia/Tokyo
+```
+
+and Python reports that the zone is unavailable, install the optional `tzdata` package:
+
+```powershell
+py -3 -m pip install tzdata
+```
 
 ## Install
 
-Clone the repository and install the script somewhere on your `PATH`:
+### Windows (PowerShell)
+
+Clone the repository and run the included installer:
+
+```powershell
+git clone https://github.com/yza167-jp/codex-usage.git
+cd codex-usage
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The installer copies `codex-usage` and `codex-usage.cmd` to:
+
+```text
+%LOCALAPPDATA%\Programs\codex-usage
+```
+
+and adds that directory to your **user PATH**. Open a new terminal and verify:
+
+```powershell
+codex-usage --version
+```
+
+You can choose another install directory:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallDir C:\Tools\codex-usage
+```
+
+Or run without installing:
+
+```powershell
+py -3 .\codex-usage 24h
+```
+
+### macOS / Linux
 
 ```bash
 git clone https://github.com/yza167-jp/codex-usage.git
@@ -58,23 +108,14 @@ codex-usage --version
 
 ## Quick start
 
-```bash
-# Current calendar day
+```text
 codex-usage today
-
-# Previous calendar day
 codex-usage yesterday
-
-# Exact rolling windows
 codex-usage 6h
 codex-usage 12h
 codex-usage 24h
 codex-usage 48h
-
-# Any rolling hour window
 codex-usage 168h
-
-# Calendar ranges
 codex-usage week
 codex-usage 7d
 codex-usage 2026-08-10
@@ -83,8 +124,10 @@ codex-usage 2026-08-01..2026-08-10
 
 `24h` and `yesterday` are intentionally different:
 
-- `24h`: from **now minus 24 hours** to now.
+- `24h`: the exact trailing 24-hour interval ending now.
 - `yesterday`: the previous local calendar day, `00:00–24:00`.
+
+Rolling `Nh` windows are calculated as elapsed time, including across daylight-saving transitions.
 
 ## Reading the summary
 
@@ -123,7 +166,7 @@ These are local heuristics, not OpenAI product warnings.
 
 ## Detailed diagnostics
 
-```bash
+```text
 codex-usage 24h --details
 ```
 
@@ -138,38 +181,37 @@ Adds:
 
 By default only the top eight agents are shown per session:
 
-```bash
+```text
 codex-usage 24h --details --top-agents 5
 codex-usage 24h --details --all-agents
 ```
 
 Restore token columns in the summary:
 
-```bash
+```text
 codex-usage 24h --wide
 ```
 
 Show each subagent as a separate top-level row instead of rolling it into the root session:
 
-```bash
+```text
 codex-usage 24h --show-subagents
 ```
 
 ## Colors
 
-Color is enabled automatically when stdout is a terminal.
+Color is enabled automatically when stdout is an interactive terminal. On Windows, v1.4.0 attempts to enable Virtual Terminal Processing for the current console, so Windows Terminal, modern PowerShell, and supported `cmd.exe` consoles can render the same status colors as macOS/Linux.
 
-```bash
+```text
 codex-usage 24h --color always
 codex-usage 24h --color never
-NO_COLOR=1 codex-usage 24h
 ```
 
-JSON and CSV output never contain ANSI color codes.
+The standard `NO_COLOR` environment variable is respected. JSON and CSV output never contain ANSI color codes.
 
 ## JSON / CSV
 
-```bash
+```text
 codex-usage 24h --json
 codex-usage 24h --csv
 codex-usage week --csv > codex-week.csv
@@ -181,12 +223,13 @@ Codex session transcripts can become large during long-running agent work. `code
 
 Default cache locations:
 
+- Windows: `%LOCALAPPDATA%\codex-usage\index-v2.sqlite3`
 - macOS: `~/Library/Caches/codex-usage/index-v2.sqlite3`
 - Linux: `${XDG_CACHE_HOME:-~/.cache}/codex-usage/index-v2.sqlite3`
 
 Inspect performance:
 
-```bash
+```text
 codex-usage 24h --perf
 ```
 
@@ -198,7 +241,7 @@ Perf: incremental-index | discovery=hot 0.004s | files=86 | hits=27 | cold=0 | a
 
 Useful maintenance commands:
 
-```bash
+```text
 codex-usage --cache-info
 codex-usage 24h --rebuild-cache --perf
 codex-usage 24h --no-cache
@@ -207,11 +250,27 @@ codex-usage 24h --full-discovery --perf
 
 The index stores only the metadata and token counters needed for statistics. It does **not** copy prompt or response bodies into the SQLite cache.
 
+## Codex data location
+
+The default is:
+
+```text
+~/.codex
+```
+
+which maps to the user's home directory on Windows, macOS, and Linux. Override it with either the `CODEX_HOME` environment variable or:
+
+```text
+codex-usage 24h --codex-home <path>
+```
+
+If your Codex sessions live inside **WSL**, the simplest and most reliable option is to run `codex-usage` inside the same WSL distribution. A native Windows invocation can still use `--codex-home` for a Windows-accessible transcript path, but the persistent profiler cache should remain on a local Windows filesystem for best SQLite performance.
+
 ## Fast mode
 
 If every eligible request in the selected window used Codex Fast mode, you can estimate credits with the published Fast multiplier:
 
-```bash
+```text
 codex-usage 24h --fast
 ```
 
@@ -219,88 +278,48 @@ Historical speed tier is not reliably present in the local `token_count` events,
 
 ## Data sources and accuracy
 
-Codex documents local session transcripts at:
+The tool reads local Codex rollout JSONL and, when present, `state_5.sqlite` for thread metadata. Token counters are converted into estimated credits using the rate card embedded in the script.
 
-- `$CODEX_HOME/sessions` (default `~/.codex/sessions`)
-- `$CODEX_HOME/archived_sessions` (default `~/.codex/archived_sessions`)
+Important limitations:
 
-`codex-usage` parses the local cumulative `token_count` events, converts them to deltas, handles rolling time windows, and attempts to avoid double-counting inherited history in full-history subagent forks.
-
-The embedded credit rate card is a snapshot and can become stale as Codex pricing changes. The script prints its rate-card date in the report header. For current official values, check the Codex pricing documentation.
-
-For authoritative product views:
-
-- `/status` shows current-session information including current token usage.
-- `/usage` shows account token activity views such as daily, weekly, and cumulative usage.
-
-This tool complements those views; it does not replace them.
+- Local transcripts are telemetry, not the authoritative server-side quota meter.
+- Historical Fast/Standard service tier is not reliably recoverable from token-count events.
+- Model/rate-card changes can make older embedded rates stale; check the `RATE_CARD_AS_OF` value in the script.
+- Full-history forks/subagents can copy inherited token counters. The tool uses parent lineage and cumulative-counter de-duplication to avoid counting inherited history twice when the needed lineage is available.
+- An unresolved child can appear as `[ORPHAN SUB]` rather than being guessed into a parent session.
 
 ## Privacy
 
-`codex-usage` is local-only:
+`codex-usage` is local-first:
 
-- It does not send session data to a server.
-- It does not require an OpenAI API key.
-- It does not require network access.
-- Its SQLite index stores statistical metadata/token counters rather than prompt/response bodies.
+- It does not upload your Codex transcripts.
+- It does not require an API key.
+- Its SQLite cache stores usage metadata and counters, not prompt/response bodies.
+- Terminal output can contain local thread titles and project directory names. Review output before posting screenshots or logs publicly.
 
-However, **terminal output can contain session titles and local working-directory paths**. Those may reveal project names or usernames. Review or redact output before posting logs publicly.
+The repository contains no user-specific paths or session data.
 
-The Codex transcript files themselves can contain sensitive material. Do not publish your `$CODEX_HOME/sessions` directory.
+## Cross-platform testing
 
-## Credit-rate snapshot
+The repository includes smoke tests for:
 
-The v1.3.0 script currently embeds this Codex credit-rate snapshot (credits per 1M tokens):
+- CLI version/help
+- synthetic rollout parsing with and without the incremental cache
+- SQLite read-only URI handling, including paths containing spaces
+- platform-specific default cache paths
 
-| Model | Input | Cached input | Output |
-|---|---:|---:|---:|
-| GPT-5.6 Sol | 125 | 12.5 | 750 |
-| GPT-5.6 Terra | 50 | 5 | 300 |
-| GPT-5.6 Luna | 5 | 0.5 | 30 |
-| GPT-5.5 | 125 | 12.5 | 750 |
-| GPT-5.4 | 62.5 | 6.25 | 375 |
-| GPT-5.4 mini | 18.75 | 1.875 | 113 |
+GitHub Actions runs the suite on `windows-latest`, `macos-latest`, and `ubuntu-latest` with Python 3.9 and 3.13.
 
-The script also recognizes the current Daybreak rates included in its internal rate card.
+Run locally:
 
-## Limitations
-
-- Local telemetry is not a server-side billing ledger.
-- Credit estimates depend on the embedded rate card and may lag pricing changes.
-- Mixed Standard/Fast history cannot currently be reconstructed reliably from token events.
-- Parent/child lineage can be incomplete; unresolved children are marked as orphan subagents.
-- Thread `OK` / `WATCH` / `ROTATE` labels are workflow heuristics.
-- Codex may change its local transcript schema in the future.
-
-## Development
-
-Smoke-test the public script with:
-
-```bash
-python3 codex-usage --version
-python3 codex-usage --help
-python3 -m py_compile codex-usage
+```text
+python -m unittest discover -s tests -v
 ```
-
-To compare the incremental index with a direct parse on your own data:
-
-```bash
-codex-usage 24h --json > /tmp/cached.json
-codex-usage 24h --no-cache --json > /tmp/direct.json
-```
-
-Keep in mind that an active Codex session can append new usage between the two commands.
-
-## Official references
-
-- [Codex pricing and credit rate card](https://learn.chatgpt.com/docs/pricing)
-- [Codex troubleshooting: local session transcript paths](https://learn.chatgpt.com/docs/reference/troubleshooting)
-- [Codex developer commands: `/status` and `/usage`](https://learn.chatgpt.com/docs/developer-commands)
-
-## Disclaimer
-
-This project is unofficial and is not affiliated with or endorsed by OpenAI. “OpenAI”, “ChatGPT”, and “Codex” are trademarks of their respective owner.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Disclaimer
+
+This project is not affiliated with or endorsed by OpenAI. Codex behavior, transcript formats, models, and rate cards may change. Treat the tool as a local diagnostic aid, not as a billing or quota authority.
