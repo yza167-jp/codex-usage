@@ -937,15 +937,15 @@ def read_latest_quota_snapshot(codex_home: Path, tz, fallback_plan: str = "") ->
     ranked.sort(reverse=True, key=lambda item: item[0])
 
     best = None
-    for _, path in ranked[:32]:
+    # Compare several recently modified rollouts instead of trusting the first
+    # file's latest quota event. An active rollout can receive non-token lines
+    # after its last rate-limit snapshot while another thread has a newer one.
+    for _, path in ranked[:8]:
         snap = _latest_quota_in_rollout(path, fallback_plan)
         if snap is None:
             continue
         if best is None or snap.ts > best.ts:
             best = snap
-        # The newest modified rollout usually has the newest backend snapshot.
-        if best is not None and best.limit_id == "codex":
-            break
     return best
 
 
