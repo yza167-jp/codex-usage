@@ -9,7 +9,7 @@
 - Added an internal rate-card calibration revision so observations computed with the old v1.5.0 rates are never mixed into new delta learning. An old calibration can be shown only as `LOW · prior-rate fallback` until current-revision observations become available.
 - Stopped showing `local coverage≈100%` for baseline-derived calibrations because that value is 100% by construction; local coverage is now shown only after independent delta calibration exists.
 - Added JSON/CSV lower-bound metadata for partial weekly estimates.
-
+- Added regression tests for the corrected official rates, partial `WEEKLY≈` lower bounds, and retaining a prior-rate calibration when the current window is incomplete.
 
 ## 1.5.0 — 2026-08-12
 
