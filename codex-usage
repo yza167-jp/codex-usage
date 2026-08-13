@@ -67,7 +67,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.5.2"
+VERSION = "1.5.5"
 RATE_CARD_AS_OF = "2026-08-12"
 RATE_CARD_CALIBRATION_KEY = "2026-08-12-r2"
 CACHE_SCHEMA_VERSION = 2
@@ -88,6 +88,14 @@ PLAN_DISPLAY_NAMES = {
     "plus": "Plus",
     "prolite": "Pro 5x",
     "pro": "Pro 20x",
+}
+# Last-resort bootstrap scale so WEEKLY≈ remains available even immediately
+# after a reset or on a fresh cache. These are deliberately low-confidence
+# empirical seeds; local backend observations replace them automatically.
+PLAN_WEEKLY_SEED_CPP = {
+    "plus": 35.0,
+    "prolite": 175.0,
+    "pro": 700.0,
 }
 
 # Official Codex ChatGPT credit rate card, credits per 1M tokens.
@@ -1097,6 +1105,36 @@ def _cache_connect(cache_path: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS quota_obs_lookup
             ON quota_observations(account_key, plan_type, rate_card, credit_mode, reset_at, snapshot_ts);
+        CREATE TABLE IF NOT EXISTS quota_snapshots (
+            account_key TEXT NOT NULL,
+            plan_type TEXT NOT NULL,
+            reset_at INTEGER NOT NULL,
+            window_minutes INTEGER NOT NULL,
+            snapshot_ts TEXT NOT NULL,
+            used_percent REAL NOT NULL,
+            credit_mode TEXT NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY(account_key, plan_type, reset_at, snapshot_ts, credit_mode)
+        );
+        CREATE INDEX IF NOT EXISTS quota_snapshots_lookup
+            ON quota_snapshots(account_key, plan_type, credit_mode, reset_at, used_percent, snapshot_ts);
+        CREATE TABLE IF NOT EXISTS quota_intervals (
+            account_key TEXT NOT NULL,
+            plan_type TEXT NOT NULL,
+            reset_at INTEGER NOT NULL,
+            start_ts TEXT NOT NULL,
+            end_ts TEXT NOT NULL,
+            start_used_percent REAL NOT NULL,
+            end_used_percent REAL NOT NULL,
+            local_credits REAL,
+            complete INTEGER NOT NULL,
+            rate_card TEXT NOT NULL,
+            credit_mode TEXT NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY(account_key, plan_type, reset_at, start_ts, end_ts, credit_mode)
+        );
+        CREATE INDEX IF NOT EXISTS quota_intervals_lookup
+            ON quota_intervals(account_key, plan_type, rate_card, credit_mode, reset_at, end_ts);
         """
     )
 
@@ -1522,7 +1560,7 @@ def _legacy_rebase_candidates(
         SELECT snapshot_ts,used_percent,reset_at,window_minutes
         FROM quota_observations
         WHERE account_key=? AND plan_type=? AND credit_mode=?
-          AND rate_card<>? AND reset_at=?
+          AND rate_card<>? AND snapshot_ts<=?
         ORDER BY snapshot_ts DESC
         LIMIT ?
         """,
@@ -1531,7 +1569,7 @@ def _legacy_rebase_candidates(
             plan,
             mode,
             RATE_CARD_CALIBRATION_KEY,
-            int(snapshot.resets_at),
+            snapshot.ts.astimezone(timezone.utc).isoformat(),
             max(1, int(limit)),
         ),
     ))
@@ -1600,6 +1638,147 @@ def _try_rebase_legacy_observation(
     return None
 
 
+def _quota_mode(fast: bool) -> str:
+    return "fast" if fast else "standard"
+
+
+def _quota_plan(auth: LocalAuthContext, snapshot: QuotaSnapshot) -> str:
+    return (snapshot.plan_type or auth.plan_type or "unknown").lower()
+
+
+def _record_quota_snapshot(
+    conn: sqlite3.Connection,
+    auth: LocalAuthContext,
+    snapshot: QuotaSnapshot,
+    fast: bool,
+) -> None:
+    if snapshot.resets_at is None:
+        return
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO quota_snapshots(
+            account_key,plan_type,reset_at,window_minutes,snapshot_ts,
+            used_percent,credit_mode,source
+        ) VALUES(?,?,?,?,?,?,?,?)
+        """,
+        (
+            auth.account_key,
+            _quota_plan(auth, snapshot),
+            int(snapshot.resets_at),
+            int(snapshot.window_minutes),
+            snapshot.ts.astimezone(timezone.utc).isoformat(),
+            float(snapshot.used_percent),
+            _quota_mode(fast),
+            snapshot.source,
+        ),
+    )
+    conn.commit()
+
+
+def _quota_interval_anchor(
+    conn: sqlite3.Connection,
+    auth: LocalAuthContext,
+    snapshot: QuotaSnapshot,
+    fast: bool,
+) -> Optional[QuotaSnapshot]:
+    """Return the earliest snapshot on the nearest lower usage plateau.
+
+    Backend used-percent values are commonly rounded. Using the earliest sample
+    on the previous plateau captures the work accumulated while the displayed
+    percentage stayed flat, instead of learning from only the last tiny slice
+    immediately before a 1pp jump.
+    """
+    if snapshot.resets_at is None or snapshot.used_percent <= 0:
+        return None
+    plan = _quota_plan(auth, snapshot)
+    mode = _quota_mode(fast)
+    prev = conn.execute(
+        """
+        SELECT MAX(used_percent) AS used
+        FROM quota_snapshots
+        WHERE account_key=? AND plan_type=? AND reset_at=? AND credit_mode=?
+          AND used_percent < ?
+        """,
+        (auth.account_key, plan, int(snapshot.resets_at), mode, float(snapshot.used_percent) - 1e-9),
+    ).fetchone()
+    if prev is None or prev["used"] is None:
+        return None
+    prev_used = float(prev["used"])
+    row = conn.execute(
+        """
+        SELECT snapshot_ts,window_minutes,source
+        FROM quota_snapshots
+        WHERE account_key=? AND plan_type=? AND reset_at=? AND credit_mode=?
+          AND ABS(used_percent-?) < 1e-9
+        ORDER BY snapshot_ts ASC LIMIT 1
+        """,
+        (auth.account_key, plan, int(snapshot.resets_at), mode, prev_used),
+    ).fetchone()
+    if row is None:
+        return None
+    ts = parse_ts(row["snapshot_ts"])
+    if ts is None or ts >= snapshot.ts:
+        return None
+    return QuotaSnapshot(
+        ts=ts,
+        used_percent=prev_used,
+        window_minutes=int(row["window_minutes"]),
+        resets_at=int(snapshot.resets_at),
+        plan_type=plan,
+        limit_id=snapshot.limit_id,
+        source=str(row["source"] or "snapshot"),
+    )
+
+
+def _record_quota_interval(
+    conn: sqlite3.Connection,
+    auth: LocalAuthContext,
+    start_snapshot: QuotaSnapshot,
+    end_snapshot: QuotaSnapshot,
+    local_credits: Optional[float],
+    complete: bool,
+    fast: bool,
+) -> None:
+    if end_snapshot.resets_at is None or start_snapshot.resets_at != end_snapshot.resets_at:
+        return
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO quota_intervals(
+            account_key,plan_type,reset_at,start_ts,end_ts,start_used_percent,
+            end_used_percent,local_credits,complete,rate_card,credit_mode,source
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            auth.account_key,
+            _quota_plan(auth, end_snapshot),
+            int(end_snapshot.resets_at),
+            start_snapshot.ts.astimezone(timezone.utc).isoformat(),
+            end_snapshot.ts.astimezone(timezone.utc).isoformat(),
+            float(start_snapshot.used_percent),
+            float(end_snapshot.used_percent),
+            None if local_credits is None else float(local_credits),
+            1 if complete else 0,
+            RATE_CARD_CALIBRATION_KEY,
+            _quota_mode(fast),
+            "snapshot_delta",
+        ),
+    )
+    conn.commit()
+
+
+def bootstrap_quota_calibration(
+    auth: LocalAuthContext,
+    snapshot: QuotaSnapshot,
+) -> QuotaCalibration:
+    plan = _quota_plan(auth, snapshot)
+    cpp = PLAN_WEEKLY_SEED_CPP.get(plan, PLAN_WEEKLY_SEED_CPP["prolite"])
+    return QuotaCalibration(
+        credits_per_percent=cpp,
+        confidence="SEED",
+        source="plan_seed" if plan in PLAN_WEEKLY_SEED_CPP else "generic_seed",
+    )
+
+
 def _weighted_median(values: List[Tuple[float, float]]) -> Optional[float]:
     if not values:
         return None
@@ -1636,22 +1815,39 @@ def load_quota_calibration(
     ))
     calibration = QuotaCalibration(observation_count=len(rows))
 
-    by_reset: Dict[int, List[sqlite3.Row]] = {}
-    for row in rows:
-        by_reset.setdefault(int(row["reset_at"]), []).append(row)
-
+    interval_rows = list(conn.execute(
+        """
+        SELECT start_used_percent,end_used_percent,local_credits
+        FROM quota_intervals
+        WHERE account_key=? AND plan_type=? AND rate_card=? AND credit_mode=?
+          AND complete=1 AND local_credits IS NOT NULL
+        ORDER BY reset_at,end_ts
+        """,
+        (auth.account_key, plan, RATE_CARD_CALIBRATION_KEY, mode),
+    ))
+    calibration.observation_count = len(rows) + len(interval_rows)
     candidates: List[Tuple[float, float]] = []
-    for group in by_reset.values():
-        for previous, current in zip(group, group[1:]):
-            du = float(current["used_percent"]) - float(previous["used_percent"])
-            dc = float(current["local_credits"]) - float(previous["local_credits"])
-            # Backend percentages can be rounded. Require visible movement and
-            # positive local work before learning a conversion interval.
-            if du < 0.25 or dc <= 0:
-                continue
+    for row in interval_rows:
+        du = float(row["end_used_percent"]) - float(row["start_used_percent"])
+        dc = float(row["local_credits"])
+        if du >= 0.25 and dc > 0:
             ratio = dc / du
-            if ratio > 0 and ratio < 1e9:
+            if 0 < ratio < 1e9:
                 candidates.append((ratio, du))
+
+    if not candidates:
+        by_reset: Dict[int, List[sqlite3.Row]] = {}
+        for row in rows:
+            by_reset.setdefault(int(row["reset_at"]), []).append(row)
+        for group in by_reset.values():
+            for previous, current in zip(group, group[1:]):
+                du = float(current["used_percent"]) - float(previous["used_percent"])
+                dc = float(current["local_credits"]) - float(previous["local_credits"])
+                if du < 0.25 or dc <= 0:
+                    continue
+                ratio = dc / du
+                if 0 < ratio < 1e9:
+                    candidates.append((ratio, du))
 
     clean = candidates
     if len(candidates) >= 2:
@@ -1687,11 +1883,11 @@ def load_quota_calibration(
         stored_credits = float(latest["local_credits"])
         if used >= 1.0 and stored_credits > 0:
             cpp = stored_credits / used
-            source = (
-                "rebased_baseline"
-                if str(latest["source"] or "") == "rebased"
-                else "stored_baseline"
-            )
+            same_epoch = int(latest["reset_at"]) == int(snapshot.resets_at or -1)
+            if str(latest["source"] or "") == "rebased":
+                source = "rebased_baseline" if same_epoch else "historical_rebased"
+            else:
+                source = "stored_baseline" if same_epoch else "historical_baseline"
 
     # v1.5.2 deliberately does NOT fall back to old-rate local_credits. Those
     # values live in a different coordinate system after a rate-card change.
@@ -2198,10 +2394,10 @@ def effective_health(bucket: Bucket, fast: bool, state: str) -> str:
     return thread_health(bucket, fast)
 
 
-def recent_burn(bucket: Bucket, fast: bool) -> Tuple[Optional[float], float]:
-    credits, _ = model_map_credits(bucket.recent_usage_by_model, fast)
+def recent_burn(bucket: Bucket, fast: bool) -> Tuple[Optional[float], float, bool]:
+    credits, complete = model_map_credits(bucket.recent_usage_by_model, fast)
     _, cache_tax, _, _ = cost_components_for_map(bucket.recent_usage_by_model, fast)
-    return credits, cache_tax
+    return credits, cache_tax, complete
 
 
 def status_text(state: str, health: str, orphan: bool = False) -> str:
@@ -2412,6 +2608,7 @@ def render_table(
     quota_snapshot: Optional[QuotaSnapshot] = None,
     quota_calibration: Optional[QuotaCalibration] = None,
     quota_local_credits: Optional[float] = None,
+    quota_local_complete: bool = True,
 ) -> str:
     rows = []
     known_credit_total = 0.0
@@ -2424,14 +2621,14 @@ def render_table(
         _, cache_tax, _, _ = cost_components_for_map(b.usage_by_model, fast)
         state = thread_state(b, now, live_report)
         health = effective_health(b, fast, state)
-        burn, recent_cache = recent_burn(b, fast)
+        burn, recent_cache, burn_complete = recent_burn(b, fast)
         is_orphan = orphan_subagent(b, sessions)
         if credits is not None:
             known_credit_total += credits
         if not complete:
             any_partial = True
             all_credit_complete = False
-        rows.append((b, u, credits, complete, cache_tax, state, health, burn, recent_cache, is_orphan))
+        rows.append((b, u, credits, complete, cache_tax, state, health, burn, recent_cache, burn_complete, is_orphan))
 
     rows.sort(
         key=lambda x: (
@@ -2456,7 +2653,7 @@ def render_table(
         used = quota_snapshot.used_percent
         left = max(0.0, 100.0 - used)
         sub_line = (
-            f"Subscription  {plan_display_name(plan_raw)} · WEEKLY {used:.1f}% used / {left:.1f}% left "
+            f"Subscription  {plan_display_name(plan_raw)} · CURRENT WEEK {used:.1f}% used / {left:.1f}% left "
             f"· reset {human_until(quota_snapshot.resets_at, now)} · snapshot {human_age(quota_snapshot.ts, now)}"
         )
         sub_style = color.RED if used >= 85 else color.YELLOW if used >= 60 else color.GREEN
@@ -2471,18 +2668,32 @@ def render_table(
                 cal_meta = f" · {cal.clean_intervals} clean / {cal.observed_percent_points:.1f}pp"
             elif cal.source == "rebased_baseline":
                 cal_meta = " · rebased baseline"
+            elif cal.source == "historical_rebased":
+                cal_meta = " · historical rebase"
+            elif cal.source == "historical_baseline":
+                cal_meta = " · historical baseline"
             elif cal.source == "stored_baseline":
                 cal_meta = " · stored baseline"
+            elif cal.source in ("plan_seed", "generic_seed"):
+                cal_meta = " · plan bootstrap"
             else:
                 cal_meta = " · baseline"
-            cal_line = (
-                f"Calibration   1% weekly ≈ {cal.credits_per_percent:.1f} credits* · {cal.confidence}"
+            scale_line = (
+                f"Weekly scale  1% ≈ {cal.credits_per_percent:.1f} credits* · {cal.confidence}"
                 f"{cal_meta}{coverage}"
             )
-            lines.append(color.wrap(truncate(cal_line, terminal_width), color.DIM))
-        else:
+            lines.append(color.wrap(truncate(scale_line, terminal_width), color.DIM))
+            if quota_local_credits is not None:
+                local_week = weekly_percent_text(quota_local_credits, cal, quota_local_complete)
+                credit_mark = f"{quota_local_credits:.1f}" + ("" if quota_local_complete else "+")
+            elif not quota_local_complete:
+                local_week = "≥0.00%"
+                credit_mark = "0.0+"
+            else:
+                local_week = "0.00%"
+                credit_mark = "0.0"
             lines.append(color.wrap(
-                "Calibration   LEARNING · first estimate appears after enough local/week usage is observed",
+                truncate(f"Local this week≈ {local_week} · CREDITS* {credit_mark}", terminal_width),
                 color.DIM,
             ))
     elif plan_raw:
@@ -2498,8 +2709,8 @@ def render_table(
 
     gap = 2
     if wide:
-        headers = ["SESSION", "MODEL(S)", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "WEEKLY≈", "CACHE TAX", "1H BURN", "SHARE", "STATUS"]
-        fixed = [9, 9, 9, 10, 9, 10, 9, 7, 13]
+        headers = ["SESSION", "MODEL(S)", "WEEKLY≈", "1H≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SHARE", "STATUS"]
+        fixed = [10, 9, 10, 9, 9, 9, 10, 7, 13]
         fixed_total = sum(fixed) + gap * (len(headers) - 1)
         flexible = max(28, terminal_width - fixed_total)
         model_w = max(14, min(24, flexible // 3))
@@ -2507,8 +2718,8 @@ def render_table(
         widths = [session_w, model_w] + fixed
         align_right = {2, 3, 4, 5, 6, 7, 8, 9}
     else:
-        headers = ["SESSION", "MODEL(S)", "CREDITS*", "WEEKLY≈", "CACHE TAX", "1H BURN", "SHARE", "STATUS"]
-        fixed = [10, 9, 10, 9, 7, 13]
+        headers = ["SESSION", "MODEL(S)", "WEEKLY≈", "1H≈", "CREDITS*", "CACHE TAX", "SHARE", "STATUS"]
+        fixed = [10, 9, 10, 10, 7, 13]
         fixed_total = sum(fixed) + gap * (len(headers) - 1)
         flexible = max(30, terminal_width - fixed_total)
         model_w = max(14, min(24, flexible // 3))
@@ -2549,7 +2760,7 @@ def render_table(
     lines.append(fmt_row(headers, {i: "header" for i in range(len(headers))}))
     lines.append(color.wrap("  ".join("-" * w for w in widths), color.DIM))
 
-    for b, u, credits, complete, cache_tax, state, health, burn, recent_cache, is_orphan in rows:
+    for b, u, credits, complete, cache_tax, state, health, burn, recent_cache, burn_complete, is_orphan in rows:
         credit_text = "—"
         share_text = "—"
         if credits is not None:
@@ -2558,25 +2769,25 @@ def render_table(
                 share_text = f"{100.0 * credits / known_credit_total:.1f}%"
         title = b.title + (f" (+{len(b.child_sessions)} sub)" if b.child_sessions else "")
         status = status_text(state, health, is_orphan)
-        burn_text = "—" if burn is None or burn <= 0 else f"{burn:.1f}"
         weekly_text = weekly_percent_text(credits, quota_calibration, complete)
+        burn_weekly = weekly_percent_text(
+            burn if burn is not None and burn > 0 else None, quota_calibration, burn_complete
+        )
 
         if wide:
             row = [
-                title, model_label(b.usage_by_model.keys()),
+                title, model_label(b.usage_by_model.keys()), weekly_text, burn_weekly, credit_text,
                 human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
-                human_tokens(u.output_tokens), credit_text, weekly_text,
-                f"{cache_tax:.1f}" if cache_tax > 0 else "—",
-                burn_text, share_text, status,
+                human_tokens(u.output_tokens), f"{cache_tax:.1f}" if cache_tax > 0 else "—",
+                share_text, status,
             ]
-            status_idx, title_idx, burn_idx, cache_idx = 10, 0, 8, 7
+            status_idx, title_idx, burn_idx, cache_idx = 10, 0, 3, 8
         else:
             row = [
-                title, model_label(b.usage_by_model.keys()), credit_text, weekly_text,
-                f"{cache_tax:.1f}" if cache_tax > 0 else "—",
-                burn_text, share_text, status,
+                title, model_label(b.usage_by_model.keys()), weekly_text, burn_weekly, credit_text,
+                f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
             ]
-            status_idx, title_idx, burn_idx, cache_idx = 7, 0, 5, 4
+            status_idx, title_idx, burn_idx, cache_idx = 7, 0, 3, 5
 
         styles = {}
         if is_orphan:
@@ -2613,44 +2824,43 @@ def render_table(
     total_usage = Usage()
     total_cache_tax = 0.0
     total_recent = 0.0
-    for _, u, _, _, cache_tax, _, _, burn, _, _ in rows:
+    for _, u, _, _, cache_tax, _, _, burn, _, _, _ in rows:
         total_usage = total_usage + u
         total_cache_tax += cache_tax
         if burn is not None:
             total_recent += burn
-    total_credit_text = f"{known_credit_total:.1f}" if known_credit_total > 0 else "—"
+    total_credit_text = f"{known_credit_total:.1f}" + ("" if all_credit_complete else "+") if known_credit_total > 0 else "—"
     total_weekly_text = weekly_percent_text(
-        known_credit_total if known_credit_total > 0 else None,
-        quota_calibration,
-        all_credit_complete,
+        known_credit_total if known_credit_total > 0 else None, quota_calibration, all_credit_complete
+    )
+    total_burn_complete = all(r[9] for r in rows if r[7] is not None and r[7] > 0)
+    total_burn_weekly = weekly_percent_text(
+        total_recent if total_recent > 0 else None, quota_calibration, total_burn_complete
     )
     if wide:
         total_row = [
-            "TOTAL", "", human_tokens(total_usage.input_tokens),
-            human_tokens(total_usage.cached_input_tokens), human_tokens(total_usage.output_tokens),
-            total_credit_text, total_weekly_text, f"{total_cache_tax:.1f}" if total_cache_tax else "—",
-            f"{total_recent:.1f}" if total_recent else "—",
+            "TOTAL", "", total_weekly_text, total_burn_weekly, total_credit_text,
+            human_tokens(total_usage.input_tokens), human_tokens(total_usage.cached_input_tokens),
+            human_tokens(total_usage.output_tokens), f"{total_cache_tax:.1f}" if total_cache_tax else "—",
             "100%" if known_credit_total > 0 else "—", "",
         ]
     else:
         total_row = [
-            "TOTAL", "", total_credit_text, total_weekly_text,
+            "TOTAL", "", total_weekly_text, total_burn_weekly, total_credit_text,
             f"{total_cache_tax:.1f}" if total_cache_tax else "—",
-            f"{total_recent:.1f}" if total_recent else "—",
             "100%" if known_credit_total > 0 else "—", "",
         ]
     lines.append(color.wrap("  ".join("-" * w for w in widths), color.DIM))
     lines.append(fmt_row(total_row, {i: "total" for i in range(len(total_row))}))
     lines.append("")
     lines.append(color.wrap(
-        "* 1H BURN = credits observed in the trailing 60 minutes (not a quota limit). "
-        "CACHE TAX = cached-input credit component.", color.DIM
+        "* WEEKLY≈ expresses the selected local usage as a share of one plan weekly allowance; it can span quota resets.",
+        color.DIM,
     ))
-    if quota_calibration is not None and quota_calibration.credits_per_percent:
-        lines.append(color.wrap(
-            "  WEEKLY≈ is an estimated share of included weekly allowance learned from local credits vs backend used%.",
-            color.DIM,
-        ))
+    lines.append(color.wrap(
+        "  1H≈ is the same weekly-equivalent metric for the trailing 60 minutes. CREDITS* and CACHE TAX are secondary diagnostics.",
+        color.DIM,
+    ))
     lines.append(color.wrap(STATUS_NOTE, color.DIM))
     if not wide:
         lines.append(color.wrap("  Use --wide to restore INPUT/CACHED/OUTPUT columns.", color.DIM))
@@ -2666,7 +2876,7 @@ def render_table(
         ))
 
     if details:
-        for b, total_u, total_credits, total_complete, total_cache_tax, state, health, burn, recent_cache, is_orphan in rows:
+        for b, total_u, total_credits, total_complete, total_cache_tax, state, health, burn, recent_cache, burn_complete, is_orphan in rows:
             lines.append("")
             detail_width = terminal_width
             lines.append(color.wrap("=" * detail_width, color.BLUE))
@@ -2703,16 +2913,15 @@ def render_table(
                 f"{state_text} · last {human_age(b.last_activity, now)} · health {health_text}"
             )
 
+            usage_weekly = weekly_percent_text(total_credits, quota_calibration, total_complete)
+            credit_mark = "—" if total_credits is None else f"{total_credits:.1f}" + ("" if total_complete else "+")
+            lines.append(f"Usage      WEEKLY≈ {usage_weekly} · CREDITS* {credit_mark}")
             if burn is not None and burn > 0:
-                projection = burn * 2.0
-                projection_text = f" · +2h ≈{projection:.1f}" if state == "ACTIVE" else ""
+                burn_weekly = weekly_percent_text(burn, quota_calibration, burn_complete)
+                projection_weekly = weekly_percent_text(burn * 2.0, quota_calibration, burn_complete)
+                projection_text = f" · +2h≈{projection_weekly}" if state == "ACTIVE" else ""
                 lines.append(
-                    f"1H BURN {burn:.1f} · cache {recent_cache:.1f}{projection_text}"
-                )
-            if quota_calibration is not None and quota_calibration.credits_per_percent and total_credits is not None:
-                lines.append(
-                    f"WEEKLY≈ {weekly_percent_text(total_credits, quota_calibration, total_complete)} "
-                    f"· 1%≈{quota_calibration.credits_per_percent:.1f} credits* · {quota_calibration.confidence}"
+                    f"1H usage   WEEKLY≈ {burn_weekly} · CREDITS* {burn:.1f} · cache {recent_cache:.1f}{projection_text}"
                 )
             lines.append("")
 
@@ -2727,11 +2936,11 @@ def render_table(
             # COST COMPONENTS
             uncached_c, cached_c, output_c, comp_complete = cost_components_for_map(b.usage_by_model, fast)
             component_total = uncached_c + cached_c + output_c
-            lines.append(color.wrap("Credit components", color.BOLD, color.BLUE))
-            ch = ["COMPONENT", "CREDITS*", "SESSION%"]
-            cw = fit_widths_to_target([30, 14, 10], detail_width, (0,))
-            cr = {1, 2}
-            lines.append(fmt_detail(ch, cw, cr, {0: "header", 1: "header", 2: "header"}))
+            lines.append(color.wrap("Usage components", color.BOLD, color.BLUE))
+            ch = ["COMPONENT", "WEEKLY≈", "CREDITS*", "SESSION%"]
+            cw = fit_widths_to_target([30, 12, 12, 10], detail_width, (0,))
+            cr = {1, 2, 3}
+            lines.append(fmt_detail(ch, cw, cr, {i: "header" for i in range(len(ch))}))
             lines.append(color.wrap("  ".join("-" * w for w in cw), color.DIM))
             for name, value in (
                 ("Cached input (CACHE TAX)", cached_c),
@@ -2739,16 +2948,17 @@ def render_table(
                 ("Output", output_c),
             ):
                 pct = f"{100.0 * value / component_total:.1f}%" if component_total > 0 else "—"
+                weekly = weekly_percent_text(value, quota_calibration, comp_complete)
                 st = {0: "warn"} if name.startswith("Cached") and component_total and value / component_total >= 0.70 else {}
-                lines.append(fmt_detail([name, f"{value:.1f}", pct], cw, cr, st))
+                lines.append(fmt_detail([name, weekly, f"{value:.1f}", pct], cw, cr, st))
 
             # MAIN / SUB SUMMARY
             main_map, sub_map = main_sub_maps(b)
             lines.append("")
             lines.append(color.wrap("Main vs subagents", color.BOLD, color.BLUE))
-            rh = ["ROLE", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "SESSION%"]
-            rw = fit_widths_to_target([12, 11, 11, 11, 12, 12, 10], detail_width, (0,))
-            rr = {1, 2, 3, 4, 5, 6}
+            rh = ["ROLE", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SESSION%"]
+            rw = fit_widths_to_target([12, 12, 12, 10, 10, 10, 11, 10], detail_width, (0,))
+            rr = {1, 2, 3, 4, 5, 6, 7}
             lines.append(fmt_detail(rh, rw, rr, {i: "header" for i in range(len(rh))}))
             lines.append(color.wrap("  ".join("-" * w for w in rw), color.DIM))
             for role, mmap in (("MAIN", main_map), ("SUB", sub_map)):
@@ -2763,17 +2973,18 @@ def render_table(
                     else "—"
                 )
                 lines.append(fmt_detail([
-                    role, human_tokens(ru.input_tokens), human_tokens(ru.cached_input_tokens),
-                    human_tokens(ru.output_tokens), "—" if rcost is None else f"{rcost:.1f}",
-                    f"{rcache:.1f}" if rcache else "—", pct,
+                    role, weekly_percent_text(rcost, quota_calibration, rcomplete),
+                    "—" if rcost is None else f"{rcost:.1f}" + ("" if rcomplete else "+"),
+                    human_tokens(ru.input_tokens), human_tokens(ru.cached_input_tokens),
+                    human_tokens(ru.output_tokens), f"{rcache:.1f}" if rcache else "—", pct,
                 ], rw, rr, {0: "active" if role == "MAIN" and state == "ACTIVE" else None}))
 
             # MODEL BREAKDOWN
             lines.append("")
             lines.append(color.wrap("Model breakdown", color.BOLD, color.BLUE))
-            mh = ["MODEL", "INPUT", "CACHED", "OUTPUT", "REASON", "CREDITS*", "CACHE TAX", "SESSION%"]
-            mw = fit_widths_to_target([20, 10, 10, 10, 10, 11, 11, 9], detail_width, (0,))
-            mr = {1, 2, 3, 4, 5, 6, 7}
+            mh = ["MODEL", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "REASON", "CACHE TAX", "SESSION%"]
+            mw = fit_widths_to_target([20, 12, 11, 9, 9, 9, 9, 10, 9], detail_width, (0,))
+            mr = {1, 2, 3, 4, 5, 6, 7, 8}
             lines.append(fmt_detail(mh, mw, mr, {i: "header" for i in range(len(mh))}))
             lines.append(color.wrap("  ".join("-" * w for w in mw), color.DIM))
             model_rows = []
@@ -2786,17 +2997,18 @@ def render_table(
             for model, u, c, cache_part in model_rows:
                 pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
                 lines.append(fmt_detail([
-                    pretty_model(model), human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
-                    human_tokens(u.output_tokens), human_tokens(u.reasoning_output_tokens),
-                    "—" if c is None else f"{c:.1f}", f"{cache_part:.1f}" if cache_part else "—", pct,
+                    pretty_model(model), weekly_percent_text(c, quota_calibration, c is not None),
+                    "—" if c is None else f"{c:.1f}", human_tokens(u.input_tokens),
+                    human_tokens(u.cached_input_tokens), human_tokens(u.output_tokens),
+                    human_tokens(u.reasoning_output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
                 ], mw, mr))
 
             # AGENT BREAKDOWN
             lines.append("")
             lines.append(color.wrap("Agent breakdown", color.BOLD, color.BLUE))
-            ah = ["ROLE / SESSION", "MODEL(S)", "INPUT", "CACHED", "OUTPUT", "CREDITS*", "CACHE TAX", "SESSION%"]
-            aw = fit_widths_to_target([37, 19, 9, 9, 9, 10, 10, 9], detail_width, (0, 1))
-            ar = {2, 3, 4, 5, 6, 7}
+            ah = ["ROLE / SESSION", "MODEL(S)", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SESSION%"]
+            aw = fit_widths_to_target([30, 18, 12, 11, 8, 8, 8, 10, 9], detail_width, (0, 1))
+            ar = {2, 3, 4, 5, 6, 7, 8}
             lines.append(fmt_detail(ah, aw, ar, {i: "header" for i in range(len(ah))}))
             lines.append(color.wrap("  ".join("-" * w for w in aw), color.DIM))
             agent_rows = []
@@ -2817,9 +3029,9 @@ def render_table(
                 credit_text = "—" if c is None else f"{c:.1f}" + ("" if complete else "+")
                 role_style = "active" if sid not in b.source_is_subagent and state == "ACTIVE" else None
                 lines.append(fmt_detail([
-                    label, model_label(by_model.keys()), human_tokens(u.input_tokens),
-                    human_tokens(u.cached_input_tokens), human_tokens(u.output_tokens), credit_text,
-                    f"{cache_part:.1f}" if cache_part else "—", pct,
+                    label, model_label(by_model.keys()), weekly_percent_text(c, quota_calibration, complete),
+                    credit_text, human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
+                    human_tokens(u.output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
                 ], aw, ar, {0: role_style} if role_style else {}))
             hidden = len(agent_rows) - len(visible_agents)
             if hidden > 0:
@@ -2856,6 +3068,8 @@ def render_json(
             "weekly_resets_at": quota_snapshot.resets_at if quota_snapshot else None,
             "snapshot_at": quota_snapshot.ts.isoformat() if quota_snapshot else None,
             "local_week_credits": quota_local_credits,
+            "local_weekly_estimate_percent": (quota_local_credits / quota_calibration.credits_per_percent) if (quota_local_credits is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
+            "weekly_estimate_basis": "one_plan_weekly_allowance",
             "credits_per_weekly_percent": quota_calibration.credits_per_percent if quota_calibration else None,
             "effective_weekly_credit_capacity": quota_calibration.effective_weekly_credits if quota_calibration else None,
             "calibration_confidence": quota_calibration.confidence if quota_calibration else None,
@@ -2919,7 +3133,7 @@ def render_json(
         sub_credits, _ = model_map_credits(sub_map, fast)
         state = thread_state(b, now, live_report)
         health = effective_health(b, fast, state)
-        burn, recent_cache = recent_burn(b, fast)
+        burn, recent_cache, burn_complete = recent_burn(b, fast)
         out["sessions"].append({
             "session_id": b.session_id,
             "title": b.title,
@@ -2927,6 +3141,7 @@ def render_json(
             "thread_state": state,
             "thread_health": health,
             "last_activity": b.last_activity.isoformat() if b.last_activity else None,
+            "trailing_1h_weekly_estimate_percent": (burn / quota_calibration.credits_per_percent) if (burn is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
             "trailing_1h_credit_burn": burn,
             "trailing_1h_cache_tax": recent_cache,
             "cache_tax_credits": cache_tax,
@@ -2986,7 +3201,7 @@ def render_csv(
         sub_c, _ = model_map_credits(sub_map, fast)
         state = thread_state(b, now, live_report)
         health = effective_health(b, fast, state)
-        burn, recent_cache = recent_burn(b, fast)
+        burn, recent_cache, burn_complete = recent_burn(b, fast)
         writer.writerow([
             b.session_id,
             b.title,
@@ -3184,6 +3399,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     quota_calibration = None
     quota_local_credits = None
+    quota_complete = True
     if quota_snapshot is not None and quota_week_start is not None:
         quota_end = _to_tz(quota_snapshot.ts, tz) + timedelta(microseconds=1)
         if quota_end > quota_week_start:
@@ -3199,8 +3415,27 @@ def main(argv: Optional[List[str]] = None) -> int:
             quota_local_credits, quota_complete = bucket_collection_credits(weekly_buckets, sessions, args.fast)
             quota_conn = _cache_connect(cache_path)
             try:
+                interval_anchor = _quota_interval_anchor(
+                    quota_conn, auth_context, quota_snapshot, args.fast
+                )
+                if interval_anchor is not None:
+                    interval_start = _to_tz(interval_anchor.ts, tz)
+                    interval_end = _to_tz(quota_snapshot.ts, tz) + timedelta(microseconds=1)
+                    interval_buckets = make_buckets(
+                        sessions=sessions, index=index, start=interval_start, end=interval_end,
+                        tz=tz, show_subagents=False, trend_start=None,
+                    )
+                    interval_credits, interval_complete = bucket_collection_credits(
+                        interval_buckets, sessions, args.fast
+                    )
+                    _record_quota_interval(
+                        quota_conn, auth_context, interval_anchor, quota_snapshot,
+                        interval_credits, interval_complete, args.fast,
+                    )
+                _record_quota_snapshot(quota_conn, auth_context, quota_snapshot, args.fast)
+
                 current_complete_credits = None
-                if quota_local_credits is not None and quota_complete:
+                if quota_local_credits is not None and quota_complete and quota_snapshot.used_percent >= 1.0:
                     _record_quota_observation(
                         quota_conn, auth_context, quota_snapshot, quota_local_credits, args.fast
                     )
@@ -3210,22 +3445,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
                 if not quota_calibration.credits_per_percent:
                     rebased = _try_rebase_legacy_observation(
-                        quota_conn,
-                        auth_context,
-                        quota_snapshot,
-                        sessions,
-                        index,
-                        tz,
-                        args.fast,
+                        quota_conn, auth_context, quota_snapshot, sessions, index, tz, args.fast
                     )
                     if rebased is not None:
                         quota_calibration = load_quota_calibration(
-                            quota_conn,
-                            auth_context,
-                            quota_snapshot,
-                            current_complete_credits,
-                            args.fast,
+                            quota_conn, auth_context, quota_snapshot, current_complete_credits, args.fast
                         )
+                if not quota_calibration.credits_per_percent:
+                    quota_calibration = bootstrap_quota_calibration(auth_context, quota_snapshot)
             finally:
                 quota_conn.close()
 
@@ -3248,6 +3475,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             top_agents=max(0, args.top_agents), all_agents=args.all_agents,
             auth_context=auth_context, quota_snapshot=quota_snapshot,
             quota_calibration=quota_calibration, quota_local_credits=quota_local_credits,
+            quota_local_complete=quota_complete,
         ))
 
     if malformed and not (args.json or args.csv):

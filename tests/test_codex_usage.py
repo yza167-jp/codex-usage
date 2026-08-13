@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.5.2", proc.stdout)
+        self.assertIn("1.5.5", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -110,6 +110,72 @@ class CodexUsageSmokeTests(unittest.TestCase):
             self.assertEqual(ctx.plan_type, "prolite")
             self.assertEqual(self.mod.plan_display_name(ctx.plan_type), "Pro 5x")
             self.assertNotEqual(ctx.account_key, "local")
+
+    def test_v155_plan_seed_keeps_weekly_available_after_reset(self):
+        snap = self.mod.QuotaSnapshot(
+            datetime.now(timezone.utc), 0.0, 10080, 9999999999, plan_type="prolite"
+        )
+        auth = self.mod.LocalAuthContext(plan_type="prolite", account_key="acct")
+        cal = self.mod.bootstrap_quota_calibration(auth, snap)
+        self.assertEqual(cal.credits_per_percent, 175.0)
+        self.assertEqual(cal.confidence, "SEED")
+        self.assertEqual(cal.source, "plan_seed")
+        self.assertEqual(self.mod.weekly_percent_text(350.0, cal, True), "2.00%")
+
+    def test_v155_interval_calibration_ignores_dirty_spark_interval(self):
+        now = datetime.now(timezone.utc)
+        reset = int((now + self.mod.timedelta(days=5)).timestamp())
+        with tempfile.TemporaryDirectory() as td:
+            conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
+            auth = self.mod.LocalAuthContext(plan_type="prolite", account_key="acct")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO quota_intervals(
+                        account_key,plan_type,reset_at,start_ts,end_ts,start_used_percent,
+                        end_used_percent,local_credits,complete,rate_card,credit_mode,source
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    ("acct", "prolite", reset, now.isoformat(), (now+self.mod.timedelta(seconds=1)).isoformat(),
+                     0.0, 1.0, 50.0, 0, self.mod.RATE_CARD_CALIBRATION_KEY, "standard", "snapshot_delta"),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quota_intervals(
+                        account_key,plan_type,reset_at,start_ts,end_ts,start_used_percent,
+                        end_used_percent,local_credits,complete,rate_card,credit_mode,source
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    ("acct", "prolite", reset, (now+self.mod.timedelta(seconds=2)).isoformat(),
+                     (now+self.mod.timedelta(seconds=3)).isoformat(), 1.0, 3.0, 360.0, 1,
+                     self.mod.RATE_CARD_CALIBRATION_KEY, "standard", "snapshot_delta"),
+                )
+                conn.commit()
+                snap = self.mod.QuotaSnapshot(now+self.mod.timedelta(seconds=4), 3.0, 10080, reset, plan_type="prolite")
+                cal = self.mod.load_quota_calibration(conn, auth, snap, None, False)
+                self.assertAlmostEqual(cal.credits_per_percent, 180.0, delta=0.01)
+                self.assertEqual(cal.source, "delta")
+                self.assertEqual(cal.clean_intervals, 1)
+            finally:
+                conn.close()
+
+    def test_v155_interval_anchor_uses_earliest_previous_plateau(self):
+        now = datetime.now(timezone.utc)
+        reset = int((now + self.mod.timedelta(days=6)).timestamp())
+        with tempfile.TemporaryDirectory() as td:
+            conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
+            auth = self.mod.LocalAuthContext(plan_type="prolite", account_key="acct")
+            try:
+                for offset in (0, 10, 20):
+                    snap0 = self.mod.QuotaSnapshot(now+self.mod.timedelta(seconds=offset), 0.0, 10080, reset, plan_type="prolite")
+                    self.mod._record_quota_snapshot(conn, auth, snap0, False)
+                snap1 = self.mod.QuotaSnapshot(now+self.mod.timedelta(seconds=30), 1.0, 10080, reset, plan_type="prolite")
+                anchor = self.mod._quota_interval_anchor(conn, auth, snap1, False)
+                self.assertIsNotNone(anchor)
+                self.assertEqual(anchor.used_percent, 0.0)
+                self.assertEqual(anchor.ts, now)
+            finally:
+                conn.close()
 
     def test_v151_official_rate_card_and_spark_unpriced(self):
         self.assertEqual(self.mod.RATE_CARD["gpt-5.6-terra"], (62.5, 6.25, 375.0))
