@@ -1,5 +1,45 @@
 # codex-usage
 
+## v1.5.5: weekly-first usage
+
+v1.5.5 changes the product model: **weekly subscription allowance is now the primary usage unit**, while `CREDITS*` is a secondary implementation/diagnostic unit.
+
+The top of a report separates two different ideas:
+
+```text
+Subscription  Pro 5x · CURRENT WEEK 0.0% used / 100.0% left · reset 6d23h · snapshot now
+Weekly scale  1% ≈ 180.0 credits* · LOW · historical rebase
+Local this week≈ ≥0.48% · CREDITS* 86.2+
+```
+
+- `CURRENT WEEK` is the latest backend quota snapshot found locally.
+- `Local this week≈` estimates how much of the current weekly allowance the local transcripts explain, even when the backend display is still rounded to `0.0%`.
+- Table `WEEKLY≈` means **the selected local usage expressed as a share of one plan weekly allowance**. It is therefore still meaningful for a `24h` or longer report that crosses a quota reset; it is not claiming that all selected usage belongs to the current backend epoch.
+- `1H≈` applies the same scale to the trailing 60 minutes.
+
+Default summary order is now conceptually:
+
+```text
+SESSION  MODEL(S)  WEEKLY≈  1H≈  CREDITS*  CACHE TAX  SHARE  STATUS
+```
+
+Details follow the same priority: `WEEKLY≈` precedes credits in usage components, MAIN/SUB, model, and agent tables.
+
+### Always-available weekly estimates
+
+v1.5.5 uses a fallback ladder so authenticated users normally get a `WEEKLY≈` value whenever they query:
+
+1. clean snapshot-to-snapshot **delta calibration** under the current rate card;
+2. a current/historical current-rate baseline, including a safely **rebased** historical backend anchor;
+3. a low-confidence **plan bootstrap seed** when no usable local calibration exists yet.
+
+The bootstrap is intentionally labeled `SEED` and is replaced automatically as real local/backend observations accumulate. Current bootstrap scales are empirical starting points, not OpenAI-published quota sizes.
+
+### Interval learning and unpriced models
+
+Backend quota snapshots are stored independently from cumulative local credits. When the displayed weekly percentage moves, `codex-usage` measures only the local usage between suitable snapshot plateaus. A Spark/unknown-price interval is marked incomplete and excluded from learning, but a later clean interval in the same week can still calibrate normally. This avoids the old failure mode where one unpriced model made the entire weekly epoch unusable.
+
+
 [中文说明](README.zh-CN.md)
 
 `codex-usage` is an **unofficial, local-first Codex usage profiler**. It reads the Codex data already stored on your machine and answers a practical question:

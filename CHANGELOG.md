@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.5 — 2026-08-13
+
+- Made weekly allowance the primary user-facing usage unit: summary, TOTAL, detail metadata, component tables, MAIN/SUB, model, and agent breakdowns now put `WEEKLY≈` ahead of `CREDITS*`.
+- Added `1H≈`, expressing trailing-60-minute burn directly as a share of one weekly allowance; credits remain a secondary diagnostic.
+- Split current account state from attribution: the header now shows authoritative backend `CURRENT WEEK` used/left plus a local `Local this week≈` estimate.
+- Defined report-table `WEEKLY≈` as the selected local usage expressed in units of one plan weekly allowance, so rolling reports remain meaningful even when they cross a weekly reset.
+- Added interval calibration tables. Backend snapshots are stored even when the whole weekly window contains an unpriced model, and clean snapshot-to-snapshot intervals can teach the conversion independently.
+- A dirty interval containing Spark/unknown pricing is skipped without poisoning later clean intervals in the same week.
+- Rebase may use historical backend anchors from earlier reset epochs, while still re-pricing token history under the current rate card.
+- Added a last-resort plan bootstrap scale (`SEED`) so authenticated Plus / Pro 5x / Pro 20x users still receive a weekly-equivalent estimate immediately after reset or on a fresh cache; observed local calibration automatically supersedes it.
+- Preserved lower-bound semantics: `CREDITS* +` maps to `WEEKLY≈ ≥x%`.
+- Added current-week and trailing-1h weekly-equivalent fields to JSON output.
+
+
 ## 1.5.2 — 2026-08-13
 
 - Rebased legacy weekly calibration anchors onto the current token rate card instead of dividing current-rate `CREDITS*` by old-rate credits-per-percent.

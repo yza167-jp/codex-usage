@@ -1,5 +1,45 @@
 # codex-usage
 
+## v1.5.5：weekly-first 使用体验
+
+v1.5.5 调整了整个工具的产品语义：**订阅的 weekly allowance 成为第一使用指标**，`CREDITS*` 退到第二层，主要用于计价细节、cache tax 和调试。
+
+报告顶部现在刻意区分：
+
+```text
+Subscription  Pro 5x · CURRENT WEEK 0.0% used / 100.0% left · reset 6d23h · snapshot now
+Weekly scale  1% ≈ 180.0 credits* · LOW · historical rebase
+Local this week≈ ≥0.48% · CREDITS* 86.2+
+```
+
+- `CURRENT WEEK`：本地最新 telemetry 中的 backend 当前周真值。
+- `Local this week≈`：本机 transcript 能解释的当前周 quota 归因；即使 backend 仍因取整显示 `0.0%`，也可以给出本地估算。
+- 表格里的 `WEEKLY≈`：**所选本地 usage 相当于一个完整 weekly allowance 的多少**。因此 `24h` 等查询即使跨过 weekly reset 仍然可以自然阅读；它并不声称这些 usage 全都属于当前 backend epoch。
+- `1H≈`：最近 60 分钟消耗相当于 weekly allowance 的多少。
+
+默认摘要的核心列顺序调整为：
+
+```text
+SESSION  MODEL(S)  WEEKLY≈  1H≈  CREDITS*  CACHE TAX  SHARE  STATUS
+```
+
+DETAILS 中 Usage components、MAIN/SUB、Model、Agent breakdown 也统一把 `WEEKLY≈` 放在 credits 前面。
+
+### 任何时点尽量都能给 weekly 数字
+
+v1.5.5 使用分层 fallback：
+
+1. 当前 rate card 下、干净 snapshot interval 学到的 **delta calibration**；
+2. 当前/历史的 current-rate baseline，包括安全重新计价得到的 **historical rebase**；
+3. 如果仍无本地可用 calibration，则使用低置信度的 **plan bootstrap seed**。
+
+bootstrap 会明确显示 `SEED`，它只是经验启动值，不代表 OpenAI 官方公开了固定的 weekly credits；随着真实 local/backend observations 增加，会自动被更可信的 calibration 取代。
+
+### interval calibration 与 Spark
+
+backend snapshot 与本地累计 credits 现在分开保存。weekly 百分比变化时，工具只统计合适的前后 snapshot plateau 之间的本地 usage。如果某个 interval 含 Spark/未知价格模型，这一段只会被标记为 incomplete 并跳过学习；同一周后续干净 interval 仍然能够正常校准，因此不会再出现“本周出现一次 Spark，整周 calibration 都报废”的情况。
+
+
 [English README](README.md)
 
 `codex-usage` 是一个**非官方、本地优先的 Codex 用量分析工具**。它读取本机已经存在的 Codex 数据，主要回答一个实际问题：
