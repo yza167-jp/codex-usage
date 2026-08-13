@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.2 — 2026-08-13
+
+- Rebased legacy weekly calibration anchors onto the current token rate card instead of dividing current-rate `CREDITS*` by old-rate credits-per-percent.
+- Reuses only the backend portion of a prior observation (`used_percent`, snapshot time, reset/window metadata); historical local token usage is replayed and repriced under the current rate card.
+- Tries prior anchors newest-first within the same weekly reset epoch and skips any anchor whose replay contains unpriced usage such as GPT-5.3-Codex-Spark.
+- Persists a successful rebase as a current-revision quota observation with source `rebased`, yielding `LOW · rebased baseline` until current-rate delta observations mature.
+- Removed the raw `prior-rate fallback`: if no complete anchor can be rebased, calibration stays `LEARNING` rather than mixing incompatible credit coordinate systems.
+- Added `calibration_source` to JSON and CSV subscription metadata.
+- Added regression tests for rate-card rebasing, rejection of raw legacy totals, and Spark-blocked anchors.
+
+
 ## 1.5.1 — 2026-08-12
 
 - Kept previously learned weekly calibration available when the current weekly window contains an unpriced model; incomplete current windows no longer force `WEEKLY≈` back to `—`.

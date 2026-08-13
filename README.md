@@ -8,6 +8,14 @@
 
 The core tool is a single Python script with **no mandatory third-party dependencies**. It supports macOS, Windows 10/11, and Linux.
 
+## v1.5.2: rate-card calibration rebase
+
+v1.5.2 fixes a subtler calibration issue: after the embedded token rate card changes, a historical `credits / weekly %` baseline is no longer numerically comparable with newly computed `CREDITS*`.
+
+The tool now treats a prior quota observation as a **backend anchor**, not as a reusable credit total. For an anchor in the current weekly reset epoch it reconstructs local usage from the weekly-window start through that anchor timestamp and prices those tokens again with the current rate card. A successful replay becomes `LOW · rebased baseline`.
+
+If a newer anchor includes an unpriced model such as GPT-5.3-Codex-Spark, it is skipped and the tool tries an earlier anchor. If no complete anchor can be replayed, calibration remains `LEARNING`; v1.5.2 deliberately does not fall back to old-rate local-credit totals. This keeps `WEEKLY≈` in the same credit coordinate system as the displayed `CREDITS*`.
+
 ## v1.5.1: partial-model resilience
 
 v1.5.1 fixes the main edge case discovered after the first real v1.5 deployment: an unpriced model such as `GPT-5.3-Codex-Spark` no longer makes the entire weekly calibration disappear.

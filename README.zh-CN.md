@@ -8,6 +8,14 @@
 
 核心工具仍然只有一个 Python 脚本，**正常使用零强制第三方依赖**，支持 macOS、Windows 10/11 和 Linux。
 
+## v1.5.2：rate-card calibration rebase
+
+v1.5.2 修复了一个更隐蔽的校准问题：当内置 token rate card 发生变化后，历史的 `credits / weekly %` baseline 与当前重新计算的 `CREDITS*` 已经不在同一个数值坐标系中。
+
+现在工具只把旧 quota observation 当作**服务端锚点**，不直接复用旧的 local credits。对于当前 weekly reset epoch 内的历史锚点，它会从 weekly window 起点重放到该锚点时刻的本地 token usage，并使用当前 rate card 重新计价；成功后显示为 `LOW · rebased baseline`。
+
+如果较新的锚点已经包含 GPT-5.3-Codex-Spark 这类未定价模型，会跳过它并继续尝试更早的锚点。如果没有任何锚点可以完整重算，calibration 会保持 `LEARNING`，而不会再退回旧费率的 credits/%。这样 `WEEKLY≈` 与屏幕上的 `CREDITS*` 始终处于同一 rate-card 坐标系。
+
 ## v1.5.1：未定价模型下的连续估算
 
 v1.5.1 修复了真实使用中发现的主要边界情况：当本周出现 `GPT-5.3-Codex-Spark` 这类官方尚未给出最终 credits rate 的模型时，不再让整个 `WEEKLY≈` calibration 退回为 `—`。
