@@ -67,7 +67,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 RATE_CARD_AS_OF = "2026-08-12"
 RATE_CARD_CALIBRATION_KEY = "2026-08-12-r2"
 CACHE_SCHEMA_VERSION = 2
@@ -1499,6 +1499,107 @@ def _record_quota_observation(
     conn.commit()
 
 
+def _legacy_rebase_candidates(
+    conn: sqlite3.Connection,
+    auth: LocalAuthContext,
+    snapshot: QuotaSnapshot,
+    fast: bool,
+    limit: int = 8,
+) -> List[QuotaSnapshot]:
+    """Return prior-rate anchors from the current weekly reset epoch.
+
+    These anchors carry authoritative backend used-percent/timestamps, but their
+    stored local_credits were computed under an older rate card. v1.5.2 never
+    reuses those old credit totals directly; callers may replay local token
+    history through the *current* rate card and persist a rebased observation.
+    """
+    if snapshot.resets_at is None:
+        return []
+    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
+    mode = "fast" if fast else "standard"
+    rows = list(conn.execute(
+        """
+        SELECT snapshot_ts,used_percent,reset_at,window_minutes
+        FROM quota_observations
+        WHERE account_key=? AND plan_type=? AND credit_mode=?
+          AND rate_card<>? AND reset_at=?
+        ORDER BY snapshot_ts DESC
+        LIMIT ?
+        """,
+        (
+            auth.account_key,
+            plan,
+            mode,
+            RATE_CARD_CALIBRATION_KEY,
+            int(snapshot.resets_at),
+            max(1, int(limit)),
+        ),
+    ))
+    out: List[QuotaSnapshot] = []
+    for row in rows:
+        ts = parse_ts(row["snapshot_ts"])
+        if ts is None or ts > snapshot.ts + timedelta(seconds=5):
+            continue
+        try:
+            used = float(row["used_percent"])
+            reset_at = int(row["reset_at"])
+            window_minutes = int(row["window_minutes"])
+        except (TypeError, ValueError):
+            continue
+        if not (1.0 <= used <= 100.0) or window_minutes <= 0:
+            continue
+        out.append(QuotaSnapshot(
+            ts=ts,
+            used_percent=used,
+            window_minutes=window_minutes,
+            resets_at=reset_at,
+            plan_type=plan,
+            limit_id=snapshot.limit_id,
+            source="rebased",
+        ))
+    return out
+
+
+def _try_rebase_legacy_observation(
+    conn: sqlite3.Connection,
+    auth: LocalAuthContext,
+    snapshot: QuotaSnapshot,
+    sessions: Dict[str, RawSession],
+    index: Dict[str, dict],
+    tz,
+    fast: bool,
+) -> Optional[QuotaSnapshot]:
+    """Re-price a prior backend anchor under the current rate card.
+
+    Candidates are tried newest-first. If an anchor interval contains any
+    unpriced usage (for example GPT-5.3-Codex-Spark), it is skipped rather than
+    turning a lower bound into a fake complete baseline. The first fully priced
+    replay is stored as a normal current-revision observation with source
+    ``rebased`` so future current-rate deltas share one consistent coordinate
+    system.
+    """
+    for anchor in _legacy_rebase_candidates(conn, auth, snapshot, fast):
+        start = quota_window_start(anchor, tz)
+        end = _to_tz(anchor.ts, tz) + timedelta(microseconds=1)
+        if start is None or end <= start:
+            continue
+        buckets = make_buckets(
+            sessions=sessions,
+            index=index,
+            start=start,
+            end=end,
+            tz=tz,
+            show_subagents=False,
+            trend_start=None,
+        )
+        credits, complete = bucket_collection_credits(buckets, sessions, fast)
+        if credits is None or not complete:
+            continue
+        _record_quota_observation(conn, auth, anchor, credits, fast)
+        return anchor
+    return None
+
+
 def _weighted_median(values: List[Tuple[float, float]]) -> Optional[float]:
     if not values:
         return None
@@ -1526,7 +1627,7 @@ def load_quota_calibration(
     mode = "fast" if fast else "standard"
     rows = list(conn.execute(
         """
-        SELECT reset_at,snapshot_ts,used_percent,local_credits
+        SELECT reset_at,snapshot_ts,used_percent,local_credits,source
         FROM quota_observations
         WHERE account_key=? AND plan_type=? AND rate_card=? AND credit_mode=?
         ORDER BY reset_at,snapshot_ts
@@ -1586,24 +1687,17 @@ def load_quota_calibration(
         stored_credits = float(latest["local_credits"])
         if used >= 1.0 and stored_credits > 0:
             cpp = stored_credits / used
-            source = "stored_baseline"
+            source = (
+                "rebased_baseline"
+                if str(latest["source"] or "") == "rebased"
+                else "stored_baseline"
+            )
 
-    if cpp is None:
-        legacy = conn.execute(
-            """
-            SELECT rate_card,used_percent,local_credits
-            FROM quota_observations
-            WHERE account_key=? AND plan_type=? AND credit_mode=? AND rate_card<>?
-            ORDER BY snapshot_ts DESC LIMIT 1
-            """,
-            (auth.account_key, plan, mode, RATE_CARD_CALIBRATION_KEY),
-        ).fetchone()
-        if legacy is not None:
-            used = float(legacy["used_percent"])
-            stored_credits = float(legacy["local_credits"])
-            if used >= 1.0 and stored_credits > 0:
-                cpp = stored_credits / used
-                source = "legacy_baseline"
+    # v1.5.2 deliberately does NOT fall back to old-rate local_credits. Those
+    # values live in a different coordinate system after a rate-card change.
+    # main() may replay a legacy backend anchor through the current rate card;
+    # if no fully priced anchor can be rebased, remain LEARNING rather than
+    # publishing a numerically incompatible WEEKLY≈ conversion.
 
     calibration.credits_per_percent = cpp
     calibration.clean_intervals = len(clean) if source == "delta" else 0
@@ -2375,8 +2469,8 @@ def render_table(
             )
             if cal.source == "delta":
                 cal_meta = f" · {cal.clean_intervals} clean / {cal.observed_percent_points:.1f}pp"
-            elif cal.source == "legacy_baseline":
-                cal_meta = " · prior-rate fallback"
+            elif cal.source == "rebased_baseline":
+                cal_meta = " · rebased baseline"
             elif cal.source == "stored_baseline":
                 cal_meta = " · stored baseline"
             else:
@@ -2765,6 +2859,7 @@ def render_json(
             "credits_per_weekly_percent": quota_calibration.credits_per_percent if quota_calibration else None,
             "effective_weekly_credit_capacity": quota_calibration.effective_weekly_credits if quota_calibration else None,
             "calibration_confidence": quota_calibration.confidence if quota_calibration else None,
+            "calibration_source": quota_calibration.source if quota_calibration else None,
             "calibration_clean_intervals": quota_calibration.clean_intervals if quota_calibration else 0,
             "calibration_observed_percent_points": quota_calibration.observed_percent_points if quota_calibration else 0.0,
             "local_coverage_percent": quota_calibration.local_coverage_percent if quota_calibration else None,
@@ -2877,7 +2972,7 @@ def render_csv(
         "session_id", "title", "cwd", "models", "input_tokens",
         "cached_input_tokens", "uncached_input_tokens", "output_tokens",
         "reasoning_output_tokens", "credit_estimate", "weekly_estimate_percent", "weekly_estimate_is_lower_bound", "cache_tax_credits",
-        "subscription_plan", "weekly_used_percent", "calibration_credits_per_percent", "calibration_confidence",
+        "subscription_plan", "weekly_used_percent", "calibration_credits_per_percent", "calibration_confidence", "calibration_source",
         "main_credit_estimate", "subagent_credit_estimate", "thread_state",
         "thread_health", "last_activity", "trailing_1h_credit_burn",
         "trailing_1h_cache_tax", "rolled_up_subagents",
@@ -2910,6 +3005,7 @@ def render_csv(
             "" if quota_snapshot is None else f"{quota_snapshot.used_percent:.6f}",
             "" if not quota_calibration or not quota_calibration.credits_per_percent else f"{quota_calibration.credits_per_percent:.6f}",
             "" if quota_calibration is None else quota_calibration.confidence,
+            "" if quota_calibration is None else quota_calibration.source,
             "" if main_c is None else f"{main_c:.6f}",
             "" if sub_c is None else f"{sub_c:.6f}",
             state,
@@ -3112,6 +3208,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                 quota_calibration = load_quota_calibration(
                     quota_conn, auth_context, quota_snapshot, current_complete_credits, args.fast
                 )
+                if not quota_calibration.credits_per_percent:
+                    rebased = _try_rebase_legacy_observation(
+                        quota_conn,
+                        auth_context,
+                        quota_snapshot,
+                        sessions,
+                        index,
+                        tz,
+                        args.fast,
+                    )
+                    if rebased is not None:
+                        quota_calibration = load_quota_calibration(
+                            quota_conn,
+                            auth_context,
+                            quota_snapshot,
+                            current_complete_credits,
+                            args.fast,
+                        )
             finally:
                 quota_conn.close()
 

@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.5.1", proc.stdout)
+        self.assertIn("1.5.2", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -126,7 +126,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
         self.assertTrue(partial.startswith("≥"))
         self.assertEqual(partial[1:], exact)
 
-    def test_legacy_calibration_survives_unpriced_current_window(self):
+    def test_legacy_rate_totals_are_not_used_directly(self):
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as td:
             conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
@@ -145,10 +145,113 @@ class CodexUsageSmokeTests(unittest.TestCase):
                 conn.commit()
                 snap = self.mod.QuotaSnapshot(now, 97.0, 10080, reset, plan_type="prolite")
                 cal = self.mod.load_quota_calibration(conn, auth, snap, None, False)
-                self.assertAlmostEqual(cal.credits_per_percent, 172.3, delta=0.2)
-                self.assertEqual(cal.source, "legacy_baseline")
+                self.assertIsNone(cal.credits_per_percent)
+                self.assertEqual(cal.confidence, "LEARNING")
+            finally:
+                conn.close()
+
+    def test_legacy_anchor_rebases_under_current_rate_card(self):
+        now = datetime.now(timezone.utc)
+        reset = int((now + self.mod.timedelta(days=5)).timestamp())
+        window_start = datetime.fromtimestamp(reset, tz=timezone.utc) - self.mod.timedelta(minutes=10080)
+        anchor_ts = now - self.mod.timedelta(hours=1)
+        sid = "019ffabc-1234-7000-8000-123456789abc"
+        session = self.mod.RawSession(
+            session_id=sid,
+            path=Path("synthetic.jsonl"),
+            created_at=window_start,
+            model_provider="openai",
+            usage_events=[
+                self.mod.UsageEvent(
+                    ts=anchor_ts - self.mod.timedelta(minutes=1),
+                    model="gpt-5.6-luna",
+                    cumulative=self.mod.Usage(
+                        input_tokens=1_000_000,
+                        cached_input_tokens=800_000,
+                        output_tokens=100_000,
+                        reasoning_output_tokens=0,
+                        total_tokens=1_100_000,
+                    ),
+                )
+            ],
+        )
+        sessions = {sid: session}
+        with tempfile.TemporaryDirectory() as td:
+            conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
+            auth = self.mod.LocalAuthContext(plan_type="prolite", account_key="acct")
+            try:
+                # Old Luna card would have valued this at 4.4 credits; current
+                # v1.5.1+ card values the same token history at 22 credits.
+                conn.execute(
+                    """
+                    INSERT INTO quota_observations(
+                        account_key,plan_type,reset_at,window_minutes,snapshot_ts,
+                        used_percent,local_credits,rate_card,credit_mode,source
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    ("acct", "prolite", reset, 10080, anchor_ts.isoformat(), 10.0, 4.4, "2026-08-12", "standard", "rollout"),
+                )
+                conn.commit()
+                snap = self.mod.QuotaSnapshot(now, 20.0, 10080, reset, plan_type="prolite")
+                rebased = self.mod._try_rebase_legacy_observation(
+                    conn, auth, snap, sessions, {}, timezone.utc, False
+                )
+                self.assertIsNotNone(rebased)
+                cal = self.mod.load_quota_calibration(conn, auth, snap, None, False)
+                self.assertAlmostEqual(cal.credits_per_percent, 2.2, delta=0.01)
+                self.assertEqual(cal.source, "rebased_baseline")
                 self.assertEqual(cal.confidence, "LOW")
-                self.assertIsNone(cal.local_coverage_percent)
+                stored = conn.execute(
+                    "SELECT local_credits,source,rate_card FROM quota_observations WHERE rate_card=?",
+                    (self.mod.RATE_CARD_CALIBRATION_KEY,),
+                ).fetchone()
+                self.assertIsNotNone(stored)
+                self.assertAlmostEqual(float(stored["local_credits"]), 22.0, delta=0.01)
+                self.assertEqual(stored["source"], "rebased")
+            finally:
+                conn.close()
+
+    def test_rebase_skips_anchor_with_unpriced_history(self):
+        now = datetime.now(timezone.utc)
+        reset = int((now + self.mod.timedelta(days=5)).timestamp())
+        window_start = datetime.fromtimestamp(reset, tz=timezone.utc) - self.mod.timedelta(minutes=10080)
+        anchor_ts = now - self.mod.timedelta(hours=1)
+        sid = "019ffabc-1234-7000-8000-123456789abd"
+        session = self.mod.RawSession(
+            session_id=sid,
+            path=Path("synthetic-spark.jsonl"),
+            created_at=window_start,
+            model_provider="openai",
+            usage_events=[
+                self.mod.UsageEvent(
+                    ts=anchor_ts - self.mod.timedelta(minutes=1),
+                    model="gpt-5.3-codex-spark",
+                    cumulative=self.mod.Usage(input_tokens=1000, total_tokens=1000),
+                )
+            ],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
+            auth = self.mod.LocalAuthContext(plan_type="prolite", account_key="acct")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO quota_observations(
+                        account_key,plan_type,reset_at,window_minutes,snapshot_ts,
+                        used_percent,local_credits,rate_card,credit_mode,source
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    ("acct", "prolite", reset, 10080, anchor_ts.isoformat(), 10.0, 100.0, "2026-08-12", "standard", "rollout"),
+                )
+                conn.commit()
+                snap = self.mod.QuotaSnapshot(now, 20.0, 10080, reset, plan_type="prolite")
+                rebased = self.mod._try_rebase_legacy_observation(
+                    conn, auth, snap, {sid: session}, {}, timezone.utc, False
+                )
+                self.assertIsNone(rebased)
+                cal = self.mod.load_quota_calibration(conn, auth, snap, None, False)
+                self.assertIsNone(cal.credits_per_percent)
+                self.assertEqual(cal.confidence, "LEARNING")
             finally:
                 conn.close()
 
