@@ -34,9 +34,9 @@ Notes:
   the cached-input rate.
 - reasoning_output_tokens is a subset/detail of output_tokens and is NOT added
   again when estimating credits.
-- Fast/priority service tier is not reliably persisted in token_count JSONL
-  events. `--fast` means "assume all eligible OpenAI-model usage in this
-  report was Fast".
+- v1.6 reads persisted service-tier settings and attributes each token delta
+  to Standard, Fast/priority, Flex, or Unknown. `--fast` now applies only to
+  unresolved historical segments; detected Standard/Fast segments are preserved.
 - Session JSONL is local telemetry, not the authoritative server-side meter.
 - v1.4 adds native Windows support: Windows cache locations, Windows-safe
   SQLite read-only URIs, automatic VT/ANSI terminal enablement, PowerShell/CMD
@@ -67,10 +67,10 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.5.5"
+VERSION = "1.6.0"
 RATE_CARD_AS_OF = "2026-08-12"
-RATE_CARD_CALIBRATION_KEY = "2026-08-12-r2"
-CACHE_SCHEMA_VERSION = 2
+RATE_CARD_CALIBRATION_KEY = "2026-08-12-r3-tier-aware"
+CACHE_SCHEMA_VERSION = 3
 TREND_MINUTES = 60
 ACTIVE_MINUTES = 15
 RECENT_MINUTES = 60
@@ -124,6 +124,18 @@ FAST_MULTIPLIERS: Dict[str, float] = {
     "gpt-5.5": 2.5,
     "gpt-5.4": 2.0,
 }
+
+USAGE_KEY_SEP = "\x1f"
+SERVICE_TIER_STANDARD = "standard"
+SERVICE_TIER_FAST = "fast"
+SERVICE_TIER_FLEX = "flex"
+SERVICE_TIER_UNKNOWN = "unknown"
+SERVICE_TIER_ORDER = (
+    SERVICE_TIER_FAST,
+    SERVICE_TIER_STANDARD,
+    SERVICE_TIER_FLEX,
+    SERVICE_TIER_UNKNOWN,
+)
 
 UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -203,6 +215,10 @@ class UsageEvent:
     ts: datetime
     cumulative: Usage
     model: str
+    # Programmatic/synthetic events default to Standard for backward
+    # compatibility. The rollout parser starts at Unknown until it observes an
+    # explicit persisted tier setting.
+    service_tier: str = SERVICE_TIER_STANDARD
 
 
 @dataclass
@@ -311,12 +327,13 @@ class Bucket:
         is_subagent: bool = False,
         activity_ts: Optional[datetime] = None,
         recent: bool = False,
+        service_tier: str = SERVICE_TIER_STANDARD,
     ) -> None:
-        model = model or "unknown"
-        self.usage_by_model[model] = self.usage_by_model.get(model, Usage()) + usage
+        key = usage_key(model, service_tier)
+        self.usage_by_model[key] = self.usage_by_model.get(key, Usage()) + usage
 
         by_model = self.usage_by_source.setdefault(source_session_id, {})
-        by_model[model] = by_model.get(model, Usage()) + usage
+        by_model[key] = by_model.get(key, Usage()) + usage
         if source_title:
             self.source_titles[source_session_id] = source_title
         if is_subagent:
@@ -328,8 +345,8 @@ class Bucket:
             if self.last_activity is None or activity_ts > self.last_activity:
                 self.last_activity = activity_ts
         if recent:
-            self.recent_usage_by_model[model] = (
-                self.recent_usage_by_model.get(model, Usage()) + usage
+            self.recent_usage_by_model[key] = (
+                self.recent_usage_by_model.get(key, Usage()) + usage
             )
 
         self.event_count += 1
@@ -515,6 +532,66 @@ def normalize_model(model: object) -> str:
     return s
 
 
+def normalize_service_tier(value: object) -> str:
+    """Normalize persisted Codex service-tier spellings.
+
+    Codex/API history may use ``priority`` for Fast. A present null/default
+    value is Standard; absence of the field is handled by the caller and leaves
+    the current tier unchanged/Unknown.
+    """
+    if value is None:
+        return SERVICE_TIER_STANDARD
+    tier = str(value).strip().lower().replace("-", "_")
+    if tier in ("", "default", "standard", "auto", "none", "null"):
+        return SERVICE_TIER_STANDARD
+    if tier in ("fast", "priority"):
+        return SERVICE_TIER_FAST
+    if tier == "flex":
+        return SERVICE_TIER_FLEX
+    return SERVICE_TIER_UNKNOWN
+
+
+def usage_key(model: object, service_tier: object) -> str:
+    return f"{normalize_model(model)}{USAGE_KEY_SEP}{normalize_service_tier(service_tier)}"
+
+
+def split_usage_key(key: object) -> Tuple[str, str]:
+    raw = str(key or "unknown")
+    if USAGE_KEY_SEP not in raw:
+        # Pre-v1.6 programmatic maps are interpreted as Standard. Rollout data
+        # always enters through usage_key() and can therefore preserve Unknown.
+        return normalize_model(raw), SERVICE_TIER_STANDARD
+    model, tier = raw.rsplit(USAGE_KEY_SEP, 1)
+    return normalize_model(model), normalize_service_tier(tier)
+
+
+def _mapping_service_tier(mapping: object) -> Optional[str]:
+    if not isinstance(mapping, dict):
+        return None
+    for key in ("service_tier", "serviceTier"):
+        if key in mapping:
+            return normalize_service_tier(mapping.get(key))
+    for key in ("thread_settings", "threadSettings", "settings", "snapshot", "turn_context"):
+        nested = mapping.get(key)
+        tier = _mapping_service_tier(nested)
+        if tier is not None:
+            return tier
+    return None
+
+
+def _mapping_model(mapping: object) -> Optional[str]:
+    if not isinstance(mapping, dict):
+        return None
+    if mapping.get("model"):
+        return normalize_model(mapping.get("model"))
+    for key in ("thread_settings", "threadSettings", "settings", "snapshot", "turn_context"):
+        nested = mapping.get(key)
+        model = _mapping_model(nested)
+        if model:
+            return model
+    return None
+
+
 def _full_discover_rollouts(codex_home: Path, include_archived: bool) -> List[Path]:
     roots = [codex_home / "sessions"]
     if include_archived:
@@ -675,19 +752,28 @@ def discover_rollouts(
 
 
 def _line_is_relevant(raw: bytes) -> bool:
-    # Record type is near the beginning of Codex JSONL lines. Restricting the
-    # substring search to the first 4 KiB avoids scanning giant compacted/image
-    # payloads for keywords that may happen to occur in user content.
+    # Record type/settings live near the beginning of Codex JSONL lines.
     head = raw[:4096]
-    if b"session_meta" in head:
+    if b"session_meta" in head or b"turn_context" in head:
         return True
-    if b"turn_context" in head:
+    if b"thread_settings_applied" in head or b'"service_tier"' in head or b'"serviceTier"' in head:
         return True
     return b"event_msg" in head and b"token_count" in head
 
 
-def _apply_record(session: RawSession, rec: dict, current_model: str, own_meta_seen: bool):
-    """Apply one relevant JSONL record; return (model, own_meta_seen, event)."""
+def _apply_record(
+    session: RawSession,
+    rec: dict,
+    current_model: str,
+    current_service_tier: str,
+    own_meta_seen: bool,
+):
+    """Apply one relevant JSONL record.
+
+    Returns ``(model, service_tier, own_meta_seen, usage_event)``. Tier settings
+    are stateful because token_count records are cumulative snapshots emitted
+    after the request whose model/tier was applied.
+    """
     rtype = rec.get("type")
     payload = rec.get("payload") or {}
     ts = parse_ts(rec.get("timestamp"))
@@ -711,22 +797,48 @@ def _apply_record(session: RawSession, rec: dict, current_model: str, own_meta_s
                 or parse_ts(payload.get("timestamp"))
                 or ts
             )
-        return current_model, own_meta_seen, None
+        model = _mapping_model(payload)
+        tier = _mapping_service_tier(payload)
+        if model:
+            current_model = model
+        if tier is not None:
+            current_service_tier = tier
+        return current_model, current_service_tier, own_meta_seen, None
 
     if rtype == "turn_context" and isinstance(payload, dict):
         current_model = normalize_model(payload.get("model") or current_model)
-        return current_model, own_meta_seen, None
+        tier = _mapping_service_tier(payload)
+        if tier is not None:
+            current_service_tier = tier
+        return current_model, current_service_tier, own_meta_seen, None
 
-    if (
-        rtype == "event_msg"
-        and isinstance(payload, dict)
-        and payload.get("type") == "token_count"
-    ):
-        info = payload.get("info") or {}
-        total = info.get("total_token_usage") if isinstance(info, dict) else None
-        if isinstance(total, dict) and ts is not None:
-            event = UsageEvent(ts=ts, cumulative=Usage.from_dict(total), model=current_model)
-    return current_model, own_meta_seen, event
+    if rtype == "event_msg" and isinstance(payload, dict):
+        event_type = str(payload.get("type") or "")
+        if event_type in ("thread_settings_applied", "thread_settings", "turn_context"):
+            model = _mapping_model(payload)
+            tier = _mapping_service_tier(payload)
+            if model:
+                current_model = model
+            if tier is not None:
+                current_service_tier = tier
+        else:
+            # Some Codex versions place the applied service tier directly on a
+            # token/event payload rather than in a dedicated settings snapshot.
+            tier = _mapping_service_tier(payload)
+            if tier is not None:
+                current_service_tier = tier
+
+        if event_type == "token_count":
+            info = payload.get("info") or {}
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if isinstance(total, dict) and ts is not None:
+                event = UsageEvent(
+                    ts=ts,
+                    cumulative=Usage.from_dict(total),
+                    model=current_model,
+                    service_tier=current_service_tier,
+                )
+    return current_model, current_service_tier, own_meta_seen, event
 
 
 def parse_rollout(path: Path) -> Optional[RawSession]:
@@ -734,6 +846,7 @@ def parse_rollout(path: Path) -> Optional[RawSession]:
     session = RawSession(session_id=id_from_filename(path), path=path)
     own_meta_seen = False
     current_model = "unknown"
+    current_service_tier = SERVICE_TIER_UNKNOWN
 
     try:
         fh = path.open("rb", buffering=4 * 1024 * 1024)
@@ -749,8 +862,8 @@ def parse_rollout(path: Path) -> Optional[RawSession]:
             except (json.JSONDecodeError, UnicodeDecodeError, MemoryError):
                 session.malformed_lines += 1
                 continue
-            current_model, own_meta_seen, event = _apply_record(
-                session, rec, current_model, own_meta_seen
+            current_model, current_service_tier, own_meta_seen, event = _apply_record(
+                session, rec, current_model, current_service_tier, own_meta_seen
             )
             if event is not None:
                 session.usage_events.append(event)
@@ -760,7 +873,6 @@ def parse_rollout(path: Path) -> Optional[RawSession]:
     if session.created_at is None and session.usage_events:
         session.created_at = session.usage_events[0].ts
     return session
-
 
 
 def _decode_jwt_payload_unverified(jwt: str) -> Optional[dict]:
@@ -1065,6 +1177,7 @@ def _cache_connect(cache_path: Path) -> sqlite3.Connection:
             offset INTEGER NOT NULL DEFAULT 0,
             session_id TEXT NOT NULL,
             current_model TEXT NOT NULL DEFAULT 'unknown',
+            current_service_tier TEXT NOT NULL DEFAULT 'unknown',
             own_meta_seen INTEGER NOT NULL DEFAULT 0,
             created_at TEXT,
             cwd TEXT NOT NULL DEFAULT '',
@@ -1081,6 +1194,7 @@ def _cache_connect(cache_path: Path) -> sqlite3.Connection:
             byte_offset INTEGER NOT NULL,
             ts TEXT NOT NULL,
             model TEXT NOT NULL,
+            service_tier TEXT NOT NULL DEFAULT 'unknown',
             input_tokens INTEGER NOT NULL,
             cached_input_tokens INTEGER NOT NULL,
             output_tokens INTEGER NOT NULL,
@@ -1137,6 +1251,17 @@ def _cache_connect(cache_path: Path) -> sqlite3.Connection:
             ON quota_intervals(account_key, plan_type, rate_card, credit_mode, reset_at, end_ts);
         """
     )
+
+    # CREATE TABLE IF NOT EXISTS does not add columns to an existing v2
+    # cache. Add them before checking the schema version, then clear token/file
+    # rows so they are replayed with tier-aware state.
+    for table, column, declaration in (
+        ("files", "current_service_tier", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("events", "service_tier", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ):
+        columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if row is not None and int(row[0]) != CACHE_SCHEMA_VERSION:
@@ -1197,6 +1322,7 @@ def _scan_file_into_cache(
     reset = force_reset
     start_offset = 0
     current_model = "unknown"
+    current_service_tier = SERVICE_TIER_UNKNOWN
     own_meta_seen = False
 
     if row is not None and not force_reset:
@@ -1216,15 +1342,13 @@ def _scan_file_into_cache(
             stats.cache_hits += 1
             return
 
-        # Codex rollout files are append-only. A same-inode size increase is the
-        # normal incremental case. Same-size content modification or truncation
-        # is treated conservatively as a rewrite.
         append_only = same_identity and int(st.st_size) >= old_size
         if int(st.st_size) == old_size and int(st.st_mtime_ns) != int(row["mtime_ns"]):
             append_only = False
         if append_only:
             start_offset = min(old_offset, int(st.st_size))
             current_model = str(row["current_model"] or "unknown")
+            current_service_tier = str(row["current_service_tier"] or SERVICE_TIER_UNKNOWN)
             own_meta_seen = bool(row["own_meta_seen"])
             session = _session_from_cache_row(row, path)
             stats.incremental_scans += 1
@@ -1240,6 +1364,7 @@ def _scan_file_into_cache(
         session = RawSession(session_id=id_from_filename(path), path=path)
         start_offset = 0
         current_model = "unknown"
+        current_service_tier = SERVICE_TIER_UNKNOWN
         own_meta_seen = False
         if row is not None:
             stats.cold_scans += 1
@@ -1258,9 +1383,8 @@ def _scan_file_into_cache(
             if not raw:
                 break
             stats.bytes_read += len(raw)
-            # Active rollout may be observed in the middle of an append. Leave
-            # the incomplete final line for the next run instead of caching it.
-            if not raw.endswith(b"\n"):
+            if not raw.endswith(b"
+"):
                 break
             last_complete_offset = fh.tell()
             if not raw.startswith(b"{") or not _line_is_relevant(raw):
@@ -1271,21 +1395,21 @@ def _scan_file_into_cache(
                 session.malformed_lines += 1
                 continue
             stats.parsed_records += 1
-            current_model, own_meta_seen, event = _apply_record(
-                session, rec, current_model, own_meta_seen
+            current_model, current_service_tier, own_meta_seen, event = _apply_record(
+                session, rec, current_model, current_service_tier, own_meta_seen
             )
             if event is not None:
                 u = event.cumulative
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO events(
-                        path,byte_offset,ts,model,input_tokens,cached_input_tokens,
+                        path,byte_offset,ts,model,service_tier,input_tokens,cached_input_tokens,
                         output_tokens,reasoning_output_tokens,total_tokens
-                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         p, line_start, event.ts.astimezone(timezone.utc).isoformat(), event.model,
-                        u.input_tokens, u.cached_input_tokens, u.output_tokens,
+                        event.service_tier, u.input_tokens, u.cached_input_tokens, u.output_tokens,
                         u.reasoning_output_tokens, u.total_tokens,
                     ),
                 )
@@ -1306,13 +1430,13 @@ def _scan_file_into_cache(
         """
         INSERT OR REPLACE INTO files(
             path,dev,ino,observed_size,mtime_ns,offset,session_id,current_model,
-            own_meta_seen,created_at,cwd,source_json,thread_source_json,originator,
+            current_service_tier,own_meta_seen,created_at,cwd,source_json,thread_source_json,originator,
             parent_id,forked_from_id,model_provider,malformed_lines
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             p, _sqlite_i64(st2.st_dev), _sqlite_i64(st2.st_ino), int(st2.st_size), int(st2.st_mtime_ns),
-            int(last_complete_offset), session.session_id, current_model,
+            int(last_complete_offset), session.session_id, current_model, current_service_tier,
             1 if own_meta_seen else 0,
             session.created_at.astimezone(timezone.utc).isoformat() if session.created_at else None,
             session.cwd, _json_text(session.source), _json_text(session.thread_source),
@@ -1342,7 +1466,7 @@ def _load_sessions_from_cache(conn: sqlite3.Connection, live_paths: set) -> Dict
         session = _session_from_cache_row(row, Path(p))
         for erow in conn.execute(
             """
-            SELECT ts,model,input_tokens,cached_input_tokens,output_tokens,
+            SELECT ts,model,service_tier,input_tokens,cached_input_tokens,output_tokens,
                    reasoning_output_tokens,total_tokens
             FROM events WHERE path=? ORDER BY byte_offset
             """,
@@ -1355,6 +1479,7 @@ def _load_sessions_from_cache(conn: sqlite3.Connection, live_paths: set) -> Dict
                 UsageEvent(
                     ts=ts,
                     model=str(erow["model"]),
+                    service_tier=str(erow["service_tier"] or SERVICE_TIER_UNKNOWN),
                     cumulative=Usage(
                         input_tokens=int(erow["input_tokens"]),
                         cached_input_tokens=int(erow["cached_input_tokens"]),
@@ -1513,7 +1638,7 @@ def _record_quota_observation(
     if snapshot.resets_at is None or not (0.0 <= snapshot.used_percent <= 100.0):
         return
     plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
-    mode = "fast" if fast else "standard"
+    mode = _quota_mode(fast)
     conn.execute(
         """
         INSERT OR REPLACE INTO quota_observations(
@@ -1554,12 +1679,13 @@ def _legacy_rebase_candidates(
     if snapshot.resets_at is None:
         return []
     plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
-    mode = "fast" if fast else "standard"
+    mode = _quota_mode(fast)
+    legacy_mode = "fast" if fast else "standard"
     rows = list(conn.execute(
         """
         SELECT snapshot_ts,used_percent,reset_at,window_minutes
         FROM quota_observations
-        WHERE account_key=? AND plan_type=? AND credit_mode=?
+        WHERE account_key=? AND plan_type=? AND credit_mode IN (?,?)
           AND rate_card<>? AND snapshot_ts<=?
         ORDER BY snapshot_ts DESC
         LIMIT ?
@@ -1568,6 +1694,7 @@ def _legacy_rebase_candidates(
             auth.account_key,
             plan,
             mode,
+            legacy_mode,
             RATE_CARD_CALIBRATION_KEY,
             snapshot.ts.astimezone(timezone.utc).isoformat(),
             max(1, int(limit)),
@@ -1639,7 +1766,7 @@ def _try_rebase_legacy_observation(
 
 
 def _quota_mode(fast: bool) -> str:
-    return "fast" if fast else "standard"
+    return "tier_auto_assume_fast" if fast else "tier_auto"
 
 
 def _quota_plan(auth: LocalAuthContext, snapshot: QuotaSnapshot) -> str:
@@ -1803,7 +1930,7 @@ def load_quota_calibration(
     fast: bool,
 ) -> QuotaCalibration:
     plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
-    mode = "fast" if fast else "standard"
+    mode = _quota_mode(fast)
     rows = list(conn.execute(
         """
         SELECT reset_at,snapshot_ts,used_percent,local_credits,source
@@ -2166,7 +2293,7 @@ def baseline_from_parent(
 def compute_deltas(
     session: RawSession,
     sessions: Dict[str, RawSession],
-) -> List[Tuple[datetime, str, Usage]]:
+) -> List[Tuple[datetime, str, str, Usage]]:
     inherited = inherited_usage_keys(session, sessions)
     parent_baseline = baseline_from_parent(session, sessions)
     has_parent = bool(session.lineage_parent())
@@ -2175,7 +2302,7 @@ def compute_deltas(
     if parent_baseline is not None:
         prev = parent_baseline
 
-    deltas: List[Tuple[datetime, str, Usage]] = []
+    deltas: List[Tuple[datetime, str, str, Usage]] = []
     first_usage_seen = False
 
     for ev in session.usage_events:
@@ -2186,9 +2313,6 @@ def compute_deltas(
             first_usage_seen = True
             continue
 
-        # If parent metadata exists but its rollout isn't available, the first
-        # cumulative counter may include inherited usage. Baseline it rather
-        # than reporting a potentially huge false child charge.
         if has_parent and parent_baseline is None and not inherited and not first_usage_seen:
             prev = cur
             first_usage_seen = True
@@ -2198,7 +2322,7 @@ def compute_deltas(
         prev = cur
         first_usage_seen = True
         if delta.nonzero():
-            deltas.append((ev.ts, ev.model, delta))
+            deltas.append((ev.ts, ev.model, ev.service_tier, delta))
 
     return deltas
 
@@ -2219,29 +2343,53 @@ def rollup_target(session: RawSession, sessions: Dict[str, RawSession], show_sub
 
 
 def model_is_chatgpt_openai(session: RawSession, model: str) -> bool:
+    base_model, _ = split_usage_key(model)
     provider = (session.model_provider or "").strip().lower()
-    # Empty/openai are normal ChatGPT-authenticated Codex cases. Bedrock and
-    # custom providers should not be assigned ChatGPT credits.
     if provider and provider not in ("openai", "chatgpt"):
         return False
-    return model in RATE_CARD
+    return base_model in RATE_CARD
 
 
-def credit_for_usage(model: str, usage: Usage, fast: bool) -> Optional[float]:
+def _tier_multiplier(model: str, tier: str, assume_fast_unknown: bool) -> Tuple[float, bool]:
+    """Return (multiplier, estimate_complete_for_tier)."""
+    if tier == SERVICE_TIER_STANDARD:
+        return 1.0, True
+    if tier == SERVICE_TIER_FAST:
+        multiplier = FAST_MULTIPLIERS.get(model)
+        return (multiplier, True) if multiplier is not None else (1.0, False)
+    if tier == SERVICE_TIER_UNKNOWN:
+        if assume_fast_unknown:
+            return FAST_MULTIPLIERS.get(model, 1.0), True
+        # Standard is a conservative lower bound when this model supports Fast.
+        return 1.0, model not in FAST_MULTIPLIERS
+    # Flex is kept distinct in reports. Until a Codex subscription credit rule
+    # is embedded for it, Standard pricing is only a lower-bound diagnostic.
+    return 1.0, False
+
+
+def _credit_for_usage_with_completeness(
+    model_key: str,
+    usage: Usage,
+    assume_fast_unknown: bool,
+) -> Tuple[Optional[float], bool]:
+    model, tier = split_usage_key(model_key)
     rate = RATE_CARD.get(model)
     if rate is None:
-        return None
+        return None, False
     input_rate, cached_rate, output_rate = rate
     cached = min(usage.input_tokens, usage.cached_input_tokens)
     uncached = max(0, usage.input_tokens - cached)
+    multiplier, tier_complete = _tier_multiplier(model, tier, assume_fast_unknown)
     credits = (
         uncached * input_rate
         + cached * cached_rate
         + usage.output_tokens * output_rate
     ) / 1_000_000.0
-    if fast:
-        credits *= FAST_MULTIPLIERS.get(model, 1.0)
-    return credits
+    return credits * multiplier, tier_complete
+
+
+def credit_for_usage(model: str, usage: Usage, fast: bool) -> Optional[float]:
+    return _credit_for_usage_with_completeness(model, usage, fast)[0]
 
 
 def bucket_credits(
@@ -2251,20 +2399,18 @@ def bucket_credits(
 ) -> Tuple[Optional[float], bool]:
     total = 0.0
     any_priced = False
-    all_priced = True
-    # Once usage is rolled up we no longer have provider per-model-per-child.
-    # For standard OpenAI model IDs, use the published card. Unknown/custom
-    # model IDs remain unpriced.
-    for model, usage in bucket.usage_by_model.items():
-        c = credit_for_usage(model, usage, fast)
-        if c is None:
-            all_priced = False
+    all_complete = True
+    for model_key, usage in bucket.usage_by_model.items():
+        credits, complete = _credit_for_usage_with_completeness(model_key, usage, fast)
+        if credits is None:
+            all_complete = False
         else:
             any_priced = True
-            total += c
+            total += credits
+            all_complete = all_complete and complete
     if not any_priced:
         return None, False
-    return total, all_priced
+    return total, all_complete
 
 
 def model_map_credits(
@@ -2273,17 +2419,38 @@ def model_map_credits(
 ) -> Tuple[Optional[float], bool]:
     total = 0.0
     any_priced = False
-    all_priced = True
-    for model, usage in usage_by_model.items():
-        c = credit_for_usage(model, usage, fast)
-        if c is None:
-            all_priced = False
+    all_complete = True
+    for model_key, usage in usage_by_model.items():
+        credits, complete = _credit_for_usage_with_completeness(model_key, usage, fast)
+        if credits is None:
+            all_complete = False
         else:
             any_priced = True
-            total += c
+            total += credits
+            all_complete = all_complete and complete
     if not any_priced:
         return None, False
-    return total, all_priced
+    return total, all_complete
+
+
+def _credit_components_for_usage_with_completeness(
+    model_key: str,
+    usage: Usage,
+    fast: bool,
+) -> Tuple[Optional[Tuple[float, float, float]], bool]:
+    model, tier = split_usage_key(model_key)
+    rate = RATE_CARD.get(model)
+    if rate is None:
+        return None, False
+    input_rate, cached_rate, output_rate = rate
+    cached = min(usage.input_tokens, usage.cached_input_tokens)
+    uncached = max(0, usage.input_tokens - cached)
+    multiplier, complete = _tier_multiplier(model, tier, fast)
+    return (
+        uncached * input_rate * multiplier / 1_000_000.0,
+        cached * cached_rate * multiplier / 1_000_000.0,
+        usage.output_tokens * output_rate * multiplier / 1_000_000.0,
+    ), complete
 
 
 def credit_components_for_usage(
@@ -2291,19 +2458,7 @@ def credit_components_for_usage(
     usage: Usage,
     fast: bool,
 ) -> Optional[Tuple[float, float, float]]:
-    """Return (uncached_input_credits, cached_input_credits, output_credits)."""
-    rate = RATE_CARD.get(model)
-    if rate is None:
-        return None
-    input_rate, cached_rate, output_rate = rate
-    cached = min(usage.input_tokens, usage.cached_input_tokens)
-    uncached = max(0, usage.input_tokens - cached)
-    mult = FAST_MULTIPLIERS.get(model, 1.0) if fast else 1.0
-    return (
-        uncached * input_rate * mult / 1_000_000.0,
-        cached * cached_rate * mult / 1_000_000.0,
-        usage.output_tokens * output_rate * mult / 1_000_000.0,
-    )
+    return _credit_components_for_usage_with_completeness(model, usage, fast)[0]
 
 
 def cost_components_for_map(
@@ -2313,15 +2468,18 @@ def cost_components_for_map(
     uncached = cached = output = 0.0
     complete = True
     any_priced = False
-    for model, usage in usage_by_model.items():
-        c = credit_components_for_usage(model, usage, fast)
-        if c is None:
+    for model_key, usage in usage_by_model.items():
+        components, entry_complete = _credit_components_for_usage_with_completeness(
+            model_key, usage, fast
+        )
+        if components is None:
             complete = False
             continue
         any_priced = True
-        uncached += c[0]
-        cached += c[1]
-        output += c[2]
+        uncached += components[0]
+        cached += components[1]
+        output += components[2]
+        complete = complete and entry_complete
     return uncached, cached, output, complete and any_priced
 
 
@@ -2427,6 +2585,7 @@ def human_tokens(n: int) -> str:
 
 
 def pretty_model(model: str) -> str:
+    model, _ = split_usage_key(model)
     aliases = {
         "gpt-5.6-sol": "5.6 Sol",
         "gpt-5.6": "5.6 Sol",
@@ -2446,9 +2605,56 @@ def pretty_model(model: str) -> str:
     return aliases.get(model, model)
 
 
+def model_names(models: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for key in models:
+        model, _ = split_usage_key(key)
+        if model not in seen:
+            seen.add(model)
+            out.append(model)
+    return out
+
+
 def model_label(models: Iterable[str]) -> str:
-    items = [pretty_model(m) for m in models]
+    items = [pretty_model(m) for m in model_names(models)]
     return " / ".join(items) if items else "?"
+
+
+def service_tier_display(tier: str, compact: bool = False) -> str:
+    mapping = {
+        SERVICE_TIER_STANDARD: "STD" if compact else "Standard",
+        SERVICE_TIER_FAST: "FAST" if compact else "Fast",
+        SERVICE_TIER_FLEX: "FLEX" if compact else "Flex",
+        SERVICE_TIER_UNKNOWN: "?" if compact else "Unknown",
+    }
+    return mapping.get(tier, "?" if compact else tier.title())
+
+
+def service_tiers(models: Iterable[str]) -> List[str]:
+    found = set()
+    for key in models:
+        _, tier = split_usage_key(key)
+        found.add(tier)
+    return [tier for tier in SERVICE_TIER_ORDER if tier in found]
+
+
+def tier_label(models: Iterable[str]) -> str:
+    tiers = service_tiers(models)
+    if not tiers:
+        return "?"
+    if tiers == [SERVICE_TIER_FAST, SERVICE_TIER_STANDARD]:
+        return "MIXED"
+    return "/".join(service_tier_display(t, compact=True) for t in tiers)
+
+
+def group_by_service_tier(usage_by_model: Dict[str, Usage]) -> Dict[str, Dict[str, Usage]]:
+    grouped: Dict[str, Dict[str, Usage]] = {}
+    for key, usage in usage_by_model.items():
+        _, tier = split_usage_key(key)
+        target = grouped.setdefault(tier, {})
+        target[key] = target.get(key, Usage()) + usage
+    return grouped
 
 
 def _terminal_char_width(ch: str) -> int:
@@ -2574,7 +2780,7 @@ def make_buckets(
             )
             buckets[target_id] = bucket
 
-        for ts, model, delta in deltas:
+        for ts, model, service_tier, delta in deltas:
             local_ts = _to_tz(ts, tz)
             if start <= local_ts < end:
                 bucket.add(
@@ -2585,9 +2791,9 @@ def make_buckets(
                     is_subagent=session.is_subagent(),
                     activity_ts=local_ts,
                     recent=(trend_start is not None and local_ts >= trend_start),
+                    service_tier=service_tier,
                 )
 
-    # Remove buckets that had deltas, but none in the selected period.
     return {sid: b for sid, b in buckets.items() if b.total_usage().nonzero()}
 
 
@@ -2640,7 +2846,7 @@ def render_table(
     lines: List[str] = []
     terminal_width = max(80, min(REPORT_MAX_WIDTH, shutil.get_terminal_size(fallback=(120, 24)).columns))
     tzname = _tz_display(tz, now)
-    mode = "Fast-assumed credits" if fast else "Standard credits"
+    mode = "Tier-aware credits (unknown→Fast)" if fast else "Tier-aware credits"
     lines.append(color.wrap(f"Codex usage — {period_label} — {tzname}", color.BOLD, color.CYAN))
     lines.append(color.wrap(f"Credit mode: {mode} (rate card {RATE_CARD_AS_OF})", color.DIM))
 
@@ -2709,23 +2915,23 @@ def render_table(
 
     gap = 2
     if wide:
-        headers = ["SESSION", "MODEL(S)", "WEEKLY≈", "1H≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SHARE", "STATUS"]
-        fixed = [10, 9, 10, 9, 9, 9, 10, 7, 13]
+        headers = ["SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SHARE", "STATUS"]
+        fixed = [10, 10, 9, 10, 9, 9, 9, 10, 7, 13]
         fixed_total = sum(fixed) + gap * (len(headers) - 1)
         flexible = max(28, terminal_width - fixed_total)
         model_w = max(14, min(24, flexible // 3))
         session_w = max(18, flexible - model_w)
         widths = [session_w, model_w] + fixed
-        align_right = {2, 3, 4, 5, 6, 7, 8, 9}
+        align_right = {3, 4, 5, 6, 7, 8, 9, 10}
     else:
-        headers = ["SESSION", "MODEL(S)", "WEEKLY≈", "1H≈", "CREDITS*", "CACHE TAX", "SHARE", "STATUS"]
-        fixed = [10, 9, 10, 10, 7, 13]
+        headers = ["SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*", "CACHE TAX", "SHARE", "STATUS"]
+        fixed = [10, 10, 9, 10, 10, 7, 13]
         fixed_total = sum(fixed) + gap * (len(headers) - 1)
         flexible = max(30, terminal_width - fixed_total)
         model_w = max(14, min(24, flexible // 3))
         session_w = max(20, flexible - model_w)
         widths = [session_w, model_w] + fixed
-        align_right = {2, 3, 4, 5, 6}
+        align_right = {3, 4, 5, 6, 7}
 
     def styled_cell(padded: str, style: Optional[str]) -> str:
         if not style:
@@ -2776,18 +2982,20 @@ def render_table(
 
         if wide:
             row = [
-                title, model_label(b.usage_by_model.keys()), weekly_text, burn_weekly, credit_text,
+                title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
+                weekly_text, burn_weekly, credit_text,
                 human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
                 human_tokens(u.output_tokens), f"{cache_tax:.1f}" if cache_tax > 0 else "—",
                 share_text, status,
             ]
-            status_idx, title_idx, burn_idx, cache_idx = 10, 0, 3, 8
+            status_idx, title_idx, burn_idx, cache_idx = 11, 0, 4, 9
         else:
             row = [
-                title, model_label(b.usage_by_model.keys()), weekly_text, burn_weekly, credit_text,
+                title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
+                weekly_text, burn_weekly, credit_text,
                 f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
             ]
-            status_idx, title_idx, burn_idx, cache_idx = 7, 0, 3, 5
+            status_idx, title_idx, burn_idx, cache_idx = 8, 0, 4, 6
 
         styles = {}
         if is_orphan:
@@ -2839,14 +3047,14 @@ def render_table(
     )
     if wide:
         total_row = [
-            "TOTAL", "", total_weekly_text, total_burn_weekly, total_credit_text,
+            "TOTAL", "", "", total_weekly_text, total_burn_weekly, total_credit_text,
             human_tokens(total_usage.input_tokens), human_tokens(total_usage.cached_input_tokens),
             human_tokens(total_usage.output_tokens), f"{total_cache_tax:.1f}" if total_cache_tax else "—",
             "100%" if known_credit_total > 0 else "—", "",
         ]
     else:
         total_row = [
-            "TOTAL", "", total_weekly_text, total_burn_weekly, total_credit_text,
+            "TOTAL", "", "", total_weekly_text, total_burn_weekly, total_credit_text,
             f"{total_cache_tax:.1f}" if total_cache_tax else "—",
             "100%" if known_credit_total > 0 else "—", "",
         ]
@@ -2866,12 +3074,12 @@ def render_table(
         lines.append(color.wrap("  Use --wide to restore INPUT/CACHED/OUTPUT columns.", color.DIM))
     if fast:
         lines.append(color.wrap(
-            "  --fast applies the published Fast multiplier to all eligible usage in the selected period.",
+            "  --fast resolves only UNKNOWN tier segments as Fast; detected Standard/Fast segments are unchanged.",
             color.DIM,
         ))
     if any_partial:
         lines.append(color.wrap(
-            "  '+' means the row also contains usage from an unpriced/unknown model; WEEKLY≈ with ≥ is a priced-usage lower bound.",
+            "  '+' means the row contains an unpriced model or unresolved/Flex tier; WEEKLY≈ with ≥ is a conservative lower bound.",
             color.DIM,
         ))
 
@@ -2912,6 +3120,7 @@ def render_table(
             lines.append(
                 f"{state_text} · last {human_age(b.last_activity, now)} · health {health_text}"
             )
+            lines.append(f"Service tier  {tier_label(b.usage_by_model.keys())}")
 
             usage_weekly = weekly_percent_text(total_credits, quota_calibration, total_complete)
             credit_mark = "—" if total_credits is None else f"{total_credits:.1f}" + ("" if total_complete else "+")
@@ -2933,6 +3142,33 @@ def render_table(
                     cells.append(styled_cell(padded, styles.get(i)))
                 return "  ".join(cells)
 
+            # SERVICE TIER BREAKDOWN
+            lines.append(color.wrap("Service tier breakdown", color.BOLD, color.BLUE))
+            th = ["SERVICE TIER", "WEEKLY≈", "CREDITS*", "SESSION%"]
+            tw = fit_widths_to_target([30, 12, 12, 10], detail_width, (0,))
+            tr = {1, 2, 3}
+            lines.append(fmt_detail(th, tw, tr, {i: "header" for i in range(len(th))}))
+            lines.append(color.wrap("  ".join("-" * w for w in tw), color.DIM))
+            tier_groups = group_by_service_tier(b.usage_by_model)
+            for tier in SERVICE_TIER_ORDER:
+                tier_map = tier_groups.get(tier)
+                if not tier_map:
+                    continue
+                tier_cost, tier_complete = model_map_credits(tier_map, fast)
+                pct = (
+                    f"{100.0 * tier_cost / total_credits:.1f}%"
+                    if tier_cost is not None and total_credits not in (None, 0)
+                    else "—"
+                )
+                tier_credit = "—" if tier_cost is None else f"{tier_cost:.1f}" + ("" if tier_complete else "+")
+                lines.append(fmt_detail([
+                    service_tier_display(tier),
+                    weekly_percent_text(tier_cost, quota_calibration, tier_complete),
+                    tier_credit,
+                    pct,
+                ], tw, tr, {0: "warn"} if tier in (SERVICE_TIER_FAST, SERVICE_TIER_UNKNOWN) else {}))
+
+            lines.append("")
             # COST COMPONENTS
             uncached_c, cached_c, output_c, comp_complete = cost_components_for_map(b.usage_by_model, fast)
             component_total = uncached_c + cached_c + output_c
@@ -2956,9 +3192,9 @@ def render_table(
             main_map, sub_map = main_sub_maps(b)
             lines.append("")
             lines.append(color.wrap("Main vs subagents", color.BOLD, color.BLUE))
-            rh = ["ROLE", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SESSION%"]
-            rw = fit_widths_to_target([12, 12, 12, 10, 10, 10, 11, 10], detail_width, (0,))
-            rr = {1, 2, 3, 4, 5, 6, 7}
+            rh = ["ROLE", "TIER(S)", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SESSION%"]
+            rw = fit_widths_to_target([10, 10, 12, 11, 9, 9, 9, 10, 9], detail_width, (0,))
+            rr = {2, 3, 4, 5, 6, 7, 8}
             lines.append(fmt_detail(rh, rw, rr, {i: "header" for i in range(len(rh))}))
             lines.append(color.wrap("  ".join("-" * w for w in rw), color.DIM))
             for role, mmap in (("MAIN", main_map), ("SUB", sub_map)):
@@ -2973,7 +3209,7 @@ def render_table(
                     else "—"
                 )
                 lines.append(fmt_detail([
-                    role, weekly_percent_text(rcost, quota_calibration, rcomplete),
+                    role, tier_label(mmap.keys()), weekly_percent_text(rcost, quota_calibration, rcomplete),
                     "—" if rcost is None else f"{rcost:.1f}" + ("" if rcomplete else "+"),
                     human_tokens(ru.input_tokens), human_tokens(ru.cached_input_tokens),
                     human_tokens(ru.output_tokens), f"{rcache:.1f}" if rcache else "—", pct,
@@ -2982,23 +3218,25 @@ def render_table(
             # MODEL BREAKDOWN
             lines.append("")
             lines.append(color.wrap("Model breakdown", color.BOLD, color.BLUE))
-            mh = ["MODEL", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "REASON", "CACHE TAX", "SESSION%"]
-            mw = fit_widths_to_target([20, 12, 11, 9, 9, 9, 9, 10, 9], detail_width, (0,))
-            mr = {1, 2, 3, 4, 5, 6, 7, 8}
+            mh = ["MODEL", "TIER", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "REASON", "CACHE TAX", "SESSION%"]
+            mw = fit_widths_to_target([18, 9, 11, 10, 8, 8, 8, 8, 9, 9], detail_width, (0,))
+            mr = {2, 3, 4, 5, 6, 7, 8, 9}
             lines.append(fmt_detail(mh, mw, mr, {i: "header" for i in range(len(mh))}))
             lines.append(color.wrap("  ".join("-" * w for w in mw), color.DIM))
             model_rows = []
-            for model, u in b.usage_by_model.items():
-                c = credit_for_usage(model, u, fast)
-                comp = credit_components_for_usage(model, u, fast)
+            for model_key, u in b.usage_by_model.items():
+                model, tier = split_usage_key(model_key)
+                c, complete = _credit_for_usage_with_completeness(model_key, u, fast)
+                comp, _ = _credit_components_for_usage_with_completeness(model_key, u, fast)
                 cache_part = comp[1] if comp else 0.0
-                model_rows.append((model, u, c, cache_part))
-            model_rows.sort(key=lambda x: (x[2] if x[2] is not None else -1), reverse=True)
-            for model, u, c, cache_part in model_rows:
+                model_rows.append((model, tier, u, c, complete, cache_part))
+            model_rows.sort(key=lambda x: (x[3] if x[3] is not None else -1), reverse=True)
+            for model, tier, u, c, complete, cache_part in model_rows:
                 pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
                 lines.append(fmt_detail([
-                    pretty_model(model), weekly_percent_text(c, quota_calibration, c is not None),
-                    "—" if c is None else f"{c:.1f}", human_tokens(u.input_tokens),
+                    pretty_model(model), service_tier_display(tier, compact=True),
+                    weekly_percent_text(c, quota_calibration, complete),
+                    "—" if c is None else f"{c:.1f}" + ("" if complete else "+"), human_tokens(u.input_tokens),
                     human_tokens(u.cached_input_tokens), human_tokens(u.output_tokens),
                     human_tokens(u.reasoning_output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
                 ], mw, mr))
@@ -3006,9 +3244,9 @@ def render_table(
             # AGENT BREAKDOWN
             lines.append("")
             lines.append(color.wrap("Agent breakdown", color.BOLD, color.BLUE))
-            ah = ["ROLE / SESSION", "MODEL(S)", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SESSION%"]
-            aw = fit_widths_to_target([30, 18, 12, 11, 8, 8, 8, 10, 9], detail_width, (0, 1))
-            ar = {2, 3, 4, 5, 6, 7, 8}
+            ah = ["ROLE / SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SESSION%"]
+            aw = fit_widths_to_target([27, 16, 9, 11, 10, 8, 8, 8, 9, 9], detail_width, (0, 1))
+            ar = {3, 4, 5, 6, 7, 8, 9}
             lines.append(fmt_detail(ah, aw, ar, {i: "header" for i in range(len(ah))}))
             lines.append(color.wrap("  ".join("-" * w for w in aw), color.DIM))
             agent_rows = []
@@ -3029,7 +3267,8 @@ def render_table(
                 credit_text = "—" if c is None else f"{c:.1f}" + ("" if complete else "+")
                 role_style = "active" if sid not in b.source_is_subagent and state == "ACTIVE" else None
                 lines.append(fmt_detail([
-                    label, model_label(by_model.keys()), weekly_percent_text(c, quota_calibration, complete),
+                    label, model_label(by_model.keys()), tier_label(by_model.keys()),
+                    weekly_percent_text(c, quota_calibration, complete),
                     credit_text, human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
                     human_tokens(u.output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
                 ], aw, ar, {0: role_style} if role_style else {}))
@@ -3059,7 +3298,7 @@ def render_json(
     out = {
         "period": period_label,
         "timezone": _tz_label(tz),
-        "credit_mode": "fast_assumed" if fast else "standard",
+        "credit_mode": "tier_aware_assume_unknown_fast" if fast else "tier_aware",
         "subscription": {
             "plan_type": (quota_snapshot.plan_type if quota_snapshot else "") or (auth_context.plan_type if auth_context else ""),
             "plan_display": plan_display_name((quota_snapshot.plan_type if quota_snapshot else "") or (auth_context.plan_type if auth_context else "")),
@@ -3085,22 +3324,36 @@ def render_json(
         credits, complete = bucket_credits(b, sessions, fast)
 
         model_breakdown = []
-        for model, mu in b.usage_by_model.items():
-            mc = credit_for_usage(model, mu, fast)
-            mcomp = credit_components_for_usage(model, mu, fast)
+        for model_key, mu in b.usage_by_model.items():
+            model, tier = split_usage_key(model_key)
+            mc, mcomplete = _credit_for_usage_with_completeness(model_key, mu, fast)
+            mcomp, _ = _credit_components_for_usage_with_completeness(model_key, mu, fast)
             model_breakdown.append({
                 "model": model,
+                "service_tier": tier,
                 "input_tokens": mu.input_tokens,
                 "cached_input_tokens": mu.cached_input_tokens,
                 "output_tokens": mu.output_tokens,
                 "reasoning_output_tokens": mu.reasoning_output_tokens,
                 "credit_estimate": mc,
+                "credit_estimate_complete": mcomplete,
+                "weekly_estimate_percent": (mc / quota_calibration.credits_per_percent) if (mc is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
+                "weekly_estimate_is_lower_bound": bool(mc is not None and not mcomplete),
                 "cache_tax_credits": mcomp[1] if mcomp else None,
             })
-        model_breakdown.sort(
-            key=lambda x: x["credit_estimate"] if x["credit_estimate"] is not None else -1,
-            reverse=True,
-        )
+        model_breakdown.sort(key=lambda x: x["credit_estimate"] if x["credit_estimate"] is not None else -1, reverse=True)
+
+        tier_breakdown = []
+        for tier, tier_map in group_by_service_tier(b.usage_by_model).items():
+            tc, tcomplete = model_map_credits(tier_map, fast)
+            tier_breakdown.append({
+                "service_tier": tier,
+                "credit_estimate": tc,
+                "credit_estimate_complete": tcomplete,
+                "weekly_estimate_percent": (tc / quota_calibration.credits_per_percent) if (tc is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
+                "weekly_estimate_is_lower_bound": bool(tc is not None and not tcomplete),
+            })
+        tier_breakdown.sort(key=lambda x: SERVICE_TIER_ORDER.index(x["service_tier"]) if x["service_tier"] in SERVICE_TIER_ORDER else 99)
 
         agent_breakdown = []
         for sid, by_model in b.usage_by_source.items():
@@ -3111,7 +3364,8 @@ def render_json(
                 "session_id": sid,
                 "role": "subagent" if sid in b.source_is_subagent else "main",
                 "title": b.source_titles.get(sid, ""),
-                "models": list(by_model.keys()),
+                "models": model_names(by_model.keys()),
+                "service_tiers": service_tiers(by_model.keys()),
                 "input_tokens": au.input_tokens,
                 "cached_input_tokens": au.cached_input_tokens,
                 "output_tokens": au.output_tokens,
@@ -3120,12 +3374,7 @@ def render_json(
                 "cache_tax_credits": acache,
                 "credit_estimate_complete": acomplete,
             })
-        agent_breakdown.sort(
-            key=lambda x: (
-                0 if x["role"] == "main" else 1,
-                -(x["credit_estimate"] if x["credit_estimate"] is not None else -1),
-            )
-        )
+        agent_breakdown.sort(key=lambda x: (0 if x["role"] == "main" else 1, -(x["credit_estimate"] if x["credit_estimate"] is not None else -1)))
 
         main_map, sub_map = main_sub_maps(b)
         _, cache_tax, _, _ = cost_components_for_map(b.usage_by_model, fast)
@@ -3147,7 +3396,8 @@ def render_json(
             "cache_tax_credits": cache_tax,
             "main_credit_estimate": main_credits,
             "subagent_credit_estimate": sub_credits,
-            "models": list(b.usage_by_model.keys()),
+            "models": model_names(b.usage_by_model.keys()),
+            "service_tiers": service_tiers(b.usage_by_model.keys()),
             "input_tokens": u.input_tokens,
             "cached_input_tokens": u.cached_input_tokens,
             "uncached_input_tokens": max(0, u.input_tokens - min(u.input_tokens, u.cached_input_tokens)),
@@ -3158,16 +3408,11 @@ def render_json(
             "weekly_estimate_is_lower_bound": bool(credits is not None and not complete),
             "credit_estimate_complete": complete,
             "rolled_up_subagents": sorted(b.child_sessions),
+            "tier_breakdown": tier_breakdown,
             "model_breakdown": model_breakdown,
             "agent_breakdown": agent_breakdown,
         })
-    out["sessions"].sort(
-        key=lambda x: (
-            x["credit_estimate"] if x["credit_estimate"] is not None else -1,
-            x["input_tokens"] + x["output_tokens"],
-        ),
-        reverse=True,
-    )
+    out["sessions"].sort(key=lambda x: (x["credit_estimate"] if x["credit_estimate"] is not None else -1, x["input_tokens"] + x["output_tokens"]), reverse=True)
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 
@@ -3184,12 +3429,13 @@ def render_csv(
     sio = io.StringIO()
     writer = csv.writer(sio)
     writer.writerow([
-        "session_id", "title", "cwd", "models", "input_tokens",
-        "cached_input_tokens", "uncached_input_tokens", "output_tokens",
-        "reasoning_output_tokens", "credit_estimate", "weekly_estimate_percent", "weekly_estimate_is_lower_bound", "cache_tax_credits",
-        "subscription_plan", "weekly_used_percent", "calibration_credits_per_percent", "calibration_confidence", "calibration_source",
-        "main_credit_estimate", "subagent_credit_estimate", "thread_state",
-        "thread_health", "last_activity", "trailing_1h_credit_burn",
+        "session_id", "title", "cwd", "models", "service_tiers", "credit_mode",
+        "input_tokens", "cached_input_tokens", "uncached_input_tokens", "output_tokens",
+        "reasoning_output_tokens", "credit_estimate", "weekly_estimate_percent",
+        "weekly_estimate_is_lower_bound", "cache_tax_credits", "subscription_plan",
+        "weekly_used_percent", "calibration_credits_per_percent", "calibration_confidence",
+        "calibration_source", "main_credit_estimate", "subagent_credit_estimate",
+        "thread_state", "thread_health", "last_activity", "trailing_1h_credit_burn",
         "trailing_1h_cache_tax", "rolled_up_subagents",
     ])
     for b in buckets.values():
@@ -3201,12 +3447,14 @@ def render_csv(
         sub_c, _ = model_map_credits(sub_map, fast)
         state = thread_state(b, now, live_report)
         health = effective_health(b, fast, state)
-        burn, recent_cache, burn_complete = recent_burn(b, fast)
+        burn, recent_cache, _ = recent_burn(b, fast)
         writer.writerow([
             b.session_id,
             b.title,
             b.cwd,
-            ",".join(b.usage_by_model.keys()),
+            ",".join(model_names(b.usage_by_model.keys())),
+            ",".join(service_tiers(b.usage_by_model.keys())),
+            "tier_aware_assume_unknown_fast" if fast else "tier_aware",
             u.input_tokens,
             u.cached_input_tokens,
             max(0, u.input_tokens - min(u.input_tokens, u.cached_input_tokens)),
@@ -3266,7 +3514,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fast",
         action="store_true",
-        help="Assume all eligible usage was Fast mode and apply published Fast multipliers.",
+        help="Resolve only service-tier segments that remain UNKNOWN as Fast; detected Standard/Fast segments are preserved.",
     )
     p.add_argument("--details", action="store_true", help="Show credit components, MAIN/SUB totals, models, agents and live trend diagnostics.")
     p.add_argument("--wide", action="store_true", help="Show INPUT/CACHED/OUTPUT columns in the summary table.")

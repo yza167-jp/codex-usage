@@ -1,9 +1,7 @@
 == patcher compile ==
 == apply patch ==
-Traceback (most recent call last):
-  File "/tmp/upgrade_v160.py", line 916, in <module>
-    s = replace_once(
-        ^^^^^^^^^^^^^
-  File "/tmp/upgrade_v160.py", line 16, in replace_once
-    raise RuntimeError(f"missing replacement anchor: {label}")
-RuntimeError: missing replacement anchor: legacy modes query
+== script compile ==
+  File "codex-usage", line 1386
+    if not raw.endswith(b"
+                        ^
+SyntaxError: unterminated string literal (detected at line 1386)

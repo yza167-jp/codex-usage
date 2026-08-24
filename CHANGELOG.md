@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.0 — 2026-08-24
+
+- Added automatic per-delta service-tier attribution from local `turn_context` and `thread_settings_applied` records.
+- Normalized `priority`/`fast` to Fast and `default`/null to Standard; one session can now contain separately priced Standard and Fast segments.
+- Changed `--fast` from a global override into an Unknown-tier fallback. Detected Standard/Fast segments are never overwritten.
+- Added `TIER(S)` to the summary plus service-tier, model-tier, and agent-tier breakdowns in DETAILS.
+- Applied published Fast multipliers only to detected/assumed Fast segments. Unknown/Flex segments use conservative lower-bound semantics (`CREDITS* +`, `WEEKLY≈ ≥x%`).
+- Added service-tier fields and tier breakdowns to JSON/CSV output.
+- Bumped the token-event cache schema so `service_tier` and incremental parser state are persisted per rollout; quota history is retained.
+- Revisioned weekly calibration to a tier-aware credit coordinate system and allowed legacy backend anchors to be safely replayed under the new accounting.
+
 ## 1.5.5 — 2026-08-13
 
 - Made weekly allowance the primary user-facing usage unit: summary, TOTAL, detail metadata, component tables, MAIN/SUB, model, and agent breakdowns now put `WEEKLY≈` ahead of `CREDITS*`.

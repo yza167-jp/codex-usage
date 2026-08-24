@@ -1,5 +1,15 @@
 # codex-usage
 
+## v1.6.0：自动区分 Fast / Standard
+
+v1.6.0 会读取 Codex 本地持久化的 service-tier 设置，并把每次累计 `token_count` 的增量归到当时实际生效的档位。`priority` 与 `fast` 统一识别为 **Fast**，`default` / null 识别为 **Standard**。因此，同一个 session 中途切换 Fast 时，可以分别统计，而不再只能把整段记录统一按 Standard 或 Fast 估算。
+
+摘要新增 `TIER(S)`；DETAILS 新增 service-tier breakdown，Model 和 Agent 表也会显示档位，因而可以直接发现使用 Fast 的 subagent。
+
+对缺少档位标记的旧记录，默认按 Standard 计算保守下界，并用 `+` / `≥` 标记不确定性。`--fast` 仍保留，但现在仅把 **Unknown 段**按 Fast 估算，不会覆盖已经识别出的 Standard / Fast。
+
+v1.6 会自动让 token-event 缓存重建一次，以便逐事件保存 `service_tier`；历史 quota observations 会保留。tier-aware credits 使用新的 calibration revision，不会与 v1.5 的全局 Standard/Fast 坐标系混合。
+
 ## v1.5.5：weekly-first 使用体验
 
 v1.5.5 调整了整个工具的产品语义：**订阅的 weekly allowance 成为第一使用指标**，`CREDITS*` 退到第二层，主要用于计价细节、cache tax 和调试。
@@ -20,7 +30,7 @@ Local this week≈ ≥0.48% · CREDITS* 86.2+
 默认摘要的核心列顺序调整为：
 
 ```text
-SESSION  MODEL(S)  WEEKLY≈  1H≈  CREDITS*  CACHE TAX  SHARE  STATUS
+SESSION  MODEL(S)  TIER(S)  WEEKLY≈  1H≈  CREDITS*  CACHE TAX  SHARE  STATUS
 ```
 
 DETAILS 中 Usage components、MAIN/SUB、Model、Agent breakdown 也统一把 `WEEKLY≈` 放在 credits 前面。
@@ -321,7 +331,7 @@ credits* = uncached input component + cached input component + output component
 
 Reasoning tokens 是 output 的细分，不会重复收费。
 
-`--fast` 会对支持的模型应用内置 Fast multiplier。由于历史 service tier 并不总是可靠写入 token event，`--fast` 的含义是“假设本次报告里的可用 usage 都使用 Fast”。
+`--fast` 现在只会对无法从本地记录确定档位的 Unknown 段对支持的模型应用内置 Fast multiplier。由于历史 service tier 并不总是可靠写入 token event，`--fast` 的含义是“假设本次报告里的可用 usage 都使用 Fast”。
 
 `CREDITS*` 与 `WEEKLY≈` 都不是 OpenAI 官方服务端账单/额度 meter。
 

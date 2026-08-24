@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.5.5", proc.stdout)
+        self.assertIn("1.6.0", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -137,7 +137,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
                     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     ("acct", "prolite", reset, now.isoformat(), (now+self.mod.timedelta(seconds=1)).isoformat(),
-                     0.0, 1.0, 50.0, 0, self.mod.RATE_CARD_CALIBRATION_KEY, "standard", "snapshot_delta"),
+                     0.0, 1.0, 50.0, 0, self.mod.RATE_CARD_CALIBRATION_KEY, self.mod._quota_mode(False), "snapshot_delta"),
                 )
                 conn.execute(
                     """
@@ -148,7 +148,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
                     """,
                     ("acct", "prolite", reset, (now+self.mod.timedelta(seconds=2)).isoformat(),
                      (now+self.mod.timedelta(seconds=3)).isoformat(), 1.0, 3.0, 360.0, 1,
-                     self.mod.RATE_CARD_CALIBRATION_KEY, "standard", "snapshot_delta"),
+                     self.mod.RATE_CARD_CALIBRATION_KEY, self.mod._quota_mode(False), "snapshot_delta"),
                 )
                 conn.commit()
                 snap = self.mod.QuotaSnapshot(now+self.mod.timedelta(seconds=4), 3.0, 10080, reset, plan_type="prolite")
@@ -501,6 +501,75 @@ class CodexUsageSmokeTests(unittest.TestCase):
             self.assertIn("Subscription", cached.stdout)
             self.assertIn("WEEKLY", cached.stdout)
             self.assertTrue(cache_db.exists())
+
+
+    def test_v160_service_tier_normalization_and_labels(self):
+        self.assertEqual(self.mod.normalize_service_tier("priority"), "fast")
+        self.assertEqual(self.mod.normalize_service_tier("fast"), "fast")
+        self.assertEqual(self.mod.normalize_service_tier("default"), "standard")
+        self.assertEqual(self.mod.normalize_service_tier(None), "standard")
+        self.assertEqual(self.mod.normalize_service_tier("flex"), "flex")
+        keys = [
+            self.mod.usage_key("gpt-5.6-sol", "default"),
+            self.mod.usage_key("gpt-5.6-sol", "priority"),
+        ]
+        self.assertEqual(self.mod.model_label(keys), "5.6 Sol")
+        self.assertEqual(self.mod.tier_label(keys), "MIXED")
+
+    def test_v160_pricing_distinguishes_standard_fast_and_unknown(self):
+        usage = self.mod.Usage(input_tokens=1_000_000, total_tokens=1_000_000)
+        standard = self.mod.usage_key("gpt-5.6-sol", "standard")
+        fast = self.mod.usage_key("gpt-5.6-sol", "priority")
+        unknown = self.mod.usage_key("gpt-5.6-sol", "unknown-value")
+        sc, scomplete = self.mod._credit_for_usage_with_completeness(standard, usage, False)
+        fc, fcomplete = self.mod._credit_for_usage_with_completeness(fast, usage, False)
+        uc, ucomplete = self.mod._credit_for_usage_with_completeness(unknown, usage, False)
+        ufc, ufcomplete = self.mod._credit_for_usage_with_completeness(unknown, usage, True)
+        self.assertAlmostEqual(sc, 125.0)
+        self.assertTrue(scomplete)
+        self.assertAlmostEqual(fc, 312.5)
+        self.assertTrue(fcomplete)
+        self.assertAlmostEqual(uc, 125.0)
+        self.assertFalse(ucomplete)
+        self.assertAlmostEqual(ufc, 312.5)
+        self.assertTrue(ufcomplete)
+
+    def test_v160_rollout_tier_state_is_applied_per_delta(self):
+        sid = "019ffabc-1234-7000-8000-123456789aaa"
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / f"rollout-{sid}.jsonl"
+            records = [
+                {"timestamp": now.isoformat(), "type": "session_meta", "payload": {"id": sid, "model_provider": "openai"}},
+                {"timestamp": now.isoformat(), "type": "turn_context", "payload": {"model": "gpt-5.6-sol", "service_tier": None}},
+                {"timestamp": now.isoformat(), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1_000_000, "total_tokens": 1_000_000}}}},
+                {"timestamp": (now + self.mod.timedelta(seconds=1)).isoformat(), "type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {"model": "gpt-5.6-sol", "service_tier": "priority"}}},
+                {"timestamp": (now + self.mod.timedelta(seconds=2)).isoformat(), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 2_000_000, "total_tokens": 2_000_000}}}},
+            ]
+            path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+            session = self.mod.parse_rollout(path)
+            self.assertIsNotNone(session)
+            deltas = self.mod.compute_deltas(session, {sid: session})
+            self.assertEqual([d[2] for d in deltas], ["standard", "fast"])
+            bucket = self.mod.make_buckets(
+                {sid: session}, {}, now - self.mod.timedelta(seconds=1),
+                now + self.mod.timedelta(seconds=3), timezone.utc, False
+            )[sid]
+            credits, complete = self.mod.bucket_credits(bucket, {sid: session}, False)
+            self.assertAlmostEqual(credits, 437.5)
+            self.assertTrue(complete)
+            self.assertEqual(self.mod.tier_label(bucket.usage_by_model.keys()), "MIXED")
+
+    def test_v160_cache_schema_persists_service_tier(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
+            try:
+                file_cols = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+                event_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+                self.assertIn("current_service_tier", file_cols)
+                self.assertIn("service_tier", event_cols)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

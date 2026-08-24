@@ -1,5 +1,25 @@
 # codex-usage
 
+## v1.6.0: automatic Fast-mode attribution
+
+v1.6.0 reads persisted Codex service-tier settings and associates each cumulative `token_count` delta with the tier that was active for that request. `priority` and `fast` are normalized to **Fast**; `default`/null are **Standard**. A single session can therefore be split into Standard and Fast portions instead of being priced under one global assumption.
+
+The summary adds `TIER(S)` and DETAILS adds a dedicated service-tier table. Model and agent breakdowns also show tier, so Fast subagents are visible directly:
+
+```text
+SESSION              MODEL(S)   TIER(S)  WEEKLY≈  1H≈  CREDITS*  ...
+main (+6 sub)        5.6 Sol    MIXED       8.2%  1.1%    1435.0  ...
+
+Service tier breakdown
+SERVICE TIER   WEEKLY≈   CREDITS*   SESSION%
+Fast              5.4%      945.0       65.9%
+Standard          2.8%      490.0       34.1%
+```
+
+For older/truncated records with no persisted tier marker, the default estimate uses Standard pricing as a conservative lower bound and marks the row with `+` / `≥`. `--fast` is retained as an explicit fallback, but now resolves **only Unknown segments** as Fast; it never overrides a detected Standard or Fast setting.
+
+The v1.6 cache schema re-indexes token events once so each event can store `service_tier`. Quota calibration is also revisioned because tier-aware credits use a different coordinate system from v1.5's global Standard/Fast assumptions.
+
 ## v1.5.5: weekly-first usage
 
 v1.5.5 changes the product model: **weekly subscription allowance is now the primary usage unit**, while `CREDITS*` is a secondary implementation/diagnostic unit.
@@ -20,7 +40,7 @@ Local this week≈ ≥0.48% · CREDITS* 86.2+
 Default summary order is now conceptually:
 
 ```text
-SESSION  MODEL(S)  WEEKLY≈  1H≈  CREDITS*  CACHE TAX  SHARE  STATUS
+SESSION  MODEL(S)  TIER(S)  WEEKLY≈  1H≈  CREDITS*  CACHE TAX  SHARE  STATUS
 ```
 
 Details follow the same priority: `WEEKLY≈` precedes credits in usage components, MAIN/SUB, model, and agent tables.
@@ -91,7 +111,7 @@ another task                    5.6 Sol            203.1     0.51%      125.1   
 ## Highlights
 
 - Per-session usage for `today`, `yesterday`, exact dates, date ranges, or rolling windows such as `6h`, `12h`, `24h`, and any `Nh`.
-- Estimated credits by model, root/main agent, and subagent.
+- Tier-aware estimated credits by model, root/main agent, and subagent, including mixed Standard/Fast sessions.
 - `CACHE TAX`: the estimated credit component attributable to cached input.
 - `1H BURN`: credits observed in the trailing 60 minutes.
 - `ACTIVE`, `RECENT`, `IDLE` plus `OK`, `WATCH`, `ROTATE` workflow hints.
@@ -295,7 +315,7 @@ credits* = uncached input component + cached input component + output component
 
 Reasoning tokens are a subset/detail of output and are not charged twice.
 
-`--fast` applies the embedded Fast multiplier to eligible usage. Historical service tier is not reliably persisted in every token event, so `--fast` means “assume eligible usage in this report was Fast.”
+`codex-usage` reconstructs the active tier from persisted `turn_context` / `thread_settings_applied` settings. `priority` is treated as Fast. When no tier marker exists, Standard pricing is shown as a lower bound; `--fast` changes only those unresolved segments to a Fast assumption.
 
 Neither `CREDITS*` nor `WEEKLY≈` is the authoritative server-side meter.
 
@@ -320,7 +340,7 @@ codex-usage 24h --full-discovery --perf
 codex-usage 24h --no-cache
 ```
 
-A cache rebuild is normally unnecessary when upgrading from v1.4.x to v1.5.0; the quota-observation table is additive.
+v1.6 automatically invalidates and rebuilds the token-event portion of the cache once because service tier is now stored per event. Quota observations are retained.
 
 ## Time zones
 
