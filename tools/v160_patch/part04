@@ -1,0 +1,200 @@
+def service_tiers(models: Iterable[str]) -> List[str]:
+    found = set()
+    for key in models:
+        _, tier = split_usage_key(key)
+        found.add(tier)
+    return [tier for tier in SERVICE_TIER_ORDER if tier in found]
+
+
+def tier_label(models: Iterable[str]) -> str:
+    tiers = service_tiers(models)
+    if not tiers:
+        return "?"
+    if tiers == [SERVICE_TIER_FAST, SERVICE_TIER_STANDARD]:
+        return "MIXED"
+    return "/".join(service_tier_display(t, compact=True) for t in tiers)
+
+
+def group_by_service_tier(usage_by_model: Dict[str, Usage]) -> Dict[str, Dict[str, Usage]]:
+    grouped: Dict[str, Dict[str, Usage]] = {}
+    for key, usage in usage_by_model.items():
+        _, tier = split_usage_key(key)
+        target = grouped.setdefault(tier, {})
+        target[key] = target.get(key, Usage()) + usage
+    return grouped
+'''
+s = replace_function(s, 'pretty_model', pretty_block)
+# model_label was consumed by replace_function(pretty_model) only if it was the
+# next top-level function; explicitly remove any old duplicate that remains.
+old_model_label = re.compile(r'^def model_label\(.*?(?=^def |\Z)', re.MULTILINE | re.DOTALL)
+matches = list(old_model_label.finditer(s))
+if len(matches) > 1:
+    m = matches[-1]
+    s = s[:m.start()] + s[m.end():]
+
+s = replace_function(s, 'make_buckets', '''def make_buckets(
+    sessions: Dict[str, RawSession],
+    index: Dict[str, dict],
+    start: datetime,
+    end: datetime,
+    tz,
+    show_subagents: bool,
+    trend_start: Optional[datetime] = None,
+) -> Dict[str, Bucket]:
+    buckets: Dict[str, Bucket] = {}
+
+    for session in sessions.values():
+        deltas = compute_deltas(session, sessions)
+        if not deltas:
+            continue
+
+        target_id = rollup_target(session, sessions, show_subagents)
+        target_session = sessions.get(target_id, session)
+
+        bucket = buckets.get(target_id)
+        if bucket is None:
+            dbrow = index.get(target_id, {})
+            title = session_title(target_session, index)
+            if show_subagents and target_session.is_subagent():
+                title += f" [sub {short_sid(target_session.session_id)}]"
+            elif (
+                not show_subagents
+                and target_session.is_subagent()
+                and (not target_session.lineage_parent() or target_session.lineage_parent() not in sessions)
+            ):
+                title = "[ORPHAN SUB] " + title
+            bucket = Bucket(
+                session_id=target_id,
+                title=title,
+                cwd=str(dbrow.get("cwd") or target_session.cwd or ""),
+                source=str(dbrow.get("source") or target_session.source or ""),
+            )
+            buckets[target_id] = bucket
+
+        for ts, model, service_tier, delta in deltas:
+            local_ts = _to_tz(ts, tz)
+            if start <= local_ts < end:
+                bucket.add(
+                    model,
+                    delta,
+                    session.session_id,
+                    source_title=session_title(session, index),
+                    is_subagent=session.is_subagent(),
+                    activity_ts=local_ts,
+                    recent=(trend_start is not None and local_ts >= trend_start),
+                    service_tier=service_tier,
+                )
+
+    return {sid: b for sid, b in buckets.items() if b.total_usage().nonzero()}
+''')
+
+# Quota calibration mode now describes only the fallback applied to unresolved
+# tier segments; detected Standard/Fast usage is always priced per event.
+# New observations must use the tier-aware mode key rather than the old global
+# standard/fast coordinate systems.
+s = replace_once(
+    s,
+    '    mode = "fast" if fast else "standard"\n    conn.execute(\n        """\n        INSERT OR REPLACE INTO quota_observations(',
+    '    mode = _quota_mode(fast)\n    conn.execute(\n        """\n        INSERT OR REPLACE INTO quota_observations(',
+    'quota observation tier-aware mode',
+)
+s = replace_function(s, '_quota_mode', '''def _quota_mode(fast: bool) -> str:
+    return "tier_auto_assume_fast" if fast else "tier_auto"
+''')
+s = replace_once(
+    s,
+    '''    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
+    mode = "fast" if fast else "standard"
+    rows = list(conn.execute(
+''',
+    '''    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
+    mode = _quota_mode(fast)
+    rows = list(conn.execute(
+''',
+    'load calibration mode',
+)
+s = replace_once(
+    s,
+    '''    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
+    mode = "fast" if fast else "standard"
+    rows = list(conn.execute(
+        """
+        SELECT snapshot_ts,used_percent,reset_at,window_minutes
+        FROM quota_observations
+        WHERE account_key=? AND plan_type=? AND credit_mode=?
+          AND rate_card<>? AND snapshot_ts<=?
+''',
+    '''    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
+    mode = _quota_mode(fast)
+    legacy_mode = "fast" if fast else "standard"
+    rows = list(conn.execute(
+        """
+        SELECT snapshot_ts,used_percent,reset_at,window_minutes
+        FROM quota_observations
+        WHERE account_key=? AND plan_type=? AND credit_mode IN (?,?)
+          AND rate_card<>? AND snapshot_ts<=?
+''',
+    'legacy modes query',
+)
+s = replace_once(
+    s,
+    '''            auth.account_key,
+            plan,
+            mode,
+            RATE_CARD_CALIBRATION_KEY,
+''',
+    '''            auth.account_key,
+            plan,
+            mode,
+            legacy_mode,
+            RATE_CARD_CALIBRATION_KEY,
+''',
+    'legacy modes params',
+)
+
+# Header/summary layout: add a compact tier column and update mode semantics.
+s = replace_once(
+    s,
+    '    mode = "Fast-assumed credits" if fast else "Standard credits"\n',
+    '    mode = "Tier-aware credits (unknown→Fast)" if fast else "Tier-aware credits"\n',
+    'credit mode header',
+)
+s = replace_once(
+    s,
+    '''        headers = ["SESSION", "MODEL(S)", "WEEKLY≈", "1H≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SHARE", "STATUS"]
+        fixed = [10, 9, 10, 9, 9, 9, 10, 7, 13]
+''',
+    '''        headers = ["SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SHARE", "STATUS"]
+        fixed = [10, 10, 9, 10, 9, 9, 9, 10, 7, 13]
+''',
+    'wide headers tier',
+)
+s = replace_once(s, '        widths = [session_w, model_w] + fixed\n        align_right = {2, 3, 4, 5, 6, 7, 8, 9}\n', '        widths = [session_w, model_w] + fixed\n        align_right = {3, 4, 5, 6, 7, 8, 9, 10}\n', 'wide align tier')
+s = replace_once(
+    s,
+    '''        headers = ["SESSION", "MODEL(S)", "WEEKLY≈", "1H≈", "CREDITS*", "CACHE TAX", "SHARE", "STATUS"]
+        fixed = [10, 9, 10, 10, 7, 13]
+''',
+    '''        headers = ["SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*", "CACHE TAX", "SHARE", "STATUS"]
+        fixed = [10, 10, 9, 10, 10, 7, 13]
+''',
+    'summary headers tier',
+)
+s = replace_once(s, '        widths = [session_w, model_w] + fixed\n        align_right = {2, 3, 4, 5, 6}\n', '        widths = [session_w, model_w] + fixed\n        align_right = {3, 4, 5, 6, 7}\n', 'summary align tier')
+s = replace_once(
+    s,
+    '''                title, model_label(b.usage_by_model.keys()), weekly_text, burn_weekly, credit_text,
+                human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
+''',
+    '''                title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
+                weekly_text, burn_weekly, credit_text,
+                human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
+''',
+    'wide row tier',
+)
+s = replace_once(s, '            status_idx, title_idx, burn_idx, cache_idx = 10, 0, 3, 8\n', '            status_idx, title_idx, burn_idx, cache_idx = 11, 0, 4, 9\n', 'wide indexes')
+s = replace_once(
+    s,
+    '''                title, model_label(b.usage_by_model.keys()), weekly_text, burn_weekly, credit_text,
+                f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
+''',
