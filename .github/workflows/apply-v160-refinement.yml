@@ -1,0 +1,57 @@
+name: Apply v1.6.0 refinement
+
+on:
+  push:
+    branches:
+      - dev/v1.6.0-fast-aware
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[v160-refine-ok]') && !contains(github.event.head_commit.message, '[v160-refine-error]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/v1.6.0-fast-aware
+          fetch-depth: 0
+      - name: Patch, test, and commit
+        shell: bash
+        run: |
+          set +e
+          {
+            echo '== apply refinement =='
+            python tools/refine_v160.py
+            patch_status=$?
+            echo '== compile =='
+            if [ "$patch_status" -eq 0 ]; then python -m py_compile codex-usage; else false; fi
+            compile_status=$?
+            echo '== tests =='
+            if [ "$compile_status" -eq 0 ]; then python -m unittest -v tests/test_codex_usage.py; else false; fi
+            test_status=$?
+            echo '== smoke =='
+            if [ "$test_status" -eq 0 ]; then python codex-usage --version && python codex-usage --help >/dev/null; else false; fi
+            smoke_status=$?
+          } > /tmp/v160-refine.log 2>&1
+          status=$smoke_status
+          cat /tmp/v160-refine.log
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/apply-v160-refinement.yml tools/refine_v160.py V160_REFINE_FAILURE.log
+
+          if [ "$status" -eq 0 ]; then
+            rm -f V160_REFINE_ERROR.log
+            git add -A
+            git commit -m 'Finalize Fast snapshot semantics [v160-refine-ok]'
+            git push origin HEAD:dev/v1.6.0-fast-aware
+            exit 0
+          fi
+
+          cp /tmp/v160-refine.log V160_REFINE_ERROR.log
+          git add -A
+          git commit -m 'Record Fast refinement error [v160-refine-error]'
+          git push origin HEAD:dev/v1.6.0-fast-aware
+          exit "$status"
