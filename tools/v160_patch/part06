@@ -1,0 +1,200 @@
+            "weekly_used_percent": quota_snapshot.used_percent if quota_snapshot else None,
+            "weekly_left_percent": max(0.0, 100.0 - quota_snapshot.used_percent) if quota_snapshot else None,
+            "weekly_resets_at": quota_snapshot.resets_at if quota_snapshot else None,
+            "snapshot_at": quota_snapshot.ts.isoformat() if quota_snapshot else None,
+            "local_week_credits": quota_local_credits,
+            "local_weekly_estimate_percent": (quota_local_credits / quota_calibration.credits_per_percent) if (quota_local_credits is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
+            "weekly_estimate_basis": "one_plan_weekly_allowance",
+            "credits_per_weekly_percent": quota_calibration.credits_per_percent if quota_calibration else None,
+            "effective_weekly_credit_capacity": quota_calibration.effective_weekly_credits if quota_calibration else None,
+            "calibration_confidence": quota_calibration.confidence if quota_calibration else None,
+            "calibration_source": quota_calibration.source if quota_calibration else None,
+            "calibration_clean_intervals": quota_calibration.clean_intervals if quota_calibration else 0,
+            "calibration_observed_percent_points": quota_calibration.observed_percent_points if quota_calibration else 0.0,
+            "local_coverage_percent": quota_calibration.local_coverage_percent if quota_calibration else None,
+        },
+        "sessions": [],
+    }
+    for b in buckets.values():
+        u = b.total_usage()
+        credits, complete = bucket_credits(b, sessions, fast)
+
+        model_breakdown = []
+        for model_key, mu in b.usage_by_model.items():
+            model, tier = split_usage_key(model_key)
+            mc, mcomplete = _credit_for_usage_with_completeness(model_key, mu, fast)
+            mcomp, _ = _credit_components_for_usage_with_completeness(model_key, mu, fast)
+            model_breakdown.append({
+                "model": model,
+                "service_tier": tier,
+                "input_tokens": mu.input_tokens,
+                "cached_input_tokens": mu.cached_input_tokens,
+                "output_tokens": mu.output_tokens,
+                "reasoning_output_tokens": mu.reasoning_output_tokens,
+                "credit_estimate": mc,
+                "credit_estimate_complete": mcomplete,
+                "weekly_estimate_percent": (mc / quota_calibration.credits_per_percent) if (mc is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
+                "weekly_estimate_is_lower_bound": bool(mc is not None and not mcomplete),
+                "cache_tax_credits": mcomp[1] if mcomp else None,
+            })
+        model_breakdown.sort(key=lambda x: x["credit_estimate"] if x["credit_estimate"] is not None else -1, reverse=True)
+
+        tier_breakdown = []
+        for tier, tier_map in group_by_service_tier(b.usage_by_model).items():
+            tc, tcomplete = model_map_credits(tier_map, fast)
+            tier_breakdown.append({
+                "service_tier": tier,
+                "credit_estimate": tc,
+                "credit_estimate_complete": tcomplete,
+                "weekly_estimate_percent": (tc / quota_calibration.credits_per_percent) if (tc is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
+                "weekly_estimate_is_lower_bound": bool(tc is not None and not tcomplete),
+            })
+        tier_breakdown.sort(key=lambda x: SERVICE_TIER_ORDER.index(x["service_tier"]) if x["service_tier"] in SERVICE_TIER_ORDER else 99)
+
+        agent_breakdown = []
+        for sid, by_model in b.usage_by_source.items():
+            au = b.source_usage(sid)
+            ac, acomplete = model_map_credits(by_model, fast)
+            _, acache, _, _ = cost_components_for_map(by_model, fast)
+            agent_breakdown.append({
+                "session_id": sid,
+                "role": "subagent" if sid in b.source_is_subagent else "main",
+                "title": b.source_titles.get(sid, ""),
+                "models": model_names(by_model.keys()),
+                "service_tiers": service_tiers(by_model.keys()),
+                "input_tokens": au.input_tokens,
+                "cached_input_tokens": au.cached_input_tokens,
+                "output_tokens": au.output_tokens,
+                "reasoning_output_tokens": au.reasoning_output_tokens,
+                "credit_estimate": ac,
+                "cache_tax_credits": acache,
+                "credit_estimate_complete": acomplete,
+            })
+        agent_breakdown.sort(key=lambda x: (0 if x["role"] == "main" else 1, -(x["credit_estimate"] if x["credit_estimate"] is not None else -1)))
+
+        main_map, sub_map = main_sub_maps(b)
+        _, cache_tax, _, _ = cost_components_for_map(b.usage_by_model, fast)
+        main_credits, _ = model_map_credits(main_map, fast)
+        sub_credits, _ = model_map_credits(sub_map, fast)
+        state = thread_state(b, now, live_report)
+        health = effective_health(b, fast, state)
+        burn, recent_cache, burn_complete = recent_burn(b, fast)
+        out["sessions"].append({
+            "session_id": b.session_id,
+            "title": b.title,
+            "cwd": b.cwd,
+            "thread_state": state,
+            "thread_health": health,
+            "last_activity": b.last_activity.isoformat() if b.last_activity else None,
+            "trailing_1h_weekly_estimate_percent": (burn / quota_calibration.credits_per_percent) if (burn is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
+            "trailing_1h_credit_burn": burn,
+            "trailing_1h_cache_tax": recent_cache,
+            "cache_tax_credits": cache_tax,
+            "main_credit_estimate": main_credits,
+            "subagent_credit_estimate": sub_credits,
+            "models": model_names(b.usage_by_model.keys()),
+            "service_tiers": service_tiers(b.usage_by_model.keys()),
+            "input_tokens": u.input_tokens,
+            "cached_input_tokens": u.cached_input_tokens,
+            "uncached_input_tokens": max(0, u.input_tokens - min(u.input_tokens, u.cached_input_tokens)),
+            "output_tokens": u.output_tokens,
+            "reasoning_output_tokens": u.reasoning_output_tokens,
+            "credit_estimate": credits,
+            "weekly_estimate_percent": (credits / quota_calibration.credits_per_percent) if (credits is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
+            "weekly_estimate_is_lower_bound": bool(credits is not None and not complete),
+            "credit_estimate_complete": complete,
+            "rolled_up_subagents": sorted(b.child_sessions),
+            "tier_breakdown": tier_breakdown,
+            "model_breakdown": model_breakdown,
+            "agent_breakdown": agent_breakdown,
+        })
+    out["sessions"].sort(key=lambda x: (x["credit_estimate"] if x["credit_estimate"] is not None else -1, x["input_tokens"] + x["output_tokens"]), reverse=True)
+    return json.dumps(out, ensure_ascii=False, indent=2)
+''')
+
+s = replace_function(s, 'render_csv', '''def render_csv(
+    buckets: Dict[str, Bucket],
+    sessions: Dict[str, RawSession],
+    fast: bool,
+    now: datetime,
+    live_report: bool,
+    auth_context: Optional[LocalAuthContext] = None,
+    quota_snapshot: Optional[QuotaSnapshot] = None,
+    quota_calibration: Optional[QuotaCalibration] = None,
+) -> str:
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    writer.writerow([
+        "session_id", "title", "cwd", "models", "service_tiers", "credit_mode",
+        "input_tokens", "cached_input_tokens", "uncached_input_tokens", "output_tokens",
+        "reasoning_output_tokens", "credit_estimate", "weekly_estimate_percent",
+        "weekly_estimate_is_lower_bound", "cache_tax_credits", "subscription_plan",
+        "weekly_used_percent", "calibration_credits_per_percent", "calibration_confidence",
+        "calibration_source", "main_credit_estimate", "subagent_credit_estimate",
+        "thread_state", "thread_health", "last_activity", "trailing_1h_credit_burn",
+        "trailing_1h_cache_tax", "rolled_up_subagents",
+    ])
+    for b in buckets.values():
+        u = b.total_usage()
+        credits, credit_complete = bucket_credits(b, sessions, fast)
+        _, cache_tax, _, _ = cost_components_for_map(b.usage_by_model, fast)
+        main_map, sub_map = main_sub_maps(b)
+        main_c, _ = model_map_credits(main_map, fast)
+        sub_c, _ = model_map_credits(sub_map, fast)
+        state = thread_state(b, now, live_report)
+        health = effective_health(b, fast, state)
+        burn, recent_cache, _ = recent_burn(b, fast)
+        writer.writerow([
+            b.session_id,
+            b.title,
+            b.cwd,
+            ",".join(model_names(b.usage_by_model.keys())),
+            ",".join(service_tiers(b.usage_by_model.keys())),
+            "tier_aware_assume_unknown_fast" if fast else "tier_aware",
+            u.input_tokens,
+            u.cached_input_tokens,
+            max(0, u.input_tokens - min(u.input_tokens, u.cached_input_tokens)),
+            u.output_tokens,
+            u.reasoning_output_tokens,
+            "" if credits is None else f"{credits:.6f}",
+            "" if (credits is None or not quota_calibration or not quota_calibration.credits_per_percent) else f"{credits / quota_calibration.credits_per_percent:.6f}",
+            "1" if (credits is not None and not credit_complete) else "0",
+            f"{cache_tax:.6f}",
+            (quota_snapshot.plan_type if quota_snapshot else "") or (auth_context.plan_type if auth_context else ""),
+            "" if quota_snapshot is None else f"{quota_snapshot.used_percent:.6f}",
+            "" if not quota_calibration or not quota_calibration.credits_per_percent else f"{quota_calibration.credits_per_percent:.6f}",
+            "" if quota_calibration is None else quota_calibration.confidence,
+            "" if quota_calibration is None else quota_calibration.source,
+            "" if main_c is None else f"{main_c:.6f}",
+            "" if sub_c is None else f"{sub_c:.6f}",
+            state,
+            health,
+            b.last_activity.isoformat() if b.last_activity else "",
+            "" if burn is None else f"{burn:.6f}",
+            f"{recent_cache:.6f}",
+            len(b.child_sessions),
+        ])
+    return sio.getvalue()
+''')
+
+s = replace_once(
+    s,
+    '        help="Assume all eligible usage was Fast mode and apply published Fast multipliers.",\n',
+    '        help="Resolve only service-tier segments that remain UNKNOWN as Fast; detected Standard/Fast segments are preserved.",\n',
+    'fast cli help',
+)
+
+SCRIPT.write_text(s, encoding="utf-8")
+
+# Tests: update version and add tier-aware parsing/accounting regressions.
+t = TESTS.read_text(encoding="utf-8")
+# Current-revision synthetic quota rows must use the new tier-aware mode key.
+# Intentionally keep literal legacy "standard" rows whose rate-card key is old,
+# because those exercise safe historical anchor rebasing.
+t = t.replace(
+    'self.mod.RATE_CARD_CALIBRATION_KEY, "standard", "snapshot_delta"',
+    'self.mod.RATE_CARD_CALIBRATION_KEY, self.mod._quota_mode(False), "snapshot_delta"',
+)
+t = t.replace(
+    '(self.mod.RATE_CARD_CALIBRATION_KEY,),',
+    '(self.mod.RATE_CARD_CALIBRATION_KEY,),',
