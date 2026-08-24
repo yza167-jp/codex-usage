@@ -1,0 +1,200 @@
+            return model
+    return None
+'''
+s = replace_function(s, 'normalize_model', normalize_model_block)
+
+s = replace_function(s, '_line_is_relevant', '''def _line_is_relevant(raw: bytes) -> bool:
+    # Record type/settings live near the beginning of Codex JSONL lines.
+    head = raw[:4096]
+    if b"session_meta" in head or b"turn_context" in head:
+        return True
+    if b"thread_settings_applied" in head or b'"service_tier"' in head or b'"serviceTier"' in head:
+        return True
+    return b"event_msg" in head and b"token_count" in head
+''')
+
+s = replace_function(s, '_apply_record', '''def _apply_record(
+    session: RawSession,
+    rec: dict,
+    current_model: str,
+    current_service_tier: str,
+    own_meta_seen: bool,
+):
+    """Apply one relevant JSONL record.
+
+    Returns ``(model, service_tier, own_meta_seen, usage_event)``. Tier settings
+    are stateful because token_count records are cumulative snapshots emitted
+    after the request whose model/tier was applied.
+    """
+    rtype = rec.get("type")
+    payload = rec.get("payload") or {}
+    ts = parse_ts(rec.get("timestamp"))
+    event = None
+
+    if rtype == "session_meta" and isinstance(payload, dict):
+        if not own_meta_seen:
+            own_meta_seen = True
+            sid = payload.get("id") or payload.get("session_id")
+            if sid:
+                session.session_id = str(sid)
+            session.cwd = str(payload.get("cwd") or "")
+            session.source = payload.get("source") or ""
+            session.thread_source = payload.get("thread_source") or ""
+            session.originator = str(payload.get("originator") or "")
+            session.parent_id = str(payload.get("parent_thread_id") or "")
+            session.forked_from_id = str(payload.get("forked_from_id") or "")
+            session.model_provider = str(payload.get("model_provider") or "")
+            session.created_at = (
+                parse_ts(payload.get("created_at"))
+                or parse_ts(payload.get("timestamp"))
+                or ts
+            )
+        model = _mapping_model(payload)
+        tier = _mapping_service_tier(payload)
+        if model:
+            current_model = model
+        if tier is not None:
+            current_service_tier = tier
+        return current_model, current_service_tier, own_meta_seen, None
+
+    if rtype == "turn_context" and isinstance(payload, dict):
+        current_model = normalize_model(payload.get("model") or current_model)
+        tier = _mapping_service_tier(payload)
+        if tier is not None:
+            current_service_tier = tier
+        return current_model, current_service_tier, own_meta_seen, None
+
+    if rtype == "event_msg" and isinstance(payload, dict):
+        event_type = str(payload.get("type") or "")
+        if event_type in ("thread_settings_applied", "thread_settings", "turn_context"):
+            model = _mapping_model(payload)
+            tier = _mapping_service_tier(payload)
+            if model:
+                current_model = model
+            if tier is not None:
+                current_service_tier = tier
+        else:
+            # Some Codex versions place the applied service tier directly on a
+            # token/event payload rather than in a dedicated settings snapshot.
+            tier = _mapping_service_tier(payload)
+            if tier is not None:
+                current_service_tier = tier
+
+        if event_type == "token_count":
+            info = payload.get("info") or {}
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if isinstance(total, dict) and ts is not None:
+                event = UsageEvent(
+                    ts=ts,
+                    cumulative=Usage.from_dict(total),
+                    model=current_model,
+                    service_tier=current_service_tier,
+                )
+    return current_model, current_service_tier, own_meta_seen, event
+''')
+
+s = replace_function(s, 'parse_rollout', '''def parse_rollout(path: Path) -> Optional[RawSession]:
+    """Full parse used by --no-cache; binary/pre-filtered to minimize allocations."""
+    session = RawSession(session_id=id_from_filename(path), path=path)
+    own_meta_seen = False
+    current_model = "unknown"
+    current_service_tier = SERVICE_TIER_UNKNOWN
+
+    try:
+        fh = path.open("rb", buffering=4 * 1024 * 1024)
+    except OSError:
+        return None
+
+    with fh:
+        for raw in fh:
+            if not raw.startswith(b"{") or not _line_is_relevant(raw):
+                continue
+            try:
+                rec = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, MemoryError):
+                session.malformed_lines += 1
+                continue
+            current_model, current_service_tier, own_meta_seen, event = _apply_record(
+                session, rec, current_model, current_service_tier, own_meta_seen
+            )
+            if event is not None:
+                session.usage_events.append(event)
+
+    if not own_meta_seen and not session.usage_events:
+        return None
+    if session.created_at is None and session.usage_events:
+        session.created_at = session.usage_events[0].ts
+    return session
+''')
+
+# Cache schema/state additions. A schema-version bump forces token-event
+# re-indexing so existing rows can be associated with persisted tier settings.
+s = replace_once(
+    s,
+    '''            current_model TEXT NOT NULL DEFAULT 'unknown',
+            own_meta_seen INTEGER NOT NULL DEFAULT 0,
+''',
+    '''            current_model TEXT NOT NULL DEFAULT 'unknown',
+            current_service_tier TEXT NOT NULL DEFAULT 'unknown',
+            own_meta_seen INTEGER NOT NULL DEFAULT 0,
+''',
+    'files current tier column',
+)
+s = replace_once(
+    s,
+    '''            ts TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+''',
+    '''            ts TEXT NOT NULL,
+            model TEXT NOT NULL,
+            service_tier TEXT NOT NULL DEFAULT 'unknown',
+            input_tokens INTEGER NOT NULL,
+''',
+    'events tier column',
+)
+s = replace_once(
+    s,
+    '''    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+''',
+    '''    # CREATE TABLE IF NOT EXISTS does not add columns to an existing v2
+    # cache. Add them before checking the schema version, then clear token/file
+    # rows so they are replayed with tier-aware state.
+    for table, column, declaration in (
+        ("files", "current_service_tier", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("events", "service_tier", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ):
+        columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+''',
+    'cache migration insertion',
+)
+
+s = replace_function(s, '_scan_file_into_cache', '''def _scan_file_into_cache(
+    conn: sqlite3.Connection,
+    path: Path,
+    stats: CacheStats,
+    force_reset: bool = False,
+) -> None:
+    p = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return
+
+    row = conn.execute("SELECT * FROM files WHERE path=?", (p,)).fetchone()
+    reset = force_reset
+    start_offset = 0
+    current_model = "unknown"
+    current_service_tier = SERVICE_TIER_UNKNOWN
+    own_meta_seen = False
+
+    if row is not None and not force_reset:
+        same_identity = (
+            int(row["dev"]) == _sqlite_i64(st.st_dev)
+            and int(row["ino"]) == _sqlite_i64(st.st_ino)
+        )
+        old_size = int(row["observed_size"])
