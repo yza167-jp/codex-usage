@@ -1,0 +1,188 @@
+name: Refine v1.6.0 tier semantics
+
+on:
+  push:
+    branches:
+      - dev/v1.6.0-fast-aware
+
+permissions:
+  contents: write
+
+jobs:
+  refine:
+    if: ${{ !contains(github.event.head_commit.message, '[v160-refined]') && !contains(github.event.head_commit.message, '[v160-refine-failed]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/v1.6.0-fast-aware
+          fetch-depth: 0
+      - name: Apply semantic refinements and validate
+        shell: bash
+        run: |
+          set +e
+          python - <<'PY'
+          from pathlib import Path
+
+          script = Path('codex-usage')
+          s = script.read_text(encoding='utf-8')
+
+          old = '''        if event_type in ("thread_settings_applied", "thread_settings", "turn_context"):
+              model = _mapping_model(payload)
+              tier = _mapping_service_tier(payload)
+              if model:
+                  current_model = model
+              if tier is not None:
+                  current_service_tier = tier
+          else:
+          '''
+          # The indentation above is normalized below because this workflow's
+          # heredoc itself is indented by YAML.
+          old = old.replace('          ', '')
+          new = '''        if event_type == "thread_settings_applied":
+              # This event carries a full ThreadSettingsSnapshot. The official
+              # schema omits service_tier when the effective preference is the
+              # Standard/default tier, so absence here must actively clear Fast.
+              model = _mapping_model(payload)
+              tier = _mapping_service_tier(payload)
+              if model:
+                  current_model = model
+              current_service_tier = tier if tier is not None else SERVICE_TIER_STANDARD
+          elif event_type in ("thread_settings", "turn_context"):
+              model = _mapping_model(payload)
+              tier = _mapping_service_tier(payload)
+              if model:
+                  current_model = model
+              if tier is not None:
+                  current_service_tier = tier
+          else:
+          '''.replace('          ', '')
+          if old not in s:
+              raise SystemExit('thread settings block anchor missing')
+          s = s.replace(old, new, 1)
+
+          old = '''    if tier == SERVICE_TIER_UNKNOWN:
+              if assume_fast_unknown:
+                  return FAST_MULTIPLIERS.get(model, 1.0), True
+              # Standard is a conservative lower bound when this model supports Fast.
+              return 1.0, model not in FAST_MULTIPLIERS
+          '''.replace('          ', '')
+          new = '''    if tier == SERVICE_TIER_UNKNOWN:
+              if assume_fast_unknown:
+                  multiplier = FAST_MULTIPLIERS.get(model)
+                  return (multiplier, True) if multiplier is not None else (1.0, False)
+              # Standard is a conservative lower bound when this model supports Fast.
+              return 1.0, model not in FAST_MULTIPLIERS
+          '''.replace('          ', '')
+          if old not in s:
+              raise SystemExit('unknown tier multiplier anchor missing')
+          s = s.replace(old, new, 1)
+          script.write_text(s, encoding='utf-8')
+
+          tests = Path('tests/test_codex_usage.py')
+          t = tests.read_text(encoding='utf-8')
+          insert = r'''
+              def test_v160_full_settings_snapshot_without_tier_clears_fast(self):
+                  sid = "019ffabc-1234-7000-8000-123456789aab"
+                  now = datetime.now(timezone.utc)
+                  with tempfile.TemporaryDirectory() as td:
+                      path = Path(td) / f"rollout-{sid}.jsonl"
+                      records = [
+                          {"timestamp": now.isoformat(), "type": "session_meta", "payload": {"id": sid, "model_provider": "openai"}},
+                          {"timestamp": now.isoformat(), "type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {"model": "gpt-5.6-sol", "service_tier": "priority"}}},
+                          {"timestamp": (now + self.mod.timedelta(seconds=1)).isoformat(), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1_000_000, "total_tokens": 1_000_000}}}},
+                          {"timestamp": (now + self.mod.timedelta(seconds=2)).isoformat(), "type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {"model": "gpt-5.6-sol"}}},
+                          {"timestamp": (now + self.mod.timedelta(seconds=3)).isoformat(), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 2_000_000, "total_tokens": 2_000_000}}}},
+                      ]
+                      path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+                      session = self.mod.parse_rollout(path)
+                      deltas = self.mod.compute_deltas(session, {sid: session})
+                      self.assertEqual([d[2] for d in deltas], ["fast", "standard"])
+
+              def test_v160_fast_fallback_does_not_override_detected_standard(self):
+                  usage = self.mod.Usage(input_tokens=1_000_000, total_tokens=1_000_000)
+                  standard = self.mod.usage_key("gpt-5.6-sol", "standard")
+                  credits, complete = self.mod._credit_for_usage_with_completeness(standard, usage, True)
+                  self.assertAlmostEqual(credits, 125.0)
+                  self.assertTrue(complete)
+
+              def test_v160_unknown_fast_without_published_multiplier_stays_partial(self):
+                  usage = self.mod.Usage(input_tokens=1_000_000, total_tokens=1_000_000)
+                  unknown = self.mod.usage_key("gpt-5.3-codex", "unknown")
+                  credits, complete = self.mod._credit_for_usage_with_completeness(unknown, usage, True)
+                  self.assertAlmostEqual(credits, 43.75)
+                  self.assertFalse(complete)
+          '''
+          insert = '\n'.join(line[12:] if line.startswith('            ') else line for line in insert.splitlines())
+          anchor = '    def test_v160_cache_schema_persists_service_tier(self):\n'
+          if anchor not in t:
+              raise SystemExit('test insertion anchor missing')
+          t = t.replace(anchor, insert + '\n\n' + anchor, 1)
+          tests.write_text(t, encoding='utf-8')
+
+          readme = Path('README.md')
+          r = readme.read_text(encoding='utf-8')
+          marker = 'The v1.6 cache schema re-indexes token events once so each event can store `service_tier`.'
+          replacement = ('A persisted `thread_settings_applied` item is a full settings snapshot: if its optional '
+                         '`service_tier` field is absent, v1.6 treats that snapshot as Standard/default rather than '
+                         'carrying a previous Fast setting forward.\n\n' + marker)
+          if marker not in r:
+              raise SystemExit('README marker missing')
+          readme.write_text(r.replace(marker, replacement, 1), encoding='utf-8')
+
+          zh = Path('README.zh-CN.md')
+          z = zh.read_text(encoding='utf-8')
+          old_zh = '`--fast` 现在只会对无法从本地记录确定档位的 Unknown 段对支持的模型应用内置 Fast multiplier。由于历史 service tier 并不总是可靠写入 token event，`--fast` 的含义是“假设本次报告里的可用 usage 都使用 Fast”。'
+          new_zh = '`codex-usage` 会从持久化的 `turn_context` / `thread_settings_applied` 设置重建实际档位；`priority` 视为 Fast。缺少档位标记时默认按 Standard 给出保守下界；`--fast` 只把这些 Unknown 段按 Fast 估算，不会覆盖已经识别出的 Standard / Fast。'
+          if old_zh not in z:
+              raise SystemExit('Chinese README anchor missing')
+          zh.write_text(z.replace(old_zh, new_zh, 1), encoding='utf-8')
+
+          changelog = Path('CHANGELOG.md')
+          c = changelog.read_text(encoding='utf-8')
+          marker = '- Normalized `priority`/`fast` to Fast and `default`/null to Standard; one session can now contain separately priced Standard and Fast segments.\n'
+          addition = marker + '- Treated an omitted `service_tier` in the full `thread_settings_applied` snapshot as Standard/default, so switching Fast off cannot leave stale Fast state in local accounting.\n'
+          if marker not in c:
+              raise SystemExit('changelog marker missing')
+          changelog.write_text(c.replace(marker, addition, 1), encoding='utf-8')
+          PY
+          patch_status=$?
+
+          {
+            echo '== compile =='
+            if [ "$patch_status" -eq 0 ]; then python -m py_compile codex-usage; else false; fi
+            compile_status=$?
+            if [ "$compile_status" -eq 0 ]; then
+              echo '== unit tests =='
+              python -m unittest -v tests/test_codex_usage.py
+              test_status=$?
+            else
+              test_status=$compile_status
+            fi
+            if [ "$test_status" -eq 0 ]; then
+              echo '== CLI smoke =='
+              python codex-usage --version
+              python codex-usage --help >/dev/null
+              smoke_status=$?
+            else
+              smoke_status=$test_status
+            fi
+          } > /tmp/v160-refine.log 2>&1
+          status=$smoke_status
+          cat /tmp/v160-refine.log
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/refine-v160.yml
+          if [ "$status" -eq 0 ]; then
+            rm -f V160_REFINE_FAILURE.log
+            git add -A
+            git commit -m 'Refine Fast snapshot semantics [v160-refined]'
+            git push origin HEAD:dev/v1.6.0-fast-aware
+            exit 0
+          fi
+          cp /tmp/v160-refine.log V160_REFINE_FAILURE.log
+          git add -A
+          git commit -m 'Record v1.6.0 refinement failure [v160-refine-failed]'
+          git push origin HEAD:dev/v1.6.0-fast-aware
+          exit "$status"
