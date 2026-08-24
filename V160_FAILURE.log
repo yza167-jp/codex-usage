@@ -1,7 +1,0 @@
-== patcher compile ==
-== apply patch ==
-== script compile ==
-  File "codex-usage", line 1386
-    if not raw.endswith(b"
-                        ^
-SyntaxError: unterminated string literal (detected at line 1386)

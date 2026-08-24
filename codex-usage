@@ -1383,8 +1383,7 @@ def _scan_file_into_cache(
             if not raw:
                 break
             stats.bytes_read += len(raw)
-            if not raw.endswith(b"
-"):
+            if not raw.endswith(b"\n"):
                 break
             last_complete_offset = fh.tell()
             if not raw.startswith(b"{") or not _line_is_relevant(raw):
