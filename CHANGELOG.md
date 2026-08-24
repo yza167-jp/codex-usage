@@ -4,6 +4,7 @@
 
 - Added automatic per-delta service-tier attribution from local `turn_context` and `thread_settings_applied` records.
 - Normalized `priority`/`fast` to Fast and `default`/null to Standard; one session can now contain separately priced Standard and Fast segments.
+- Treated an omitted `service_tier` in the full `thread_settings_applied` snapshot as Standard/default, preventing stale Fast state after Fast is switched off.
 - Changed `--fast` from a global override into an Unknown-tier fallback. Detected Standard/Fast segments are never overwritten.
 - Added `TIER(S)` to the summary plus service-tier, model-tier, and agent-tier breakdowns in DETAILS.
 - Applied published Fast multipliers only to detected/assumed Fast segments. Unknown/Flex segments use conservative lower-bound semantics (`CREDITS* +`, `WEEKLY≈ ≥x%`).

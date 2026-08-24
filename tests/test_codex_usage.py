@@ -560,6 +560,37 @@ class CodexUsageSmokeTests(unittest.TestCase):
             self.assertTrue(complete)
             self.assertEqual(self.mod.tier_label(bucket.usage_by_model.keys()), "MIXED")
 
+    def test_v160_full_settings_snapshot_without_tier_clears_fast(self):
+        sid = "019ffabc-1234-7000-8000-123456789aab"
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / f"rollout-{sid}.jsonl"
+            records = [
+                {"timestamp": now.isoformat(), "type": "session_meta", "payload": {"id": sid, "model_provider": "openai"}},
+                {"timestamp": now.isoformat(), "type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {"model": "gpt-5.6-sol", "service_tier": "priority"}}},
+                {"timestamp": (now + self.mod.timedelta(seconds=1)).isoformat(), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1_000_000, "total_tokens": 1_000_000}}}},
+                {"timestamp": (now + self.mod.timedelta(seconds=2)).isoformat(), "type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {"model": "gpt-5.6-sol"}}},
+                {"timestamp": (now + self.mod.timedelta(seconds=3)).isoformat(), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 2_000_000, "total_tokens": 2_000_000}}}},
+            ]
+            path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+            session = self.mod.parse_rollout(path)
+            deltas = self.mod.compute_deltas(session, {sid: session})
+            self.assertEqual([d[2] for d in deltas], ["fast", "standard"])
+
+    def test_v160_fast_fallback_does_not_override_detected_standard(self):
+        usage = self.mod.Usage(input_tokens=1_000_000, total_tokens=1_000_000)
+        standard = self.mod.usage_key("gpt-5.6-sol", "standard")
+        credits, complete = self.mod._credit_for_usage_with_completeness(standard, usage, True)
+        self.assertAlmostEqual(credits, 125.0)
+        self.assertTrue(complete)
+
+    def test_v160_unknown_fast_without_published_multiplier_stays_partial(self):
+        usage = self.mod.Usage(input_tokens=1_000_000, total_tokens=1_000_000)
+        unknown = self.mod.usage_key("gpt-5.3-codex", "unknown")
+        credits, complete = self.mod._credit_for_usage_with_completeness(unknown, usage, True)
+        self.assertAlmostEqual(credits, 43.75)
+        self.assertFalse(complete)
+
     def test_v160_cache_schema_persists_service_tier(self):
         with tempfile.TemporaryDirectory() as td:
             conn = self.mod._cache_connect(Path(td) / "index.sqlite3")

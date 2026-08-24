@@ -814,7 +814,16 @@ def _apply_record(
 
     if rtype == "event_msg" and isinstance(payload, dict):
         event_type = str(payload.get("type") or "")
-        if event_type in ("thread_settings_applied", "thread_settings", "turn_context"):
+        if event_type == "thread_settings_applied":
+            # ThreadSettingsApplied carries a full ThreadSettingsSnapshot. Its
+            # optional service_tier field is omitted for the Standard/default
+            # tier, so absence here must actively clear an earlier Fast state.
+            model = _mapping_model(payload)
+            tier = _mapping_service_tier(payload)
+            if model:
+                current_model = model
+            current_service_tier = tier if tier is not None else SERVICE_TIER_STANDARD
+        elif event_type in ("thread_settings", "turn_context"):
             model = _mapping_model(payload)
             tier = _mapping_service_tier(payload)
             if model:
@@ -2358,7 +2367,8 @@ def _tier_multiplier(model: str, tier: str, assume_fast_unknown: bool) -> Tuple[
         return (multiplier, True) if multiplier is not None else (1.0, False)
     if tier == SERVICE_TIER_UNKNOWN:
         if assume_fast_unknown:
-            return FAST_MULTIPLIERS.get(model, 1.0), True
+            multiplier = FAST_MULTIPLIERS.get(model)
+            return (multiplier, True) if multiplier is not None else (1.0, False)
         # Standard is a conservative lower bound when this model supports Fast.
         return 1.0, model not in FAST_MULTIPLIERS
     # Flex is kept distinct in reports. Until a Codex subscription credit rule

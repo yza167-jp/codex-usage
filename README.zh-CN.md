@@ -331,7 +331,7 @@ credits* = uncached input component + cached input component + output component
 
 Reasoning tokens 是 output 的细分，不会重复收费。
 
-`--fast` 现在只会对无法从本地记录确定档位的 Unknown 段对支持的模型应用内置 Fast multiplier。由于历史 service tier 并不总是可靠写入 token event，`--fast` 的含义是“假设本次报告里的可用 usage 都使用 Fast”。
+`codex-usage` 会从持久化的 `turn_context` / `thread_settings_applied` 设置重建实际档位；`priority` 视为 Fast。缺少档位标记时默认按 Standard 给出保守下界；`--fast` 只把这些 Unknown 段按 Fast 估算，不会覆盖已经识别出的 Standard / Fast。
 
 `CREDITS*` 与 `WEEKLY≈` 都不是 OpenAI 官方服务端账单/额度 meter。
 

@@ -18,6 +18,8 @@ Standard          2.8%      490.0       34.1%
 
 For older/truncated records with no persisted tier marker, the default estimate uses Standard pricing as a conservative lower bound and marks the row with `+` / `≥`. `--fast` is retained as an explicit fallback, but now resolves **only Unknown segments** as Fast; it never overrides a detected Standard or Fast setting.
 
+A persisted `thread_settings_applied` item is a full settings snapshot: when its optional `service_tier` field is absent, v1.6 treats it as Standard/default instead of carrying an earlier Fast setting forward.
+
 The v1.6 cache schema re-indexes token events once so each event can store `service_tier`. Quota calibration is also revisioned because tier-aware credits use a different coordinate system from v1.5's global Standard/Fast assumptions.
 
 ## v1.5.5: weekly-first usage
