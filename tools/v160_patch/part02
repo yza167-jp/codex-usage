@@ -1,0 +1,200 @@
+        old_offset = int(row["offset"])
+        same_snapshot = (
+            same_identity
+            and old_size == int(st.st_size)
+            and int(row["mtime_ns"]) == int(st.st_mtime_ns)
+            and old_offset >= int(st.st_size)
+        )
+        if same_snapshot:
+            stats.cache_hits += 1
+            return
+
+        append_only = same_identity and int(st.st_size) >= old_size
+        if int(st.st_size) == old_size and int(st.st_mtime_ns) != int(row["mtime_ns"]):
+            append_only = False
+        if append_only:
+            start_offset = min(old_offset, int(st.st_size))
+            current_model = str(row["current_model"] or "unknown")
+            current_service_tier = str(row["current_service_tier"] or SERVICE_TIER_UNKNOWN)
+            own_meta_seen = bool(row["own_meta_seen"])
+            session = _session_from_cache_row(row, path)
+            stats.incremental_scans += 1
+        else:
+            reset = True
+    else:
+        session = RawSession(session_id=id_from_filename(path), path=path)
+        stats.cold_scans += 1
+
+    if reset:
+        conn.execute("DELETE FROM events WHERE path=?", (p,))
+        conn.execute("DELETE FROM files WHERE path=?", (p,))
+        session = RawSession(session_id=id_from_filename(path), path=path)
+        start_offset = 0
+        current_model = "unknown"
+        current_service_tier = SERVICE_TIER_UNKNOWN
+        own_meta_seen = False
+        if row is not None:
+            stats.cold_scans += 1
+
+    last_complete_offset = start_offset
+    try:
+        fh = path.open("rb", buffering=4 * 1024 * 1024)
+    except OSError:
+        return
+
+    with fh:
+        fh.seek(start_offset)
+        while True:
+            line_start = fh.tell()
+            raw = fh.readline()
+            if not raw:
+                break
+            stats.bytes_read += len(raw)
+            if not raw.endswith(b"\n"):
+                break
+            last_complete_offset = fh.tell()
+            if not raw.startswith(b"{") or not _line_is_relevant(raw):
+                continue
+            try:
+                rec = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, MemoryError):
+                session.malformed_lines += 1
+                continue
+            stats.parsed_records += 1
+            current_model, current_service_tier, own_meta_seen, event = _apply_record(
+                session, rec, current_model, current_service_tier, own_meta_seen
+            )
+            if event is not None:
+                u = event.cumulative
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO events(
+                        path,byte_offset,ts,model,service_tier,input_tokens,cached_input_tokens,
+                        output_tokens,reasoning_output_tokens,total_tokens
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        p, line_start, event.ts.astimezone(timezone.utc).isoformat(), event.model,
+                        event.service_tier, u.input_tokens, u.cached_input_tokens, u.output_tokens,
+                        u.reasoning_output_tokens, u.total_tokens,
+                    ),
+                )
+
+    try:
+        st2 = path.stat()
+    except OSError:
+        st2 = st
+
+    if session.created_at is None:
+        first = conn.execute(
+            "SELECT ts FROM events WHERE path=? ORDER BY byte_offset LIMIT 1", (p,)
+        ).fetchone()
+        if first is not None:
+            session.created_at = parse_ts(first[0])
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO files(
+            path,dev,ino,observed_size,mtime_ns,offset,session_id,current_model,
+            current_service_tier,own_meta_seen,created_at,cwd,source_json,thread_source_json,originator,
+            parent_id,forked_from_id,model_provider,malformed_lines
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            p, _sqlite_i64(st2.st_dev), _sqlite_i64(st2.st_ino), int(st2.st_size), int(st2.st_mtime_ns),
+            int(last_complete_offset), session.session_id, current_model, current_service_tier,
+            1 if own_meta_seen else 0,
+            session.created_at.astimezone(timezone.utc).isoformat() if session.created_at else None,
+            session.cwd, _json_text(session.source), _json_text(session.thread_source),
+            session.originator, session.parent_id, session.forked_from_id,
+            session.model_provider, session.malformed_lines,
+        ),
+    )
+''')
+
+s = replace_function(s, '_load_sessions_from_cache', '''def _load_sessions_from_cache(conn: sqlite3.Connection, live_paths: set) -> Dict[str, RawSession]:
+    sessions: Dict[str, RawSession] = {}
+    rows = list(conn.execute("SELECT * FROM files ORDER BY mtime_ns"))
+    for row in rows:
+        p = str(row["path"])
+        if p not in live_paths:
+            continue
+        session = _session_from_cache_row(row, Path(p))
+        for erow in conn.execute(
+            """
+            SELECT ts,model,service_tier,input_tokens,cached_input_tokens,output_tokens,
+                   reasoning_output_tokens,total_tokens
+            FROM events WHERE path=? ORDER BY byte_offset
+            """,
+            (p,),
+        ):
+            ts = parse_ts(erow["ts"])
+            if ts is None:
+                continue
+            session.usage_events.append(
+                UsageEvent(
+                    ts=ts,
+                    model=str(erow["model"]),
+                    service_tier=str(erow["service_tier"] or SERVICE_TIER_UNKNOWN),
+                    cumulative=Usage(
+                        input_tokens=int(erow["input_tokens"]),
+                        cached_input_tokens=int(erow["cached_input_tokens"]),
+                        output_tokens=int(erow["output_tokens"]),
+                        reasoning_output_tokens=int(erow["reasoning_output_tokens"]),
+                        total_tokens=int(erow["total_tokens"]),
+                    ),
+                )
+            )
+        if session.created_at is None and session.usage_events:
+            session.created_at = session.usage_events[0].ts
+        sessions[session.session_id] = session
+    return sessions
+''')
+
+s = replace_function(s, 'compute_deltas', '''def compute_deltas(
+    session: RawSession,
+    sessions: Dict[str, RawSession],
+) -> List[Tuple[datetime, str, str, Usage]]:
+    inherited = inherited_usage_keys(session, sessions)
+    parent_baseline = baseline_from_parent(session, sessions)
+    has_parent = bool(session.lineage_parent())
+
+    prev = Usage()
+    if parent_baseline is not None:
+        prev = parent_baseline
+
+    deltas: List[Tuple[datetime, str, str, Usage]] = []
+    first_usage_seen = False
+
+    for ev in session.usage_events:
+        cur = ev.cumulative
+
+        if cur.key() in inherited:
+            prev = cur
+            first_usage_seen = True
+            continue
+
+        if has_parent and parent_baseline is None and not inherited and not first_usage_seen:
+            prev = cur
+            first_usage_seen = True
+            continue
+
+        delta = cur.minus(prev)
+        prev = cur
+        first_usage_seen = True
+        if delta.nonzero():
+            deltas.append((ev.ts, ev.model, ev.service_tier, delta))
+
+    return deltas
+''')
+
+pricing_block = '''def model_is_chatgpt_openai(session: RawSession, model: str) -> bool:
+    base_model, _ = split_usage_key(model)
+    provider = (session.model_provider or "").strip().lower()
+    if provider and provider not in ("openai", "chatgpt"):
+        return False
+    return base_model in RATE_CARD
+
+
+def _tier_multiplier(model: str, tier: str, assume_fast_unknown: bool) -> Tuple[float, bool]:
+    """Return (multiplier, estimate_complete_for_tier)."""
