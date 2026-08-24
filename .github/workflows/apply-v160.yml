@@ -1,0 +1,79 @@
+name: Apply v1.6.0 Fast-aware upgrade
+
+on:
+  push:
+    branches:
+      - dev/v1.6.0-fast-aware
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[v160-applied]') && !contains(github.event.head_commit.message, '[v160-failed]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/v1.6.0-fast-aware
+          fetch-depth: 0
+      - name: Apply patch and validate
+        shell: bash
+        run: |
+          set +e
+          cat tools/v160_patch/part* > /tmp/upgrade_v160.py
+          {
+            echo '== patcher compile =='
+            python -m py_compile /tmp/upgrade_v160.py
+            patch_compile=$?
+            if [ "$patch_compile" -eq 0 ]; then
+              echo '== apply patch =='
+              python /tmp/upgrade_v160.py
+              patch_status=$?
+            else
+              patch_status=$patch_compile
+            fi
+            if [ "$patch_status" -eq 0 ]; then
+              echo '== script compile =='
+              python -m py_compile codex-usage
+              script_compile=$?
+            else
+              script_compile=$patch_status
+            fi
+            if [ "$script_compile" -eq 0 ]; then
+              echo '== unit tests =='
+              python -m unittest -v tests/test_codex_usage.py
+              test_status=$?
+            else
+              test_status=$script_compile
+            fi
+            if [ "$test_status" -eq 0 ]; then
+              echo '== CLI smoke =='
+              python codex-usage --version
+              python codex-usage --help >/dev/null
+              smoke_status=$?
+            else
+              smoke_status=$test_status
+            fi
+          } > /tmp/v160.log 2>&1
+          status=$smoke_status
+          cat /tmp/v160.log
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/apply-v160.yml
+
+          if [ "$status" -eq 0 ]; then
+            rm -rf tools/v160_patch
+            rm -f V160_FAILURE.log
+            git add -A
+            git commit -m 'Implement tier-aware Fast accounting for v1.6.0 [v160-applied]'
+            git push origin HEAD:dev/v1.6.0-fast-aware
+            exit 0
+          fi
+
+          cp /tmp/v160.log V160_FAILURE.log
+          git add -A
+          git commit -m 'Record v1.6.0 patch failure [v160-failed]'
+          git push origin HEAD:dev/v1.6.0-fast-aware
+          exit "$status"
