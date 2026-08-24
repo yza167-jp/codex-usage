@@ -101,43 +101,26 @@ s = replace_once(
 s = replace_function(s, '_quota_mode', '''def _quota_mode(fast: bool) -> str:
     return "tier_auto_assume_fast" if fast else "tier_auto"
 ''')
-s = replace_once(
-    s,
-    '''    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
-    mode = "fast" if fast else "standard"
-    rows = list(conn.execute(
-''',
-    '''    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
-    mode = _quota_mode(fast)
-    rows = list(conn.execute(
-''',
-    'load calibration mode',
+
+# Patch the legacy-anchor reader inside its own function so generic text shared
+# with load_quota_calibration cannot select the wrong occurrence.
+legacy_start = s.index('def _legacy_rebase_candidates(')
+legacy_end = s.index('def _try_rebase_legacy_observation(', legacy_start)
+legacy_segment = s[legacy_start:legacy_end]
+legacy_segment = replace_once(
+    legacy_segment,
+    '    mode = "fast" if fast else "standard"\n',
+    '    mode = _quota_mode(fast)\n    legacy_mode = "fast" if fast else "standard"\n',
+    'legacy mode variables',
 )
-s = replace_once(
-    s,
-    '''    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
-    mode = "fast" if fast else "standard"
-    rows = list(conn.execute(
-        """
-        SELECT snapshot_ts,used_percent,reset_at,window_minutes
-        FROM quota_observations
-        WHERE account_key=? AND plan_type=? AND credit_mode=?
-          AND rate_card<>? AND snapshot_ts<=?
-''',
-    '''    plan = (snapshot.plan_type or auth.plan_type or "unknown").lower()
-    mode = _quota_mode(fast)
-    legacy_mode = "fast" if fast else "standard"
-    rows = list(conn.execute(
-        """
-        SELECT snapshot_ts,used_percent,reset_at,window_minutes
-        FROM quota_observations
-        WHERE account_key=? AND plan_type=? AND credit_mode IN (?,?)
-          AND rate_card<>? AND snapshot_ts<=?
-''',
+legacy_segment = replace_once(
+    legacy_segment,
+    'WHERE account_key=? AND plan_type=? AND credit_mode=?\n          AND rate_card<>? AND snapshot_ts<=?',
+    'WHERE account_key=? AND plan_type=? AND credit_mode IN (?,?)\n          AND rate_card<>? AND snapshot_ts<=?',
     'legacy modes query',
 )
-s = replace_once(
-    s,
+legacy_segment = replace_once(
+    legacy_segment,
     '''            auth.account_key,
             plan,
             mode,
@@ -151,6 +134,20 @@ s = replace_once(
 ''',
     'legacy modes params',
 )
+s = s[:legacy_start] + legacy_segment + s[legacy_end:]
+
+# Patch the current calibration loader independently.
+load_start = s.index('def load_quota_calibration(')
+load_end = s.index('def load_thread_index(', load_start)
+load_segment = s[load_start:load_end]
+load_segment = replace_once(
+    load_segment,
+    '    mode = "fast" if fast else "standard"\n',
+    '    mode = _quota_mode(fast)\n',
+    'load calibration mode',
+)
+s = s[:load_start] + load_segment + s[load_end:]
+
 
 # Header/summary layout: add a compact tier column and update mode semantics.
 s = replace_once(
