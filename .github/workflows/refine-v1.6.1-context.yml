@@ -1,0 +1,50 @@
+name: Refine v1.6.1 project context
+
+on:
+  push:
+    branches:
+      - dev/v1.6.1-session-labels
+
+permissions:
+  contents: write
+
+jobs:
+  refine:
+    if: ${{ !contains(github.event.head_commit.message, '[v161-context]') && !contains(github.event.head_commit.message, '[v161-context-failed]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/v1.6.1-session-labels
+          fetch-depth: 0
+      - name: Apply context priority and validate
+        shell: bash
+        run: |
+          set +e
+          {
+            python tools/refine_v161_context.py
+            patch_status=$?
+            if [ "$patch_status" -eq 0 ]; then python -m py_compile codex-usage; else false; fi
+            compile_status=$?
+            if [ "$compile_status" -eq 0 ]; then python -m unittest -v tests/test_codex_usage.py; else false; fi
+            test_status=$?
+            if [ "$test_status" -eq 0 ]; then python codex-usage --version && python codex-usage --help >/dev/null; else false; fi
+            smoke_status=$?
+          } > /tmp/v161-context.log 2>&1
+          status=$smoke_status
+          cat /tmp/v161-context.log
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/refine-v1.6.1-context.yml tools/refine_v161_context.py
+          if [ "$status" -eq 0 ]; then
+            rm -f V161_CONTEXT_FAILURE.log
+            git add -A
+            git commit -m 'Prefer cwd project context [v161-context]'
+            git push origin HEAD:dev/v1.6.1-session-labels
+            exit 0
+          fi
+          cp /tmp/v161-context.log V161_CONTEXT_FAILURE.log
+          git add -A
+          git commit -m 'Record v1.6.1 context failure [v161-context-failed]'
+          git push origin HEAD:dev/v1.6.1-session-labels
+          exit "$status"
