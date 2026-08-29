@@ -697,8 +697,10 @@ class CodexUsageSmokeTests(unittest.TestCase):
         buckets = {first.session_id: first, second.session_id: second}
         self.mod._disambiguate_bucket_titles(buckets)
         self.assertNotEqual(first.title, second.title)
-        self.assertTrue(first.title.endswith(first.session_id[:12]))
-        self.assertTrue(second.title.endswith(second.session_id[:12]))
+        self.assertTrue(first.title.startswith("[project] #"))
+        self.assertTrue(second.title.startswith("[project] #"))
+        self.assertIn(first.session_id.replace("-", "")[-6:], first.title)
+        self.assertIn(second.session_id.replace("-", "")[-6:], second.title)
 
 
 

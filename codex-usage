@@ -2253,7 +2253,7 @@ def session_title(session: RawSession, index: Dict[str, dict]) -> str:
 
 
 def _disambiguate_bucket_titles(buckets: Dict[str, Bucket]) -> None:
-    """Give exact duplicate visible labels a stable short-session suffix."""
+    """Give exact duplicate labels a stable marker that survives truncation."""
     grouped: Dict[str, List[Bucket]] = {}
     for bucket in buckets.values():
         key = _clean_thread_label(bucket.title).casefold()
@@ -2262,9 +2262,17 @@ def _disambiguate_bucket_titles(buckets: Dict[str, Bucket]) -> None:
         if len(group) < 2:
             continue
         for bucket in group:
-            suffix = bucket.session_id[:12]
-            if suffix and not bucket.title.endswith(suffix):
-                bucket.title = f"{bucket.title} · {suffix}"
+            compact_id = bucket.session_id.replace("-", "")
+            marker = f"#{compact_id[-6:]}" if compact_id else "#dup"
+            # Keep project context first, then insert the marker before the
+            # long prompt/name so a narrow SESSION column still distinguishes it.
+            if bucket.title.startswith("[") and "]" in bucket.title:
+                close = bucket.title.find("]") + 1
+                prefix = bucket.title[:close]
+                rest = bucket.title[close:].lstrip()
+                bucket.title = f"{prefix} {marker} {rest}" if rest else f"{prefix} {marker}"
+            else:
+                bucket.title = f"{marker} {bucket.title}"
 
 
 def get_tz(name: Optional[str]):
