@@ -1,5 +1,16 @@
 # codex-usage
 
+## v1.6.1: project-aware session labels
+
+The `SESSION` column now prefers the explicit name shown by Codex (`threads.name`) and prefixes it with the assigned Codex project when available. If no explicit name exists, the project is combined with Codex's preview/title; older state databases fall back to the repository/cwd name. This keeps templated prompts distinguishable across projects:
+
+```text
+[steerRL] Sparse-1 S3 comparison
+[knowing-to-see] Read AGENTS.md and continue the current stage
+```
+
+If two visible sessions still resolve to the exact same label, a stable short session ID is appended. DETAILS, JSON, and CSV expose the underlying session name, thread title, project ID, and project name. This update reads only `state_5.sqlite` metadata and does not require a token-cache rebuild.
+
 ## v1.6.0: automatic Fast-mode attribution
 
 v1.6.0 reads persisted Codex service-tier settings and associates each cumulative `token_count` delta with the tier that was active for that request. `priority` and `fast` are normalized to **Fast**; `default`/null are **Standard**. A single session can therefore be split into Standard and Fast portions instead of being priced under one global assumption.

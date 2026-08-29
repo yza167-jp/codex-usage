@@ -67,7 +67,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 RATE_CARD_AS_OF = "2026-08-12"
 RATE_CARD_CALIBRATION_KEY = "2026-08-12-r3-tier-aware"
 CACHE_SCHEMA_VERSION = 3
@@ -305,6 +305,10 @@ class Bucket:
     title: str = ""
     cwd: str = ""
     source: str = ""
+    session_name: str = ""
+    thread_title: str = ""
+    project_id: str = ""
+    project_name: str = ""
     usage_by_model: Dict[str, Usage] = field(default_factory=dict)
     # source session -> model -> usage. This preserves the main/subagent split
     # even when the default top-level view rolls child agents into their root.
@@ -2064,35 +2068,127 @@ def load_quota_calibration(
     return calibration
 
 
+def _clean_thread_label(value: object) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _cwd_project_label(raw_cwd: object) -> str:
+    cwd = str(raw_cwd or "").strip()
+    if not cwd:
+        return ""
+    try:
+        leaf = Path(cwd).expanduser().name
+    except (OSError, ValueError):
+        leaf = ""
+    return _clean_thread_label(leaf)
+
+
+def _git_origin_project_label(raw_url: object) -> str:
+    value = str(raw_url or "").strip().rstrip("/")
+    if not value:
+        return ""
+    tail = value.rsplit("/", 1)[-1]
+    if ":" in tail and "/" not in value:
+        tail = tail.rsplit(":", 1)[-1]
+    if tail.endswith(".git"):
+        tail = tail[:-4]
+    return _clean_thread_label(tail)
+
+
+def _path_is_within(cwd: str, root: str) -> bool:
+    try:
+        cwd_norm = os.path.normcase(os.path.abspath(os.path.expanduser(cwd)))
+        root_norm = os.path.normcase(os.path.abspath(os.path.expanduser(root)))
+        return os.path.commonpath((cwd_norm, root_norm)) == root_norm
+    except (OSError, ValueError):
+        return False
+
+
 def load_thread_index(codex_home: Path) -> Dict[str, dict]:
-    """Best-effort read of Codex's local thread index for titles/cwd."""
+    """Best-effort read of Codex thread names, projects, titles, and cwd.
+
+    Current Codex state databases distinguish an explicit user-facing thread
+    ``name`` from the generated ``title``/``preview`` and may assign a thread to
+    a named project. Older schemas remain supported through dynamic column and
+    table discovery.
+    """
     db = codex_home / "state_5.sqlite"
     if not db.exists():
         return {}
 
     result: Dict[str, dict] = {}
     try:
-        uri = _sqlite_ro_uri(db)
-        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        conn = sqlite3.connect(_sqlite_ro_uri(db), uri=True, timeout=1.0)
     except (sqlite3.Error, OSError):
         return {}
 
     try:
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(threads)")]
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "threads" not in tables:
+            return {}
+        cols = [str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")]
         if "id" not in cols:
             return {}
         wanted = [
             c for c in (
-                "id", "title", "cwd", "source", "thread_source",
-                "model_provider", "created_at", "updated_at", "rollout_path"
+                "id", "name", "title", "preview", "first_user_message",
+                "project_id", "cwd", "source", "thread_source", "agent_nickname",
+                "agent_role", "model_provider", "created_at", "updated_at",
+                "rollout_path", "git_origin_url", "git_branch",
             ) if c in cols
         ]
-        q = "SELECT " + ", ".join('"' + c.replace('"', '""') + '"' for c in wanted) + ' FROM "threads"'
+
+        project_names: Dict[str, str] = {}
+        if "projects" in tables:
+            project_cols = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(projects)")
+            }
+            if {"id", "name"}.issubset(project_cols):
+                for project_id, project_name in conn.execute("SELECT id,name FROM projects"):
+                    pid = str(project_id or "")
+                    name = _clean_thread_label(project_name)
+                    if pid and name:
+                        project_names[pid] = name
+
+        project_roots: List[Tuple[str, str, str]] = []
+        if "project_roots" in tables and project_names:
+            root_cols = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(project_roots)")
+            }
+            if {"project_id", "path"}.issubset(root_cols):
+                for project_id, root_path in conn.execute(
+                    "SELECT project_id,path FROM project_roots"
+                ):
+                    pid = str(project_id or "")
+                    root = str(root_path or "").strip()
+                    name = project_names.get(pid, "")
+                    if pid and root and name:
+                        project_roots.append((pid, name, root))
+                project_roots.sort(key=lambda item: len(item[2]), reverse=True)
+
+        q = "SELECT " + ", ".join(
+            '"' + c.replace('"', '""') + '"' for c in wanted
+        ) + ' FROM "threads"'
         for row in conn.execute(q):
             item = dict(zip(wanted, row))
             sid = str(item.get("id") or "")
-            if sid:
-                result[sid] = item
+            if not sid:
+                continue
+            project_id = str(item.get("project_id") or "")
+            project_name = project_names.get(project_id, "")
+            if not project_name:
+                cwd = str(item.get("cwd") or "")
+                for inferred_id, inferred_name, root in project_roots:
+                    if _path_is_within(cwd, root):
+                        project_id = inferred_id
+                        project_name = inferred_name
+                        break
+            item["project_id"] = project_id
+            item["project_name"] = project_name
+            result[sid] = item
     except sqlite3.Error:
         pass
     finally:
@@ -2100,17 +2196,75 @@ def load_thread_index(codex_home: Path) -> Dict[str, dict]:
     return result
 
 
-def session_title(session: RawSession, index: Dict[str, dict]) -> str:
+def session_label_metadata(session: RawSession, index: Dict[str, dict]) -> Dict[str, str]:
     dbrow = index.get(session.session_id, {})
-    title = str(dbrow.get("title") or "").strip()
-    if title:
-        return " ".join(title.split())
+    explicit_name = _clean_thread_label(dbrow.get("name"))
+    preview = _clean_thread_label(dbrow.get("preview"))
+    generated_title = _clean_thread_label(dbrow.get("title"))
+    first_user_message = _clean_thread_label(dbrow.get("first_user_message"))
+    agent_nickname = _clean_thread_label(dbrow.get("agent_nickname"))
+    agent_role = _clean_thread_label(dbrow.get("agent_role"))
+
+    if session.is_subagent() and not explicit_name:
+        if agent_nickname and agent_role:
+            explicit_name = f"{agent_nickname} ({agent_role})"
+        else:
+            explicit_name = agent_nickname or agent_role
+
+    thread_title = preview or generated_title or first_user_message
+    base = explicit_name or thread_title
+
+    project_id = str(dbrow.get("project_id") or "")
+    project_name = _clean_thread_label(dbrow.get("project_name"))
     cwd = str(dbrow.get("cwd") or session.cwd or "").strip()
-    if cwd:
-        name = Path(cwd).name
-        if name:
-            return name
-    return session.session_id[:12]
+    repo_name = _git_origin_project_label(dbrow.get("git_origin_url"))
+    context = project_name or repo_name or _cwd_project_label(cwd)
+
+    if not base:
+        base = context or session.session_id[:12]
+        context = ""
+
+    normalized_base = base.casefold().strip()
+    normalized_context = context.casefold().strip()
+    already_contextualized = bool(
+        context
+        and (
+            normalized_base == normalized_context
+            or normalized_base.startswith(f"[{normalized_context}]")
+            or normalized_base.startswith(normalized_context + " ·")
+            or normalized_base.startswith(normalized_context + ":")
+        )
+    )
+    display_title = (
+        f"[{context}] {base}" if context and not already_contextualized else base
+    )
+    return {
+        "display_title": display_title,
+        "session_name": explicit_name,
+        "thread_title": thread_title,
+        "project_id": project_id,
+        "project_name": project_name or context,
+        "cwd": cwd,
+    }
+
+
+def session_title(session: RawSession, index: Dict[str, dict]) -> str:
+    return session_label_metadata(session, index)["display_title"]
+
+
+def _disambiguate_bucket_titles(buckets: Dict[str, Bucket]) -> None:
+    """Give exact duplicate visible labels a stable short-session suffix."""
+    grouped: Dict[str, List[Bucket]] = {}
+    for bucket in buckets.values():
+        key = _clean_thread_label(bucket.title).casefold()
+        grouped.setdefault(key, []).append(bucket)
+    for group in grouped.values():
+        if len(group) < 2:
+            continue
+        for bucket in group:
+            suffix = bucket.session_id[:12]
+            if suffix and not bucket.title.endswith(suffix):
+                bucket.title = f"{bucket.title} · {suffix}"
 
 
 def get_tz(name: Optional[str]):
@@ -2772,7 +2926,8 @@ def make_buckets(
         bucket = buckets.get(target_id)
         if bucket is None:
             dbrow = index.get(target_id, {})
-            title = session_title(target_session, index)
+            label_meta = session_label_metadata(target_session, index)
+            title = label_meta["display_title"]
             if show_subagents and target_session.is_subagent():
                 title += f" [sub {short_sid(target_session.session_id)}]"
             elif (
@@ -2786,6 +2941,10 @@ def make_buckets(
                 title=title,
                 cwd=str(dbrow.get("cwd") or target_session.cwd or ""),
                 source=str(dbrow.get("source") or target_session.source or ""),
+                session_name=label_meta["session_name"],
+                thread_title=label_meta["thread_title"],
+                project_id=label_meta["project_id"],
+                project_name=label_meta["project_name"],
             )
             buckets[target_id] = bucket
 
@@ -2803,7 +2962,9 @@ def make_buckets(
                     service_tier=service_tier,
                 )
 
-    return {sid: b for sid, b in buckets.items() if b.total_usage().nonzero()}
+    visible = {sid: b for sid, b in buckets.items() if b.total_usage().nonzero()}
+    _disambiguate_bucket_titles(visible)
+    return visible
 
 
 def render_table(
@@ -3110,6 +3271,16 @@ def render_table(
             short_title = truncate(b.title, max(30, detail_width - 9))
             lines.append(color.wrap(f"DETAILS  {short_title}", *title_style))
             lines.append(f"session: {b.session_id}")
+            if b.project_name:
+                lines.append(f"project: {b.project_name}")
+            if b.session_name:
+                lines.append(f"Codex name: {b.session_name}")
+            if b.thread_title and b.thread_title != b.session_name:
+                lines.append(
+                    "thread title: " + truncate(
+                        b.thread_title, max(30, detail_width - display_width("thread title: "))
+                    )
+                )
             if b.cwd:
                 lines.append(f"cwd: {b.cwd}")
             if b.child_sessions:
@@ -3395,6 +3566,10 @@ def render_json(
         out["sessions"].append({
             "session_id": b.session_id,
             "title": b.title,
+            "session_name": b.session_name or None,
+            "thread_title": b.thread_title or None,
+            "project_id": b.project_id or None,
+            "project_name": b.project_name or None,
             "cwd": b.cwd,
             "thread_state": state,
             "thread_health": health,
@@ -3438,7 +3613,8 @@ def render_csv(
     sio = io.StringIO()
     writer = csv.writer(sio)
     writer.writerow([
-        "session_id", "title", "cwd", "models", "service_tiers", "credit_mode",
+        "session_id", "title", "session_name", "thread_title", "project_id",
+        "project_name", "cwd", "models", "service_tiers", "credit_mode",
         "input_tokens", "cached_input_tokens", "uncached_input_tokens", "output_tokens",
         "reasoning_output_tokens", "credit_estimate", "weekly_estimate_percent",
         "weekly_estimate_is_lower_bound", "cache_tax_credits", "subscription_plan",
@@ -3460,6 +3636,10 @@ def render_csv(
         writer.writerow([
             b.session_id,
             b.title,
+            b.session_name,
+            b.thread_title,
+            b.project_id,
+            b.project_name,
             b.cwd,
             ",".join(model_names(b.usage_by_model.keys())),
             ",".join(service_tiers(b.usage_by_model.keys())),

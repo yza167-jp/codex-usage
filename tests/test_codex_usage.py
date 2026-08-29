@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.6.0", proc.stdout)
+        self.assertIn("1.6.1", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -601,6 +601,105 @@ class CodexUsageSmokeTests(unittest.TestCase):
                 self.assertIn("service_tier", event_cols)
             finally:
                 conn.close()
+
+
+    def test_v161_prefers_codex_name_and_project_over_template_prompt(self):
+        sid_named = "019ffabc-1234-7000-8000-123456789101"
+        sid_template = "019ffabc-1234-7000-8000-123456789102"
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            db = sqlite3.connect(home / "state_5.sqlite")
+            db.executescript(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    title TEXT,
+                    preview TEXT,
+                    first_user_message TEXT,
+                    project_id TEXT,
+                    cwd TEXT,
+                    source TEXT,
+                    thread_source TEXT,
+                    agent_nickname TEXT,
+                    agent_role TEXT,
+                    model_provider TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    rollout_path TEXT,
+                    git_origin_url TEXT,
+                    git_branch TEXT
+                );
+                CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE project_roots (
+                    project_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    PRIMARY KEY(project_id, position)
+                );
+                """
+            )
+            db.execute("INSERT INTO projects(id,name) VALUES(?,?)", ("p1", "steerRL"))
+            db.execute("INSERT INTO projects(id,name) VALUES(?,?)", ("p2", "knowing-to-see"))
+            template = "读取 AGENTS.md、docs/PROJECT_STATUS.md，并继续推进当前任务"
+            db.execute(
+                "INSERT INTO threads(id,name,title,preview,project_id,cwd) VALUES(?,?,?,?,?,?)",
+                (sid_named, "Sparse-1 S3 对比实验", template, template, "p1", "/tmp/steerRL"),
+            )
+            db.execute(
+                "INSERT INTO threads(id,name,title,preview,project_id,cwd) VALUES(?,?,?,?,?,?)",
+                (sid_template, None, template, template, "p2", "/tmp/knowing-to-see"),
+            )
+            db.commit()
+            db.close()
+
+            index = self.mod.load_thread_index(home)
+            named = self.mod.RawSession(sid_named, Path("named.jsonl"), cwd="/tmp/steerRL")
+            templated = self.mod.RawSession(sid_template, Path("template.jsonl"), cwd="/tmp/knowing-to-see")
+            self.assertEqual(index[sid_named]["project_name"], "steerRL")
+            self.assertEqual(
+                self.mod.session_title(named, index),
+                "[steerRL] Sparse-1 S3 对比实验",
+            )
+            self.assertEqual(
+                self.mod.session_title(templated, index),
+                f"[knowing-to-see] {template}",
+            )
+
+    def test_v161_old_state_schema_uses_cwd_project_context(self):
+        sid = "019ffabc-1234-7000-8000-123456789103"
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            db = sqlite3.connect(home / "state_5.sqlite")
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT)")
+            db.execute(
+                "INSERT INTO threads(id,title,cwd) VALUES(?,?,?)",
+                (sid, "读取 AGENTS.md、docs/PROJECT_STATUS.md", "/tmp/project-alpha"),
+            )
+            db.commit()
+            db.close()
+            index = self.mod.load_thread_index(home)
+            session = self.mod.RawSession(sid, Path("old.jsonl"), cwd="/tmp/project-alpha")
+            self.assertEqual(
+                self.mod.session_title(session, index),
+                "[project-alpha] 读取 AGENTS.md、docs/PROJECT_STATUS.md",
+            )
+
+    def test_v161_duplicate_labels_receive_stable_session_suffixes(self):
+        first = self.mod.Bucket(
+            session_id="019ffabc-1234-7000-8000-123456789111",
+            title="[project] Template task",
+        )
+        second = self.mod.Bucket(
+            session_id="019ffabc-5678-7000-8000-123456789222",
+            title="[project] Template task",
+        )
+        buckets = {first.session_id: first, second.session_id: second}
+        self.mod._disambiguate_bucket_titles(buckets)
+        self.assertNotEqual(first.title, second.title)
+        self.assertTrue(first.title.endswith(first.session_id[:12]))
+        self.assertTrue(second.title.endswith(second.session_id[:12]))
+
 
 
 if __name__ == "__main__":

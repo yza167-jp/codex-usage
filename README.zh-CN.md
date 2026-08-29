@@ -1,5 +1,16 @@
 # codex-usage
 
+## v1.6.1：项目感知的 session 名称
+
+`SESSION` 列现在优先使用 Codex 界面中显式设置的 session 名称（`threads.name`），并在可用时把 Codex project 名称放在最前面。若没有显式名称，则组合 project 与 Codex 的 preview/title；旧版状态数据库会退回到仓库名或 cwd 目录名。这样，即使多个项目都使用同一套模板化首条指令，也能直接区分：
+
+```text
+[steerRL] Sparse-1 S3 对比实验
+[knowing-to-see] 读取 AGENTS.md 并继续当前阶段
+```
+
+若多个可见 session 最终仍得到完全相同的标签，工具会追加稳定的短 session ID。DETAILS、JSON、CSV 也会提供 session name、thread title、project ID 和 project name。本次更新只读取 `state_5.sqlite` 元数据，不需要重建 token cache。
+
 ## v1.6.0：自动区分 Fast / Standard
 
 v1.6.0 会读取 Codex 本地持久化的 service-tier 设置，并把每次累计 `token_count` 的增量归到当时实际生效的档位。`priority` 与 `fast` 统一识别为 **Fast**，`default` / null 识别为 **Standard**。因此，同一个 session 中途切换 Fast 时，可以分别统计，而不再只能把整段记录统一按 Standard 或 Fast 估算。
