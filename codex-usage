@@ -2218,7 +2218,10 @@ def session_label_metadata(session: RawSession, index: Dict[str, dict]) -> Dict[
     project_name = _clean_thread_label(dbrow.get("project_name"))
     cwd = str(dbrow.get("cwd") or session.cwd or "").strip()
     repo_name = _git_origin_project_label(dbrow.get("git_origin_url"))
-    context = project_name or repo_name or _cwd_project_label(cwd)
+    # The concrete cwd is usually more discriminative than the shared remote
+    # repository name (for example across worktrees). A canonical Codex project
+    # still takes precedence when one is assigned.
+    context = project_name or _cwd_project_label(cwd) or repo_name
 
     if not base:
         base = context or session.session_id[:12]

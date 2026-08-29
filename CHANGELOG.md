@@ -3,7 +3,7 @@
 ## 1.6.1 — 2026-08-30
 
 - Preferred Codex's explicit user-facing thread `name` over the generated first-prompt title.
-- Added project-aware session labels using `threads.project_id` and `projects.name`, with repository/cwd fallback for older state databases.
+- Added project-aware session labels using `threads.project_id` and `projects.name`, with cwd/repository fallback for older state databases.
 - Prefixed project context before templated titles so identical startup instructions remain distinguishable across projects.
 - Added stable short-session suffixes when multiple visible rows still resolve to the same label.
 - Exposed session name, underlying thread title, project ID, and project name in DETAILS, JSON, and CSV.
