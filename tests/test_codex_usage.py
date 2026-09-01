@@ -729,6 +729,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
         )
         self.assertEqual(self.mod.token_triplet_text(usage), "95.2M/92.7M/405K")
         self.assertLessEqual(self.mod.display_width(self.mod.token_triplet_text(usage)), 18)
+        self.assertEqual(self.mod.human_tokens_compact(100_000_000), "100M")
 
     def test_v162_narrow_wide_uses_continuation_layout(self):
         headers, widths, _, inline = self.mod.summary_table_layout(100, True)

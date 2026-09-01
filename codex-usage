@@ -2951,8 +2951,8 @@ def human_tokens_compact(n: int) -> str:
         if value >= scale:
             scaled = value / scale
             if scaled >= 100:
-                text = f"{scaled:.0f}"
-            elif scaled >= 10:
+                return f"{scaled:.0f}{suffix}"
+            if scaled >= 10:
                 text = f"{scaled:.1f}"
             else:
                 text = f"{scaled:.2f}"
