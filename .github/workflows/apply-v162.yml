@@ -1,0 +1,56 @@
+name: Apply v1.6.2 readable-wide update
+
+on:
+  push:
+    branches:
+      - dev/v1.6.2-readable-wide
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[v162-applied]') && !contains(github.event.head_commit.message, '[v162-error]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/v1.6.2-readable-wide
+          fetch-depth: 0
+      - name: Patch, test, and commit
+        shell: bash
+        run: |
+          set +e
+          {
+            echo '== apply patch =='
+            python tools/apply_v162.py
+            patch_status=$?
+            echo '== compile =='
+            if [ "$patch_status" -eq 0 ]; then python -m py_compile codex-usage; else false; fi
+            compile_status=$?
+            echo '== tests =='
+            if [ "$compile_status" -eq 0 ]; then python -m unittest -v tests/test_codex_usage.py; else false; fi
+            test_status=$?
+            echo '== smoke =='
+            if [ "$test_status" -eq 0 ]; then python codex-usage --version && python codex-usage --help >/dev/null; else false; fi
+            smoke_status=$?
+          } > /tmp/v162.log 2>&1
+          status=$smoke_status
+          cat /tmp/v162.log
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/apply-v162.yml tools/apply_v162.py V162_ERROR.log
+
+          if [ "$status" -eq 0 ]; then
+            git add -A
+            git commit -m 'Optimize project-aware wide summary [v162-applied]'
+            git push origin HEAD:dev/v1.6.2-readable-wide
+            exit 0
+          fi
+
+          cp /tmp/v162.log V162_ERROR.log
+          git add -A
+          git commit -m 'Record v1.6.2 validation error [v162-error]'
+          git push origin HEAD:dev/v1.6.2-readable-wide
+          exit "$status"
