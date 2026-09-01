@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.2 — 2026-09-01
+
+- Rebalanced the capped 144-cell `--wide` summary so SESSION receives 34 cells instead of roughly 18.
+- Packed INPUT/CACHED/OUTPUT into a compact `TOKENS I/C/O` triplet, preserving all three diagnostics with much less horizontal cost.
+- Added project-aware session-cell fitting that shortens a long project tag first and reserves visible space for the Codex name/title.
+- Added a narrow-terminal `--wide` fallback that emits token continuation lines instead of wrapping or crushing the SESSION label.
+- Kept accounting, tier attribution, weekly calibration, cache schema, and detail-table right edges unchanged.
+
 ## 1.6.1 — 2026-08-30
 
 - Preferred Codex's explicit user-facing thread `name` over the generated first-prompt title.

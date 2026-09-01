@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.6.1", proc.stdout)
+        self.assertIn("1.6.2", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -702,6 +702,39 @@ class CodexUsageSmokeTests(unittest.TestCase):
         self.assertIn(first.session_id.replace("-", "")[-6:], first.title)
         self.assertIn(second.session_id.replace("-", "")[-6:], second.title)
 
+
+
+    def test_v162_wide_layout_preserves_session_width_at_report_cap(self):
+        headers, widths, right, inline = self.mod.summary_table_layout(144, True)
+        self.assertTrue(inline)
+        self.assertIn("TOKENS I/C/O", headers)
+        self.assertNotIn("INPUT", headers)
+        self.assertGreaterEqual(widths[0], 34)
+        self.assertEqual(sum(widths) + 2 * (len(widths) - 1), 144)
+        self.assertEqual(right, {3, 4, 5, 7, 8})
+
+    def test_v162_project_aware_truncation_keeps_project_and_task(self):
+        raw = "[atomic-cross-modal-transfer] 读取 AGENTS.md、docs/PROJECT_STATUS.md"
+        fitted = self.mod.fit_session_summary_title(raw, 34)
+        self.assertLessEqual(self.mod.display_width(fitted), 34)
+        self.assertTrue(fitted.startswith("[atomic"))
+        self.assertIn("读取", fitted)
+        self.assertNotEqual(fitted, self.mod.truncate(raw, 34))
+
+    def test_v162_compact_token_triplet(self):
+        usage = self.mod.Usage(
+            input_tokens=95_160_000,
+            cached_input_tokens=92_650_000,
+            output_tokens=405_300,
+        )
+        self.assertEqual(self.mod.token_triplet_text(usage), "95.2M/92.7M/405K")
+        self.assertLessEqual(self.mod.display_width(self.mod.token_triplet_text(usage)), 18)
+
+    def test_v162_narrow_wide_uses_continuation_layout(self):
+        headers, widths, _, inline = self.mod.summary_table_layout(100, True)
+        self.assertFalse(inline)
+        self.assertNotIn("TOKENS I/C/O", headers)
+        self.assertLessEqual(sum(widths) + 2 * (len(widths) - 1), 100)
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 RATE_CARD_AS_OF = "2026-08-12"
 RATE_CARD_CALIBRATION_KEY = "2026-08-12-r3-tier-aware"
 CACHE_SCHEMA_VERSION = 3
@@ -82,6 +82,7 @@ STATUS_NOTE = (
 # A wide terminal should still render as a readable left-hand report column.
 # This cap intentionally matches the canonical STATUS note above.
 REPORT_MAX_WIDTH = len(STATUS_NOTE)
+WIDE_SUMMARY_INLINE_MIN_WIDTH = 116
 WEEKLY_WINDOW_MINUTES = 7 * 24 * 60
 QUOTA_TAIL_BYTES = 2 * 1024 * 1024
 PLAN_DISPLAY_NAMES = {
@@ -2915,6 +2916,136 @@ def fit_widths_to_target(
     return widths
 
 
+def shrink_widths_to_target(
+    base_widths: Iterable[int],
+    minimum_widths: Iterable[int],
+    target_width: int,
+    shrink_order: Iterable[int],
+    gap: int = 2,
+) -> List[int]:
+    """Shrink selected columns without sacrificing the SESSION column first."""
+    widths = list(base_widths)
+    minimums = list(minimum_widths)
+    if len(widths) != len(minimums):
+        raise ValueError("base_widths and minimum_widths must have equal length")
+    deficit = sum(widths) + gap * (len(widths) - 1) - target_width
+    for idx in shrink_order:
+        if deficit <= 0:
+            break
+        reducible = max(0, widths[idx] - minimums[idx])
+        cut = min(reducible, deficit)
+        widths[idx] -= cut
+        deficit -= cut
+    return widths
+
+
+def human_tokens_compact(n: int) -> str:
+    """Compact token count for the inline INPUT/CACHED/OUTPUT triplet."""
+    value = max(0, int(n))
+    for scale, suffix in (
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ):
+        if value >= scale:
+            scaled = value / scale
+            if scaled >= 100:
+                text = f"{scaled:.0f}"
+            elif scaled >= 10:
+                text = f"{scaled:.1f}"
+            else:
+                text = f"{scaled:.2f}"
+            return text.rstrip("0").rstrip(".") + suffix
+    return str(value)
+
+
+def token_triplet_text(usage: Usage) -> str:
+    """Render INPUT/CACHED/OUTPUT compactly while retaining all three values."""
+    return "/".join((
+        human_tokens_compact(usage.input_tokens),
+        human_tokens_compact(usage.cached_input_tokens),
+        human_tokens_compact(usage.output_tokens),
+    ))
+
+
+def fit_session_summary_title(title: str, width: int) -> str:
+    """Keep both project context and task text visible in a narrow SESSION cell.
+
+    A generic right-side truncation can spend the entire cell on a long prefix
+    such as ``[atomic-cross-modal-transfer]``. This renderer reserves part of
+    the cell for the actual Codex name/title and shortens the project tag first.
+    """
+    clean = _clean_thread_label(title)
+    if width <= 0 or display_width(clean) <= width:
+        return clean if width > 0 else ""
+    match = re.match(r"^\[([^\]]+)\]\s*(.*)$", clean)
+    if not match or not match.group(2):
+        return truncate(clean, width)
+
+    context, body = match.group(1), match.group(2)
+    body_reserve = min(14, max(8, width // 3))
+    marker = re.match(r"^(#[^\s]+)\s+", body)
+    if marker:
+        body_reserve = max(
+            body_reserve,
+            min(max(8, width - 6), display_width(marker.group(1)) + 5),
+        )
+    context_budget = max(3, width - body_reserve - 3)  # brackets + separating space
+    context_text = truncate(context, context_budget)
+    prefix = f"[{context_text}] "
+    remaining = width - display_width(prefix)
+    if remaining < 4:
+        return truncate(clean, width)
+    return prefix + truncate(body, remaining)
+
+
+def summary_table_layout(
+    terminal_width: int,
+    wide: bool,
+) -> Tuple[List[str], List[int], set, bool]:
+    """Return headers, widths, numeric columns, and inline-wide status.
+
+    At the canonical 144-cell report width, wide mode packs INPUT/CACHED/OUTPUT
+    into one token triplet and dedicates 34 cells to SESSION. On narrow
+    terminals, --wide falls back to the normal table plus token continuation
+    lines rather than squeezing the project-aware label into an unreadable tag.
+    """
+    gap = 2
+    if wide and terminal_width >= WIDE_SUMMARY_INLINE_MIN_WIDTH:
+        headers = [
+            "SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*",
+            "TOKENS I/C/O", "CACHE TAX", "SHARE", "STATUS",
+        ]
+        base = [34, 12, 9, 9, 8, 9, 18, 9, 6, 12]
+        minimums = [20, 10, 7, 8, 7, 8, 14, 8, 6, 10]
+        widths = shrink_widths_to_target(
+            base,
+            minimums,
+            terminal_width,
+            (6, 1, 2, 9, 3, 4, 5, 7, 0),
+            gap,
+        )
+        widths = fit_widths_to_target(widths, terminal_width, (0,), gap)
+        return headers, widths, {3, 4, 5, 7, 8}, True
+
+    headers = [
+        "SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*",
+        "CACHE TAX", "SHARE", "STATUS",
+    ]
+    base = [40, 19, 10, 10, 9, 10, 10, 7, 13]
+    minimums = [12, 8, 5, 6, 5, 7, 7, 5, 7]
+    widths = shrink_widths_to_target(
+        base,
+        minimums,
+        terminal_width,
+        (1, 2, 8, 3, 4, 5, 6, 7, 0),
+        gap,
+    )
+    widths = fit_widths_to_target(widths, terminal_width, (0,), gap)
+    return headers, widths, {3, 4, 5, 6, 7}, False
+
+
 def make_buckets(
     sessions: Dict[str, RawSession],
     index: Dict[str, dict],
@@ -3095,24 +3226,9 @@ def render_table(
         return "\n".join(lines)
 
     gap = 2
-    if wide:
-        headers = ["SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SHARE", "STATUS"]
-        fixed = [10, 10, 9, 10, 9, 9, 9, 10, 7, 13]
-        fixed_total = sum(fixed) + gap * (len(headers) - 1)
-        flexible = max(28, terminal_width - fixed_total)
-        model_w = max(14, min(24, flexible // 3))
-        session_w = max(18, flexible - model_w)
-        widths = [session_w, model_w] + fixed
-        align_right = {3, 4, 5, 6, 7, 8, 9, 10}
-    else:
-        headers = ["SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*", "CACHE TAX", "SHARE", "STATUS"]
-        fixed = [10, 10, 9, 10, 10, 7, 13]
-        fixed_total = sum(fixed) + gap * (len(headers) - 1)
-        flexible = max(30, terminal_width - fixed_total)
-        model_w = max(14, min(24, flexible // 3))
-        session_w = max(20, flexible - model_w)
-        widths = [session_w, model_w] + fixed
-        align_right = {3, 4, 5, 6, 7}
+    headers, widths, align_right, wide_inline = summary_table_layout(
+        terminal_width, wide
+    )
 
     def styled_cell(padded: str, style: Optional[str]) -> str:
         if not style:
@@ -3154,22 +3270,21 @@ def render_table(
             credit_text = f"{credits:.1f}" + ("" if complete else "+")
             if known_credit_total > 0:
                 share_text = f"{100.0 * credits / known_credit_total:.1f}%"
-        title = b.title + (f" (+{len(b.child_sessions)} sub)" if b.child_sessions else "")
+        raw_title = b.title + (f" (+{len(b.child_sessions)} sub)" if b.child_sessions else "")
+        title = fit_session_summary_title(raw_title, widths[0])
         status = status_text(state, health, is_orphan)
         weekly_text = weekly_percent_text(credits, quota_calibration, complete)
         burn_weekly = weekly_percent_text(
             burn if burn is not None and burn > 0 else None, quota_calibration, burn_complete
         )
 
-        if wide:
+        if wide_inline:
             row = [
                 title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
-                weekly_text, burn_weekly, credit_text,
-                human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
-                human_tokens(u.output_tokens), f"{cache_tax:.1f}" if cache_tax > 0 else "—",
-                share_text, status,
+                weekly_text, burn_weekly, credit_text, token_triplet_text(u),
+                f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
             ]
-            status_idx, title_idx, burn_idx, cache_idx = 11, 0, 4, 9
+            status_idx, title_idx, burn_idx, cache_idx = 9, 0, 4, 7
         else:
             row = [
                 title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
@@ -3209,6 +3324,9 @@ def render_table(
                 styles[burn_idx] = "warn"
 
         lines.append(fmt_row(row, styles))
+        if wide and not wide_inline:
+            token_line = f"  TOKENS I/C/O  {token_triplet_text(u)}"
+            lines.append(color.wrap(truncate(token_line, terminal_width), color.DIM))
 
     total_usage = Usage()
     total_cache_tax = 0.0
@@ -3226,11 +3344,11 @@ def render_table(
     total_burn_weekly = weekly_percent_text(
         total_recent if total_recent > 0 else None, quota_calibration, total_burn_complete
     )
-    if wide:
+    if wide_inline:
         total_row = [
             "TOTAL", "", "", total_weekly_text, total_burn_weekly, total_credit_text,
-            human_tokens(total_usage.input_tokens), human_tokens(total_usage.cached_input_tokens),
-            human_tokens(total_usage.output_tokens), f"{total_cache_tax:.1f}" if total_cache_tax else "—",
+            token_triplet_text(total_usage),
+            f"{total_cache_tax:.1f}" if total_cache_tax else "—",
             "100%" if known_credit_total > 0 else "—", "",
         ]
     else:
@@ -3241,6 +3359,11 @@ def render_table(
         ]
     lines.append(color.wrap("  ".join("-" * w for w in widths), color.DIM))
     lines.append(fmt_row(total_row, {i: "total" for i in range(len(total_row))}))
+    if wide and not wide_inline:
+        lines.append(color.wrap(
+            truncate(f"  TOKENS I/C/O  {token_triplet_text(total_usage)}", terminal_width),
+            color.DIM,
+        ))
     lines.append("")
     lines.append(color.wrap(
         "* WEEKLY≈ expresses the selected local usage as a share of one plan weekly allowance; it can span quota resets.",
@@ -3252,7 +3375,14 @@ def render_table(
     ))
     lines.append(color.wrap(STATUS_NOTE, color.DIM))
     if not wide:
-        lines.append(color.wrap("  Use --wide to restore INPUT/CACHED/OUTPUT columns.", color.DIM))
+        lines.append(color.wrap("  Use --wide to add a compact INPUT/CACHED/OUTPUT token triplet.", color.DIM))
+    elif not wide_inline:
+        lines.append(color.wrap(
+            "  At this terminal width, --wide token diagnostics use continuation lines to preserve SESSION readability.",
+            color.DIM,
+        ))
+    else:
+        lines.append(color.wrap("  TOKENS I/C/O = INPUT / CACHED / OUTPUT.", color.DIM))
     if fast:
         lines.append(color.wrap(
             "  --fast resolves only UNKNOWN tier segments as Fast; detected Standard/Fast segments are unchanged.",
@@ -3717,7 +3847,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resolve only service-tier segments that remain UNKNOWN as Fast; detected Standard/Fast segments are preserved.",
     )
     p.add_argument("--details", action="store_true", help="Show credit components, MAIN/SUB totals, models, agents and live trend diagnostics.")
-    p.add_argument("--wide", action="store_true", help="Show INPUT/CACHED/OUTPUT columns in the summary table.")
+    p.add_argument("--wide", action="store_true", help="Add a compact INPUT/CACHED/OUTPUT token triplet; narrow terminals use continuation lines.")
     p.add_argument("--top-agents", type=int, default=8, metavar="N", help="With --details, show the top N agents per session (default: 8).")
     p.add_argument("--all-agents", action="store_true", help="With --details, show every agent instead of truncating the agent table.")
     p.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="ANSI color mode for terminal output (default: auto; NO_COLOR is respected).")

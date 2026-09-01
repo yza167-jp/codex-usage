@@ -1,5 +1,11 @@
 # codex-usage
 
+## v1.6.2：加宽可读的 project-aware SESSION
+
+v1.6.2 重新平衡 144-cell 摘要布局。加入 project 前缀后，旧 `--wide` 模式的 SESSION 只有约 18 格，往往只能看到 `[atomic-cross-mod…]`。现在全宽报告会给 SESSION **34 格**，并把 INPUT/CACHED/OUTPUT 合并为紧凑的 `TOKENS I/C/O`，例如 `95.2M/92.7M/405K`。
+
+当 `[project] session name/title` 仍然过长时，会优先缩短 project tag，并为真正的 Codex session 名或标题保留空间。较窄终端中，`--wide` 会把 token 三元组放到下一条缩进行，而不是继续挤压 SESSION。144-cell 上限、Fast 统计、weekly 估算和 credit 计算均未改变，也不需要重建 cache。
+
 ## v1.6.1：项目感知的 session 名称
 
 `SESSION` 列现在优先使用 Codex 界面中显式设置的 session 名称（`threads.name`），并在可用时把 Codex project 名称放在最前面。若没有显式名称，则组合 project 与 Codex 的 preview/title；旧版状态数据库会退回到仓库名或 cwd 目录名。这样，即使多个项目都使用同一套模板化首条指令，也能直接区分：

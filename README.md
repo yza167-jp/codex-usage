@@ -1,5 +1,11 @@
 # codex-usage
 
+## v1.6.2: readable project-aware wide summaries
+
+v1.6.2 rebalances the 144-cell summary after project-aware labels made the old `--wide` SESSION column too narrow. At the canonical report width, SESSION now receives **34 cells** and INPUT/CACHED/OUTPUT are packed into one `TOKENS I/C/O` column such as `95.2M/92.7M/405K`. Long `[project] title` labels shorten the project tag first and reserve space for the actual Codex name/title, so a row no longer degrades to only `[atomic-cross-mod…]`.
+
+On narrower terminals, `--wide` keeps the normal readable summary and places the token triplet on an indented continuation line rather than forcing the project/session label into an unusable width. The report still respects the 144-cell cap and all accounting, Fast attribution, and weekly calibration semantics are unchanged.
+
 ## v1.6.1: project-aware session labels
 
 The `SESSION` column now prefers the explicit name shown by Codex (`threads.name`) and prefixes it with the assigned Codex project when available. If no explicit name exists, the project is combined with Codex's preview/title; older state databases fall back to the repository/cwd name. This keeps templated prompts distinguishable across projects:
