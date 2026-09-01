@@ -1,0 +1,11 @@
+== apply patch ==
+Traceback (most recent call last):
+  File "/home/runner/work/codex-usage/codex-usage/tools/apply_v162.py", line 299, in <module>
+    s = replace_once(
+        ^^^^^^^^^^^^^
+  File "/home/runner/work/codex-usage/codex-usage/tools/apply_v162.py", line 6, in replace_once
+    raise RuntimeError(f"missing anchor: {label}")
+RuntimeError: missing anchor: wide help
+== compile ==
+== tests ==
+== smoke ==
