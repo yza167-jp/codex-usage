@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.0 — 2026-09-05
+
+- Added GPT-6 Astra Work/Codex reference pricing: 250 / 25 / 1,250 credits per million input / cached input / output tokens, with a 2.5x Fast multiplier.
+- Recognized the canonical `gpt-6-astra` model, exact tool shorthand aliases and narrowly matched dated Astra names; kept other GPT-6 variants unpriced rather than using a family-wide wildcard.
+- Integrated GPT-6 with existing session/TOTAL/1H, component, model/tier, main/subagent, weekly, JSON and CSV accounting through the shared rate map.
+- Documented Codex versus API pricing differences, including no Astra Codex cache-write or >272K long-context surcharge.
+- Preserved existing model rates, complete calibration history, schema-v3 token cache, weekly-first layout and 144-cell project-aware output. Cached GPT-6 events need no rebuild to become priceable.
+- Added synthetic regressions for Fast/Standard/Unknown, model switching, aliases, cache reuse, mixed-agent rollup, exports, weekly reset and calibration compatibility.
+
 ## 1.6.2 — 2026-09-01
 
 - Rebalanced the capped 144-cell `--wide` summary so SESSION receives 34 cells instead of roughly 18.

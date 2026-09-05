@@ -67,8 +67,12 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.6.2"
+VERSION = "1.7.0"
+# Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
+GPT6_RATE_CARD_AS_OF = "2026-09-05"
+# Do not invalidate complete historical calibration: no previously priced model
+# or tier changes cost. Old incomplete intervals remain excluded, not relabeled.
 RATE_CARD_CALIBRATION_KEY = "2026-08-12-r3-tier-aware"
 CACHE_SCHEMA_VERSION = 3
 TREND_MINUTES = 60
@@ -100,8 +104,11 @@ PLAN_WEEKLY_SEED_CPP = {
 }
 
 # Official Codex ChatGPT credit rate card, credits per 1M tokens.
-# Updated for the GPT-5.6-era rate card current at script creation.
+# Existing GPT-5.x entries are the pinned v1.6.2 reference rates, not a claim
+# about current purchased-credit promotions. GPT-6 Astra's Work/Codex reference
+# rates (checked 2026-09-05) are documented in docs/v1.7.0-gpt6.md.
 RATE_CARD: Dict[str, Tuple[float, float, float]] = {
+    "gpt-6-astra": (250.0, 25.0, 1250.0),
     "gpt-5.6-sol": (125.0, 12.5, 750.0),
     "gpt-5.6": (125.0, 12.5, 750.0),  # Codex default alias -> Sol family
     "daybreak-blue": (125.0, 12.5, 750.0),
@@ -118,6 +125,7 @@ RATE_CARD: Dict[str, Tuple[float, float, float]] = {
 
 # Fast mode multipliers published by OpenAI.
 FAST_MULTIPLIERS: Dict[str, float] = {
+    "gpt-6-astra": 2.5,  # Work/Codex, not the API Fast rate
     "gpt-5.6-sol": 2.5,
     "gpt-5.6": 2.5,
     "gpt-5.6-terra": 2.5,
@@ -534,6 +542,12 @@ def normalize_model(model: object) -> str:
     # check to credit calculation.
     if s.startswith("openai."):
         s = s[len("openai."):]
+    # Exact shorthand aliases are a tool compatibility convention. Match dated
+    # Astra IDs narrowly; never price every gpt-6-* variant as the base model.
+    if s in ("gpt-6", "gpt6"):
+        return "gpt-6-astra"
+    if re.fullmatch(r"gpt-6-astra-\d{4}-\d{2}-\d{2}", s):
+        return "gpt-6-astra"
     return s
 
 
@@ -2762,6 +2776,8 @@ def human_tokens(n: int) -> str:
 def pretty_model(model: str) -> str:
     model, _ = split_usage_key(model)
     aliases = {
+        "gpt-6-astra": "6 Astra",
+        "gpt-6-astra-wm": "6 Astra WM",  # recognized, separate price unverified
         "gpt-5.6-sol": "5.6 Sol",
         "gpt-5.6": "5.6 Sol",
         "gpt-5.6-terra": "5.6 Terra",
@@ -3160,7 +3176,10 @@ def render_table(
     tzname = _tz_display(tz, now)
     mode = "Tier-aware credits (unknown→Fast)" if fast else "Tier-aware credits"
     lines.append(color.wrap(f"Codex usage — {period_label} — {tzname}", color.BOLD, color.CYAN))
-    lines.append(color.wrap(f"Credit mode: {mode} (rate card {RATE_CARD_AS_OF})", color.DIM))
+    lines.append(color.wrap(
+        f"Credit mode: {mode} (rate card {RATE_CARD_AS_OF}; GPT-6 {GPT6_RATE_CARD_AS_OF})",
+        color.DIM,
+    ))
 
     plan_raw = ""
     if quota_snapshot is not None and quota_snapshot.plan_type:
