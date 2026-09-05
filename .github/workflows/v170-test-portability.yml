@@ -1,0 +1,37 @@
+name: Fix v1.7 test portability
+on:
+  push:
+    branches: [dev/v1.7.0-gpt6]
+    paths: [.github/workflows/v170-test-portability.yml]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/v1.7.0-gpt6
+          fetch-depth: 0
+      - name: Use system timezone in dependency-free CLI fixture
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/test_gpt6.py')
+          s = p.read_text(encoding='utf-8')
+          old = '"--cache-path", str(home / "cli-cache.sqlite3"), "--timezone", "UTC"]'
+          new = '"--cache-path", str(home / "cli-cache.sqlite3")]'
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
+          s = s.replace('path.read_text().splitlines()', 'path.read_text(encoding="utf-8").splitlines()')
+          p.write_text(s, encoding='utf-8')
+          PY
+          python -m unittest discover -s tests -v
+      - name: Commit tested fixture correction
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/v170-test-portability.yml
+          git add tests/test_gpt6.py
+          git commit -m 'Keep GPT-6 CLI regressions dependency-free on Windows'
+          git push origin HEAD:dev/v1.7.0-gpt6
