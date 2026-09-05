@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.7.1", proc.stdout)
+        self.assertIn("1.7.2", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -706,12 +706,12 @@ class CodexUsageSmokeTests(unittest.TestCase):
 
     def test_v162_wide_layout_preserves_session_width_at_report_cap(self):
         headers, widths, right, inline = self.mod.summary_table_layout(144, True)
-        self.assertTrue(inline)
-        self.assertIn("TOKENS I/C/O", headers)
-        self.assertNotIn("INPUT", headers)
-        self.assertGreaterEqual(widths[0], 34)
+        self.assertFalse(inline)
+        self.assertEqual(headers[:2], ["PROJECT", "SESSION"])
+        self.assertNotIn("TOKENS I/C/O", headers)
+        self.assertGreaterEqual(widths[1], 33)
         self.assertEqual(sum(widths) + 2 * (len(widths) - 1), 144)
-        self.assertEqual(right, {3, 4, 5, 7, 8})
+        self.assertEqual(right, {4, 5, 6, 7, 8})
 
     def test_v162_project_aware_truncation_keeps_project_and_task(self):
         raw = "[atomic-cross-modal-transfer] 读取 AGENTS.md、docs/PROJECT_STATUS.md"
@@ -735,7 +735,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
         headers, widths, _, inline = self.mod.summary_table_layout(100, True)
         self.assertFalse(inline)
         self.assertNotIn("TOKENS I/C/O", headers)
-        self.assertLessEqual(sum(widths) + 2 * (len(widths) - 1), 100)
+        self.assertLessEqual(sum(widths) + self.mod.summary_column_gap(100) * (len(widths) - 1), 100)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.2 — 2026-09-06
+
+- Split terminal PROJECT and SESSION columns using structured project metadata; preserve Codex names, fallback labels, duplicate markers and subagent identity.
+- Reserve 18/33 cells for project/session at the 144-cell cap. Move --wide token diagnostics to continuation lines rather than squeezing names.
+- Separate project metadata in DETAILS and add a PROJECT column to Agent breakdown; keep full model continuations and aligned numeric totals.
+- Retain project fallback metadata for unnamed sessions and display their short ID instead of repeating the project as a task.
+- Preserve credits, Fast attribution, weekly calibration, cache schema and existing JSON/CSV fields. No cache rebuild is needed.
+- Add project/session separation and rendering regression coverage.
+
 ## 1.7.1 — 2026-09-05
 
 - Keep full model lists visible using automatic wrapped Models continuation lines instead of ellipsizing names in narrow MODEL(S) cells.

@@ -74,7 +74,7 @@ class ModelDisplayTests(unittest.TestCase):
         m = self.m
         now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
         sid = "019ffabc-1234-7000-8000-123456789111"
-        b = m.Bucket(sid, title="[sample-project] 中文多模型实验")
+        b = m.Bucket(sid, title="[sample-project] 中文多模型实验", project_name="sample-project")
         models = ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra"]
         if long_model:
             models.append("unknown-model-with-a-very-long-identifier-and-unique-suffix")
@@ -94,9 +94,9 @@ class ModelDisplayTests(unittest.TestCase):
     def test_wide_render_preserves_width_and_full_models(self):
         text = self.render()
         rows = text.splitlines()
-        header = next(line for line in rows if line.startswith("SESSION"))
-        self.assertEqual(self.m.display_width(header.split("MODEL(S)")[0]), 36)
-        main = next(line for line in rows if line.startswith("[sample-project]"))
+        header = next(line for line in rows if line.startswith("PROJECT"))
+        self.assertEqual(self.m.display_width(header.split("MODEL(S)")[0]), 55)
+        main = next(line for line in rows if line.startswith("sample-project"))
         self.assertEqual(self.m.display_width(main), 144)
         self.assertIn("5.6 Sol +2", main)
         self.assertIn("  Models: 5.6 Sol / 5.6 Luna / 6 Astra", rows)

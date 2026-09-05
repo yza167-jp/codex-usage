@@ -1,5 +1,20 @@
 # codex-usage
 
+## v1.7.2: separate PROJECT and SESSION columns
+
+The terminal summary now has independent `PROJECT` and `SESSION` columns.
+PROJECT uses the assigned Codex project or the existing cwd/repository fallback;
+SESSION contains the Codex name/title without the tool-added project prefix.
+At the 144-cell report cap, the columns receive 18 and 33 cells respectively.
+Missing projects display `—`; unnamed sessions use a short session ID. Duplicate
+session markers, subagent rollups, and v1.7.1 full model continuations are retained.
+
+`--wide` keeps this same main row and shows `TOKENS I/C/O` on dim continuation
+lines, instead of shrinking the names again. DETAILS places the full project in
+its own metadata line; Agent breakdown also separates PROJECT from ROLE / SESSION.
+No new flag, pricing/calibration change or cache rebuild is needed. JSON/CSV keep
+their existing combined title and separate project/name fields for compatibility.
+
 ## v1.7.1: complete model lists without wider tables
 
 When `MODEL(S)` does not fit, the main row uses a complete first model plus
