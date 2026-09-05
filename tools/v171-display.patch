@@ -1,0 +1,311 @@
+--- a/codex-usage
++++ b/codex-usage
+@@ -67,7 +67,7 @@
+ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+ 
+ 
+-VERSION = "1.7.0"
++VERSION = "1.7.1"
+ # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
+ RATE_CARD_AS_OF = "2026-08-12"
+ GPT6_RATE_CARD_AS_OF = "2026-09-05"
+@@ -2903,6 +2903,68 @@
+     return "".join(out).rstrip("\u200d") + ellipsis
+ 
+ 
++def wrap_display_words(text: str, width: int) -> List[str]:
++    """Wrap plain text at terminal-cell boundaries without dropping long IDs.
++
++    Prefer word boundaries. A single overlong model ID is split only when
++    necessary; zero-width combining marks stay with the preceding character.
++    """
++    if width < 2:
++        raise ValueError("display wrapping requires at least two terminal cells")
++    lines: List[str] = []
++    current = ""
++    used = 0
++    for word in text.split():
++        word_width = display_width(word)
++        if current and used + 1 + word_width <= width:
++            current += " " + word
++            used += 1 + word_width
++            continue
++        if current:
++            lines.append(current)
++            current, used = "", 0
++        for ch in word:
++            cells = _terminal_char_width(ch)
++            if used + cells > width:
++                lines.append(current)
++                current, used = "", 0
++            current += ch
++            used += cells
++    if current:
++        lines.append(current)
++    return lines
++
++
++def model_cell_layout(
++    models: Iterable[str], column_width: int, report_width: int,
++) -> Tuple[str, List[str]]:
++    """Keep full model names available without widening the summary table.
++
++    A fitting list stays inline. Overflow uses a complete first model +N (or
++    a model count) and a losslessly wrapped continuation list under that row.
++    Model/tier keys are deduplicated by model, just like the existing label.
++    """
++    names = model_names(models)
++    full = model_label(names)
++    if display_width(full) <= column_width:
++        return full, []
++
++    count = len(names)
++    compact = f"{pretty_model(names[0])} +{count - 1}" if count > 1 else "1 model"
++    if display_width(compact) > column_width:
++        compact = f"{count} models" if count > 1 else "1 model"
++    # Only the count may be clipped on an extremely narrow caller. The full
++    # model list is never ellipsized, including unknown/long model IDs.
++    compact = truncate(compact, column_width)
++    prefix = "  Models: "
++    wrapped = wrap_display_words(full, max(2, report_width - display_width(prefix)))
++    continuation = " " * display_width(prefix)
++    return compact, [
++        (prefix if i == 0 else continuation) + part
++        for i, part in enumerate(wrapped)
++    ]
++
++
+ def pad_display(s: str, width: int, right: bool = False) -> str:
+     """Truncate and pad a table cell using terminal-cell width."""
+     clipped = truncate(s, width)
+@@ -3297,16 +3359,19 @@
+             burn if burn is not None and burn > 0 else None, quota_calibration, burn_complete
+         )
+ 
++        model_text, model_lines = model_cell_layout(
++            b.usage_by_model.keys(), widths[1], terminal_width
++        )
+         if wide_inline:
+             row = [
+-                title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
++                title, model_text, tier_label(b.usage_by_model.keys()),
+                 weekly_text, burn_weekly, credit_text, token_triplet_text(u),
+                 f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
+             ]
+             status_idx, title_idx, burn_idx, cache_idx = 9, 0, 4, 7
+         else:
+             row = [
+-                title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
++                title, model_text, tier_label(b.usage_by_model.keys()),
+                 weekly_text, burn_weekly, credit_text,
+                 f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
+             ]
+@@ -3343,6 +3408,7 @@
+                 styles[burn_idx] = "warn"
+ 
+         lines.append(fmt_row(row, styles))
++        lines.extend(color.wrap(line, color.DIM) for line in model_lines)
+         if wide and not wide_inline:
+             token_line = f"  TOKENS I/C/O  {token_triplet_text(u)}"
+             lines.append(color.wrap(truncate(token_line, terminal_width), color.DIM))
+@@ -3573,13 +3639,15 @@
+             model_rows.sort(key=lambda x: (x[3] if x[3] is not None else -1), reverse=True)
+             for model, tier, u, c, complete, cache_part in model_rows:
+                 pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
++                model_text, model_lines = model_cell_layout([model], mw[0], detail_width)
+                 lines.append(fmt_detail([
+-                    pretty_model(model), service_tier_display(tier, compact=True),
++                    model_text, service_tier_display(tier, compact=True),
+                     weekly_percent_text(c, quota_calibration, complete),
+                     "—" if c is None else f"{c:.1f}" + ("" if complete else "+"), human_tokens(u.input_tokens),
+                     human_tokens(u.cached_input_tokens), human_tokens(u.output_tokens),
+                     human_tokens(u.reasoning_output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
+                 ], mw, mr))
++                lines.extend(color.wrap(line, color.DIM) for line in model_lines)
+ 
+             # AGENT BREAKDOWN
+             lines.append("")
+@@ -3606,12 +3674,14 @@
+                 pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
+                 credit_text = "—" if c is None else f"{c:.1f}" + ("" if complete else "+")
+                 role_style = "active" if sid not in b.source_is_subagent and state == "ACTIVE" else None
++                model_text, model_lines = model_cell_layout(by_model.keys(), aw[1], detail_width)
+                 lines.append(fmt_detail([
+-                    label, model_label(by_model.keys()), tier_label(by_model.keys()),
++                    label, model_text, tier_label(by_model.keys()),
+                     weekly_percent_text(c, quota_calibration, complete),
+                     credit_text, human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
+                     human_tokens(u.output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
+                 ], aw, ar, {0: role_style} if role_style else {}))
++                lines.extend(color.wrap(line, color.DIM) for line in model_lines)
+             hidden = len(agent_rows) - len(visible_agents)
+             if hidden > 0:
+                 lines.append(color.wrap(
+--- a/tests/test_codex_usage.py
++++ b/tests/test_codex_usage.py
+@@ -36,7 +36,7 @@
+             text=True,
+             capture_output=True,
+         )
+-        self.assertIn("1.7.0", proc.stdout)
++        self.assertIn("1.7.1", proc.stdout)
+ 
+     def test_terminal_display_width_handles_cjk_and_combining(self):
+         self.assertEqual(self.mod.display_width("ASCII"), 5)
+--- /dev/null
++++ b/tests/test_model_display.py
+@@ -0,0 +1,154 @@
++"""Regressions for full model labels without sacrificing the SESSION column."""
++import json
++import os
++import re
++import unittest
++from datetime import datetime, timezone
++from pathlib import Path
++from unittest.mock import patch
++
++from test_codex_usage import load_module
++
++
++class ModelDisplayTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.m = load_module()
++
++    def test_single_model_stays_inline(self):
++        for model, label in (("gpt-6-astra", "6 Astra"), ("gpt-5.6-sol", "5.6 Sol")):
++            self.assertEqual(self.m.model_cell_layout([model], 12, 144), (label, []))
++
++    def test_fitting_multiple_models_stay_inline(self):
++        models = ["gpt-5.6-sol", "gpt-6-astra"]
++        self.assertEqual(self.m.model_cell_layout(models, 19, 144),
++                         ("5.6 Sol / 6 Astra", []))
++
++    def test_overflow_lists_all_models_in_continuation(self):
++        cell, notes = self.m.model_cell_layout(["gpt-5.6-sol", "gpt-6-astra"], 12, 144)
++        self.assertEqual(cell, "5.6 Sol +1")
++        self.assertEqual(notes, ["  Models: 5.6 Sol / 6 Astra"])
++        self.assertNotIn("…", cell + "".join(notes))
++
++    def test_count_is_models_not_service_tiers(self):
++        keys = [self.m.usage_key("gpt-5.6-sol", t) for t in ("fast", "standard", "unknown")]
++        keys += [self.m.usage_key("gpt-6-astra", "standard")]
++        self.assertEqual(self.m.model_cell_layout(iter(keys), 12, 144),
++                         ("5.6 Sol +1", ["  Models: 5.6 Sol / 6 Astra"]))
++
++    def test_narrow_column_uses_count_not_half_a_model(self):
++        cell, notes = self.m.model_cell_layout(
++            ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra"], 8, 80)
++        self.assertEqual(cell, "3 models")
++        self.assertEqual(notes, ["  Models: 5.6 Sol / 5.6 Luna / 6 Astra"])
++
++    def test_long_unknown_identifier_remains_complete(self):
++        model = "unpriced-model-" + "x" * 200 + "-final-suffix"
++        cell, notes = self.m.model_cell_layout([model], 12, 80)
++        self.assertEqual(cell, "1 model")
++        self.assertGreater(len(notes), 1)
++        self.assertEqual("".join(line[10:] for line in notes), model)
++        self.assertTrue(all(self.m.display_width(line) <= 80 for line in notes))
++
++    def test_many_models_wrap_without_loss(self):
++        models = ["gpt-5.6-sol", "gpt-6-astra", "gpt-5.6-luna"]
++        models += [f"unknown-model-{i:02d}" for i in range(24)]
++        for width in (80, 100, 116, 144):
++            with self.subTest(width=width):
++                cell, notes = self.m.model_cell_layout(models, 12, width)
++                self.assertEqual(cell, "5.6 Sol +26")
++                actual = "".join("".join(line[10:].split()) for line in notes)
++                self.assertEqual(actual, "".join(self.m.model_label(models).split()))
++                self.assertTrue(all(self.m.display_width(line) <= width for line in notes))
++
++    def test_cjk_and_combining_marks_wrap_in_cells(self):
++        model = "未定价模型-" + "中e\u0301" * 60 + "-末尾"
++        cell, notes = self.m.model_cell_layout([model], 12, 80)
++        self.assertEqual(cell, "1 model")
++        self.assertEqual("".join(line[10:] for line in notes), model)
++        for line in notes:
++            self.assertLessEqual(self.m.display_width(line), 80)
++            self.assertNotEqual(line[10:11], "\u0301")
++
++    def fixture(self, long_model=False):
++        m = self.m
++        now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
++        sid = "019ffabc-1234-7000-8000-123456789111"
++        b = m.Bucket(sid, title="[sample-project] 中文多模型实验")
++        models = ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra"]
++        if long_model:
++            models.append("unknown-model-with-a-very-long-identifier-and-unique-suffix")
++        for model in models:
++            b.add(model, m.Usage(1_000_000, 900_000, 10_000, 2_000, 1_010_000),
++                  sid, source_title=b.title, activity_ts=now, recent=True)
++        s = m.RawSession(sid, Path("synthetic.jsonl"), model_provider="openai")
++        return {sid: b}, {sid: s}, now, m.QuotaCalibration(100.0, "LOW")
++
++    def render(self, width=144, wide=True, details=False, color="never", long_model=False):
++        b, sessions, now, cal = self.fixture(long_model)
++        with patch.object(self.m.shutil, "get_terminal_size", return_value=os.terminal_size((width, 40))):
++            return self.m.render_table(b, sessions, "last 24h", timezone.utc, False,
++                                       details, now, True, self.m.Colorizer(color),
++                                       wide=wide, quota_calibration=cal)
++
++    def test_wide_render_preserves_width_and_full_models(self):
++        text = self.render()
++        rows = text.splitlines()
++        header = next(line for line in rows if line.startswith("SESSION"))
++        self.assertEqual(self.m.display_width(header.split("MODEL(S)")[0]), 36)
++        main = next(line for line in rows if line.startswith("[sample-project]"))
++        self.assertEqual(self.m.display_width(main), 144)
++        self.assertIn("5.6 Sol +2", main)
++        self.assertIn("  Models: 5.6 Sol / 5.6 Luna / 6 Astra", rows)
++        total = next(line for line in rows if line.startswith("TOTAL"))
++        self.assertIn("100%", total)
++        self.assertEqual(sum(line.startswith("TOTAL") for line in rows), 1)
++
++    def test_default_and_narrow_wide_both_show_complete_models(self):
++        for width, wide in ((100, False), (100, True), (116, True), (144, False)):
++            with self.subTest(width=width, wide=wide):
++                text = self.render(width=width, wide=wide)
++                self.assertIn("  Models: 5.6 Sol / 5.6 Luna / 6 Astra", text)
++                self.assertNotIn("5.6 Sol / 5…", text)
++                if wide and width == 100:
++                    self.assertIn("  TOKENS I/C/O", text)
++                for line in text.splitlines():
++                    if line.startswith("  Models:"):
++                        self.assertLessEqual(self.m.display_width(line), width)
++
++    def test_details_agent_and_long_model_are_not_ellipsized(self):
++        text = self.render(details=True, long_model=True)
++        model_section = text.split("\nModel breakdown\n", 1)[1].split("\nAgent breakdown\n", 1)[0]
++        agent_section = text.split("\nAgent breakdown\n", 1)[1]
++        long_id = "unknown-model-with-a-very-long-identifier-and-unique-suffix"
++        self.assertIn("  Models: " + long_id, model_section)
++        self.assertIn("  Models: 5.6 Sol / 5.6 Luna / 6 Astra / " + long_id, agent_section)
++        for line in text.splitlines():
++            self.assertLessEqual(self.m.display_width(line), 144)
++
++    def test_color_does_not_change_wrapping(self):
++        plain = self.render(details=True, long_model=True)
++        colored = self.render(color="always", details=True, long_model=True)
++        self.assertIn("\033[", colored)
++        self.assertEqual(re.sub(r"\x1b\[[0-9;]*m", "", colored), plain)
++
++    def test_fullscreen_does_not_expand_report(self):
++        self.assertEqual(self.render(width=240), self.render(width=144))
++
++    def test_rendering_leaves_accounting_and_exports_unchanged(self):
++        m = self.m
++        buckets, sessions, now, cal = self.fixture()
++        before = m.render_json(buckets, sessions, "24h", timezone.utc, False, now, True,
++                               quota_calibration=cal)
++        with patch.object(m.shutil, "get_terminal_size", return_value=os.terminal_size((144, 40))):
++            text = m.render_table(buckets, sessions, "24h", timezone.utc, False, True,
++                                  now, True, m.Colorizer("never"), wide=True, quota_calibration=cal)
++        after = m.render_json(buckets, sessions, "24h", timezone.utc, False, now, True,
++                              quota_calibration=cal)
++        self.assertEqual(json.loads(before), json.loads(after))
++        self.assertIn("Models:", text)
++        self.assertEqual(m.model_label(["gpt-5.6-sol", "gpt-6-astra"]), "5.6 Sol / 6 Astra")
++
++
++if __name__ == "__main__":
++    unittest.main()
