@@ -1,0 +1,20 @@
+name: v1.7.2 source snapshot
+on:
+  push:
+    branches: [fix/v1.7.2-project-column]
+    paths: [.github/workflows/v172-source.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 497a0d0177297f4559de877f25726a1f3f82a08f
+      - run: git archive --format=tar HEAD > /tmp/codex-usage-source.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v172-base-source
+          path: /tmp/codex-usage-source.tar
+          retention-days: 1
