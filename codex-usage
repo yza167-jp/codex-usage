@@ -62,12 +62,12 @@ import statistics
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
 GPT6_RATE_CARD_AS_OF = "2026-09-05"
@@ -86,7 +86,6 @@ STATUS_NOTE = (
 # A wide terminal should still render as a readable left-hand report column.
 # This cap intentionally matches the canonical STATUS note above.
 REPORT_MAX_WIDTH = len(STATUS_NOTE)
-WIDE_SUMMARY_INLINE_MIN_WIDTH = 116
 WEEKLY_WINDOW_MINUTES = 7 * 24 * 60
 QUOTA_TAIL_BYTES = 2 * 1024 * 1024
 PLAN_DISPLAY_NAMES = {
@@ -330,6 +329,8 @@ class Bucket:
     last_activity: Optional[datetime] = None
     event_count: int = 0
     child_sessions: set = field(default_factory=set)
+    # Presentation metadata only; never used to group usage or price tokens.
+    source_projects: Dict[str, str] = field(default_factory=dict)
 
     def add(
         self,
@@ -2092,7 +2093,11 @@ def _cwd_project_label(raw_cwd: object) -> str:
     if not cwd:
         return ""
     try:
-        leaf = Path(cwd).expanduser().name
+        # A report may be rendered on a different OS from the recorded cwd.
+        if re.match(r"^[A-Za-z]:[\\/]", cwd) or cwd.startswith("\\\\"):
+            leaf = PureWindowsPath(cwd).name
+        else:
+            leaf = Path(cwd).expanduser().name
     except (OSError, ValueError):
         leaf = ""
     return _clean_thread_label(leaf)
@@ -2237,6 +2242,7 @@ def session_label_metadata(session: RawSession, index: Dict[str, dict]) -> Dict[
     # repository name (for example across worktrees). A canonical Codex project
     # still takes precedence when one is assigned.
     context = project_name or _cwd_project_label(cwd) or repo_name
+    resolved_project = context
 
     if not base:
         base = context or session.session_id[:12]
@@ -2261,7 +2267,7 @@ def session_label_metadata(session: RawSession, index: Dict[str, dict]) -> Dict[
         "session_name": explicit_name,
         "thread_title": thread_title,
         "project_id": project_id,
-        "project_name": project_name or context,
+        "project_name": resolved_project,
         "cwd": cwd,
     }
 
@@ -3078,50 +3084,61 @@ def fit_session_summary_title(title: str, width: int) -> str:
     return prefix + truncate(body, remaining)
 
 
+def session_without_project(title: str, project: str) -> str:
+    """Remove only a known project prefix, never arbitrary bracketed task tags."""
+    clean = _clean_thread_label(title)
+    project = _clean_thread_label(project)
+    orphan = "[ORPHAN SUB] "
+    if clean.startswith(orphan):
+        return orphan + session_without_project(clean[len(orphan):], project)
+    if project:
+        for prefix in (f"[{project}]", project + " ·", project + ":"):
+            if clean.casefold().startswith(prefix.casefold()):
+                rest = clean[len(prefix):].lstrip()
+                if rest:
+                    return rest
+    return clean
+
+
+def bucket_identity(bucket: Bucket) -> Tuple[str, str]:
+    """Return independent project and session labels from structured metadata."""
+    project = _clean_thread_label(bucket.project_name) or _cwd_project_label(bucket.cwd)
+    title = session_without_project(bucket.title, project)
+    if not title or (title == project and not bucket.session_name and not bucket.thread_title):
+        title = short_sid(bucket.session_id)
+    return project, title
+
+
+def summary_column_gap(terminal_width: int) -> int:
+    return 1 if terminal_width < REPORT_MAX_WIDTH else 2
+
+
 def summary_table_layout(
     terminal_width: int,
     wide: bool,
 ) -> Tuple[List[str], List[int], set, bool]:
-    """Return headers, widths, numeric columns, and inline-wide status.
+    """Reserve separate PROJECT/SESSION columns, including in --wide mode.
 
-    At the canonical 144-cell report width, wide mode packs INPUT/CACHED/OUTPUT
-    into one token triplet and dedicates 34 cells to SESSION. On narrow
-    terminals, --wide falls back to the normal table plus token continuation
-    lines rather than squeezing the project-aware label into an unreadable tag.
+    At 144 cells the identity columns get 18 and 33 cells. Token diagnostics
+    use continuation lines instead of taking those cells back from the names.
+    The final bool retains the renderer contract (tokens are not inline).
     """
-    gap = 2
-    if wide and terminal_width >= WIDE_SUMMARY_INLINE_MIN_WIDTH:
-        headers = [
-            "SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*",
-            "TOKENS I/C/O", "CACHE TAX", "SHARE", "STATUS",
-        ]
-        base = [34, 12, 9, 9, 8, 9, 18, 9, 6, 12]
-        minimums = [20, 10, 7, 8, 7, 8, 14, 8, 6, 10]
-        widths = shrink_widths_to_target(
-            base,
-            minimums,
-            terminal_width,
-            (6, 1, 2, 9, 3, 4, 5, 7, 0),
-            gap,
-        )
-        widths = fit_widths_to_target(widths, terminal_width, (0,), gap)
-        return headers, widths, {3, 4, 5, 7, 8}, True
-
+    terminal_width = max(80, min(REPORT_MAX_WIDTH, terminal_width))
+    gap = summary_column_gap(terminal_width)
     headers = [
-        "SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈", "CREDITS*",
-        "CACHE TAX", "SHARE", "STATUS",
+        "PROJECT", "SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "1H≈",
+        "CREDITS*", "CACHE TAX", "SHARE", "STATUS",
     ]
-    base = [40, 19, 10, 10, 9, 10, 10, 7, 13]
-    minimums = [12, 8, 5, 6, 5, 7, 7, 5, 7]
+    base = [18, 33, 12, 9, 9, 8, 9, 9, 6, 13]
+    minimums = [7, 12, 8, 5, 6, 5, 7, 7, 5, 7]
+    readable = list(base)
+    readable[0], readable[1] = 12, 22
+    widths = shrink_widths_to_target(base, readable, terminal_width, (1, 0), gap)
     widths = shrink_widths_to_target(
-        base,
-        minimums,
-        terminal_width,
-        (1, 2, 8, 3, 4, 5, 6, 7, 0),
-        gap,
+        widths, minimums, terminal_width, (2, 3, 9, 4, 5, 6, 7, 8, 0, 1), gap,
     )
-    widths = fit_widths_to_target(widths, terminal_width, (0,), gap)
-    return headers, widths, {3, 4, 5, 6, 7}, False
+    widths = fit_widths_to_target(widths, terminal_width, (1,), gap)
+    return headers, widths, {4, 5, 6, 7, 8}, False
 
 
 def make_buckets(
@@ -3168,6 +3185,8 @@ def make_buckets(
             )
             buckets[target_id] = bucket
 
+        source_meta = session_label_metadata(session, index)
+        bucket.source_projects[session.session_id] = source_meta["project_name"]
         for ts, model, service_tier, delta in deltas:
             local_ts = _to_tz(ts, tz)
             if start <= local_ts < end:
@@ -3175,7 +3194,7 @@ def make_buckets(
                     model,
                     delta,
                     session.session_id,
-                    source_title=session_title(session, index),
+                    source_title=source_meta["display_title"],
                     is_subagent=session.is_subagent(),
                     activity_ts=local_ts,
                     recent=(trend_start is not None and local_ts >= trend_start),
@@ -3310,6 +3329,7 @@ def render_table(
     headers, widths, align_right, wide_inline = summary_table_layout(
         terminal_width, wide
     )
+    summary_separator = " " * summary_column_gap(terminal_width)
 
     def styled_cell(padded: str, style: Optional[str]) -> str:
         if not style:
@@ -3339,10 +3359,10 @@ def render_table(
         for i, (cell, width) in enumerate(zip(row, use_widths)):
             padded = pad_display(str(cell), width, right=(i in use_right))
             cells.append(styled_cell(padded, styles.get(i)))
-        return "  ".join(cells)
+        return summary_separator.join(cells)
 
     lines.append(fmt_row(headers, {i: "header" for i in range(len(headers))}))
-    lines.append(color.wrap("  ".join("-" * w for w in widths), color.DIM))
+    lines.append(color.wrap(summary_separator.join("-" * w for w in widths), color.DIM))
 
     for b, u, credits, complete, cache_tax, state, health, burn, recent_cache, burn_complete, is_orphan in rows:
         credit_text = "—"
@@ -3351,8 +3371,9 @@ def render_table(
             credit_text = f"{credits:.1f}" + ("" if complete else "+")
             if known_credit_total > 0:
                 share_text = f"{100.0 * credits / known_credit_total:.1f}%"
-        raw_title = b.title + (f" (+{len(b.child_sessions)} sub)" if b.child_sessions else "")
-        title = fit_session_summary_title(raw_title, widths[0])
+        project, session_name = bucket_identity(b)
+        raw_title = session_name + (f" (+{len(b.child_sessions)} sub)" if b.child_sessions else "")
+        title = truncate(raw_title, widths[1])
         status = status_text(state, health, is_orphan)
         weekly_text = weekly_percent_text(credits, quota_calibration, complete)
         burn_weekly = weekly_percent_text(
@@ -3360,22 +3381,14 @@ def render_table(
         )
 
         model_text, model_lines = model_cell_layout(
-            b.usage_by_model.keys(), widths[1], terminal_width
+            b.usage_by_model.keys(), widths[2], terminal_width
         )
-        if wide_inline:
-            row = [
-                title, model_text, tier_label(b.usage_by_model.keys()),
-                weekly_text, burn_weekly, credit_text, token_triplet_text(u),
-                f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
-            ]
-            status_idx, title_idx, burn_idx, cache_idx = 9, 0, 4, 7
-        else:
-            row = [
-                title, model_text, tier_label(b.usage_by_model.keys()),
-                weekly_text, burn_weekly, credit_text,
-                f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
-            ]
-            status_idx, title_idx, burn_idx, cache_idx = 8, 0, 4, 6
+        row = [
+            project or "—", title, model_text, tier_label(b.usage_by_model.keys()),
+            weekly_text, burn_weekly, credit_text,
+            f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
+        ]
+        status_idx, title_idx, burn_idx, cache_idx = 9, 1, 5, 7
 
         styles = {}
         if is_orphan:
@@ -3407,6 +3420,7 @@ def render_table(
             elif burn >= 100:
                 styles[burn_idx] = "warn"
 
+        styles[0] = "idle" if state == "IDLE" else "recent"
         lines.append(fmt_row(row, styles))
         lines.extend(color.wrap(line, color.DIM) for line in model_lines)
         if wide and not wide_inline:
@@ -3429,20 +3443,12 @@ def render_table(
     total_burn_weekly = weekly_percent_text(
         total_recent if total_recent > 0 else None, quota_calibration, total_burn_complete
     )
-    if wide_inline:
-        total_row = [
-            "TOTAL", "", "", total_weekly_text, total_burn_weekly, total_credit_text,
-            token_triplet_text(total_usage),
-            f"{total_cache_tax:.1f}" if total_cache_tax else "—",
-            "100%" if known_credit_total > 0 else "—", "",
-        ]
-    else:
-        total_row = [
-            "TOTAL", "", "", total_weekly_text, total_burn_weekly, total_credit_text,
-            f"{total_cache_tax:.1f}" if total_cache_tax else "—",
-            "100%" if known_credit_total > 0 else "—", "",
-        ]
-    lines.append(color.wrap("  ".join("-" * w for w in widths), color.DIM))
+    total_row = [
+        "TOTAL", "", "", "", total_weekly_text, total_burn_weekly, total_credit_text,
+        f"{total_cache_tax:.1f}" if total_cache_tax else "—",
+        "100%" if known_credit_total > 0 else "—", "",
+    ]
+    lines.append(color.wrap(summary_separator.join("-" * w for w in widths), color.DIM))
     lines.append(fmt_row(total_row, {i: "total" for i in range(len(total_row))}))
     if wide and not wide_inline:
         lines.append(color.wrap(
@@ -3463,7 +3469,7 @@ def render_table(
         lines.append(color.wrap("  Use --wide to add a compact INPUT/CACHED/OUTPUT token triplet.", color.DIM))
     elif not wide_inline:
         lines.append(color.wrap(
-            "  At this terminal width, --wide token diagnostics use continuation lines to preserve SESSION readability.",
+            "  --wide token diagnostics use continuation lines to keep PROJECT and SESSION readable.",
             color.DIM,
         ))
     else:
@@ -3494,11 +3500,13 @@ def render_table(
                 title_style = (color.BOLD, color.GREEN)
             else:
                 title_style = (color.BOLD, color.CYAN) if state == "RECENT" else (color.DIM,)
-            short_title = truncate(b.title, max(30, detail_width - 9))
+            project, session_name = bucket_identity(b)
+            short_title = truncate(session_name, max(30, detail_width - 9))
             lines.append(color.wrap(f"DETAILS  {short_title}", *title_style))
             lines.append(f"session: {b.session_id}")
-            if b.project_name:
-                lines.append(f"project: {b.project_name}")
+            if project:
+                for i, part in enumerate(wrap_display_words(project, detail_width - 9)):
+                    lines.append(("project: " if i == 0 else " " * 9) + part)
             if b.session_name:
                 lines.append(f"Codex name: {b.session_name}")
             if b.thread_title and b.thread_title != b.session_name:
@@ -3652,9 +3660,18 @@ def render_table(
             # AGENT BREAKDOWN
             lines.append("")
             lines.append(color.wrap("Agent breakdown", color.BOLD, color.BLUE))
-            ah = ["ROLE / SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SESSION%"]
-            aw = fit_widths_to_target([27, 16, 9, 11, 10, 8, 8, 8, 9, 9], detail_width, (0, 1))
-            ar = {3, 4, 5, 6, 7, 8, 9}
+            agent_tokens_inline = detail_width >= REPORT_MAX_WIDTH
+            if agent_tokens_inline:
+                ah = ["PROJECT", "ROLE / SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "CREDITS*", "INPUT", "CACHED", "OUTPUT", "CACHE TAX", "SESSION%"]
+                aw = [16, 28, 12, 9, 9, 9, 8, 8, 7, 9, 9]
+            else:
+                ah = ["PROJECT", "ROLE / SESSION", "MODEL(S)", "TIER(S)", "WEEKLY≈", "CREDITS*", "SESSION%"]
+                aw = shrink_widths_to_target(
+                    [18, 40, 16, 9, 11, 10, 9], [7, 12, 8, 5, 7, 8, 8],
+                    detail_width, (0, 2, 3, 1, 4, 5, 6),
+                )
+                aw = fit_widths_to_target(aw, detail_width, (1,))
+            ar = set(range(4, len(ah)))
             lines.append(fmt_detail(ah, aw, ar, {i: "header" for i in range(len(ah))}))
             lines.append(color.wrap("  ".join("-" * w for w in aw), color.DIM))
             agent_rows = []
@@ -3663,25 +3680,37 @@ def render_table(
                 c, complete = model_map_credits(by_model, fast)
                 _, cache_part, _, _ = cost_components_for_map(by_model, fast)
                 role = "SUB" if sid in b.source_is_subagent else "MAIN"
-                title = b.source_titles.get(sid, short_sid(sid))
+                source_session = sessions.get(sid)
+                source_project = b.source_projects.get(sid) or (
+                    project if sid == b.session_id else
+                    _cwd_project_label(source_session.cwd) if source_session is not None else ""
+                )
+                title = session_without_project(b.source_titles.get(sid, short_sid(sid)), source_project)
                 label = f"{role} {short_sid(sid)} {title}"
-                agent_rows.append((sid, label, by_model, u, c, complete, cache_part))
+                agent_rows.append((sid, label, by_model, u, c, complete, cache_part, source_project))
             agent_rows.sort(
                 key=lambda x: (0 if x[0] not in b.source_is_subagent else 1, -(x[4] if x[4] is not None else -1))
             )
             visible_agents = agent_rows if all_agents else agent_rows[:max(0, top_agents)]
-            for sid, label, by_model, u, c, complete, cache_part in visible_agents:
+            for sid, label, by_model, u, c, complete, cache_part, source_project in visible_agents:
                 pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
                 credit_text = "—" if c is None else f"{c:.1f}" + ("" if complete else "+")
                 role_style = "active" if sid not in b.source_is_subagent and state == "ACTIVE" else None
-                model_text, model_lines = model_cell_layout(by_model.keys(), aw[1], detail_width)
-                lines.append(fmt_detail([
-                    label, model_text, tier_label(by_model.keys()),
-                    weekly_percent_text(c, quota_calibration, complete),
-                    credit_text, human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
-                    human_tokens(u.output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
-                ], aw, ar, {0: role_style} if role_style else {}))
+                model_text, model_lines = model_cell_layout(by_model.keys(), aw[2], detail_width)
+                agent_row = [
+                    source_project or "—", label, model_text, tier_label(by_model.keys()),
+                    weekly_percent_text(c, quota_calibration, complete), credit_text,
+                ]
+                if agent_tokens_inline:
+                    agent_row += [human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
+                                  human_tokens(u.output_tokens), f"{cache_part:.1f}" if cache_part else "—"]
+                agent_row.append(pct)
+                lines.append(fmt_detail(agent_row, aw, ar, {1: role_style} if role_style else {}))
                 lines.extend(color.wrap(line, color.DIM) for line in model_lines)
+                if not agent_tokens_inline:
+                    diagnostic = f"TOKENS I/C/O {token_triplet_text(u)} · CACHE TAX {cache_part:.1f}"
+                    lines.extend(color.wrap("  " + part, color.DIM)
+                                 for part in wrap_display_words(diagnostic, detail_width - 2))
             hidden = len(agent_rows) - len(visible_agents)
             if hidden > 0:
                 lines.append(color.wrap(
@@ -3936,7 +3965,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resolve only service-tier segments that remain UNKNOWN as Fast; detected Standard/Fast segments are preserved.",
     )
     p.add_argument("--details", action="store_true", help="Show credit components, MAIN/SUB totals, models, agents and live trend diagnostics.")
-    p.add_argument("--wide", action="store_true", help="Add a compact INPUT/CACHED/OUTPUT token triplet; narrow terminals use continuation lines.")
+    p.add_argument("--wide", action="store_true", help="Add INPUT/CACHED/OUTPUT token triplets on continuation lines, preserving PROJECT/SESSION width.")
     p.add_argument("--top-agents", type=int, default=8, metavar="N", help="With --details, show the top N agents per session (default: 8).")
     p.add_argument("--all-agents", action="store_true", help="With --details, show every agent instead of truncating the agent table.")
     p.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="ANSI color mode for terminal output (default: auto; NO_COLOR is respected).")

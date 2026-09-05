@@ -1,5 +1,18 @@
 # codex-usage
 
+## v1.7.2：PROJECT 与 SESSION 独立显示
+
+摘要现在分成独立的 `PROJECT` 和 `SESSION` 两列。PROJECT 优先显示 Codex
+项目名，没有时沿用工作目录/仓库名回退；SESSION 显示会话名或任务标题，
+不再拼接工具添加的项目前缀。144 格报告中，两列分别占 18 和 33 格。
+缺失项目显示 `—`，没有会话名时显示短 session ID；同名会话标记、子代理
+汇总和 v1.7.1 的完整模型续行继续保留。
+
+`--wide` 使用相同主行，把 `TOKENS I/C/O` 放在淡色续行，不再挤窄名称列。
+DETAILS 单独列出完整 project，Agent breakdown 也将 PROJECT 与 ROLE / SESSION
+分开。无需新参数或重建 cache，不修改计价与 weekly 校准；JSON/CSV 保留
+已有的组合标题及独立项目/名称字段，避免影响现有脚本。
+
 ## v1.7.1：完整显示模型列表
 
 `MODEL(S)` 放不下时，主行显示完整的首个模型及其余模型数量，例如
