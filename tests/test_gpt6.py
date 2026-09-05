@@ -233,14 +233,14 @@ class GPT6Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             path, _ = self.write_rollout(home, now)
-            records = [json.loads(line) for line in path.read_text().splitlines()]
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
             records[-1]["payload"]["rate_limits"] = {
                 "limit_id": "codex", "plan_type": "pro", "secondary": {
                     "used_percent": 0.0, "window_minutes": 10080,
                     "resets_at": int((now+timedelta(days=6)).timestamp())}}
             path.write_text("".join(json.dumps(r)+"\n" for r in records), encoding="utf-8")
             args = [sys.executable, str(SCRIPT), "24h", "--codex-home", str(home),
-                    "--cache-path", str(home / "cli-cache.sqlite3"), "--timezone", "UTC"]
+                    "--cache-path", str(home / "cli-cache.sqlite3")]
             for extra in ([], ["--no-cache"]):
                 result = subprocess.run(args + ["--json"] + extra, text=True,
                                         capture_output=True, check=True, encoding="utf-8")
