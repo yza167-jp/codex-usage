@@ -1,5 +1,26 @@
 # codex-usage
 
+## v1.7.0: GPT-6 Astra support
+
+GPT-6 Astra now participates in session, TOTAL, trailing-hour, model/tier and
+subagent accounting, including weekly estimates, JSON and CSV. The verified
+public **Work/Codex reference rate** is **250 / 25 / 1,250 credits per 1M
+uncached input / cached input / output tokens**; **Fast uses 2.5×** those rates.
+The API's Fast multiplier and API-only surcharges are not used.
+
+`gpt-6-astra` displays as `6 Astra`. Exact `gpt-6`/`gpt6` shorthands are tool
+compatibility aliases, and dated `gpt-6-astra-YYYY-MM-DD` names use the Astra
+family reference rate. Other variants (including Pro and unverified WM pricing)
+are not silently charged as Astra. Detected Standard/Fast and `--fast`'s
+Unknown-only fallback keep their existing semantics.
+
+**No cache rebuild is needed.** Existing token events and quota history are
+retained. Old model rates, calibration coordinates, weekly-first layout,
+144-cell cap and readable project/session labels are unchanged. This release
+adds GPT-6; it does not refresh all older model rates or turn weekly estimates
+into official quota measurements. See [reference sources and compatibility
+notes](docs/v1.7.0-gpt6.md).
+
 ## v1.6.2: readable project-aware wide summaries
 
 v1.6.2 rebalances the 144-cell summary after project-aware labels made the old `--wide` SESSION column too narrow. At the canonical report width, SESSION now receives **34 cells** and INPUT/CACHED/OUTPUT are packed into one `TOKENS I/C/O` column such as `95.2M/92.7M/405K`. Long `[project] title` labels shorten the project tag first and reserve space for the actual Codex name/title, so a row no longer degrades to only `[atomic-cross-mod…]`.

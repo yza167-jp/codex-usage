@@ -1,5 +1,23 @@
 # codex-usage
 
+## v1.7.0：支持 GPT-6 Astra
+
+GPT-6 Astra 现已接入 session、TOTAL、最近一小时、模型/档位、主线程/子代理
+统计，以及 weekly 估算、JSON 和 CSV。采用核实的公开 **Work/Codex 参考费率**：
+每百万未缓存输入、缓存输入、输出 tokens 分别为 **250 / 25 / 1,250 credits**；
+**Fast 为 2.5 倍**，不套用 API 的 Fast 倍率或 API 特有的附加收费。
+
+`gpt-6-astra` 显示为 `6 Astra`。工具兼容 `gpt-6`、`gpt6` 这两个精确简写，
+也能将 `gpt-6-astra-YYYY-MM-DD` 日期后缀形式按 Astra 家族计价；这些兼容规则
+不表示它们都是官方 API ID。不会把 Pro、WM 等尚未核实费率的其他变体统一算成
+Astra。Standard/Fast 分段识别，以及 `--fast` 仅补全 Unknown 的行为不变。
+
+**不需要重建 cache。** 已缓存的 GPT-6 token 记录可以直接重新查询计价，quota
+观测历史保留。本版只新增 GPT-6，不修改旧模型参考费率、已有校准数值坐标、
+weekly-first 布局、144-cell 上限和项目/session 标题排版。公开 credits 费率
+不是订阅 weekly 的官方换算比例；weekly 仍是带来源和可信度标记的估算。
+详见[费率来源和兼容性说明](docs/v1.7.0-gpt6.md)。
+
 ## v1.6.2：加宽可读的 project-aware SESSION
 
 v1.6.2 重新平衡 144-cell 摘要布局。加入 project 前缀后，旧 `--wide` 模式的 SESSION 只有约 18 格，往往只能看到 `[atomic-cross-mod…]`。现在全宽报告会给 SESSION **34 格**，并把 INPUT/CACHED/OUTPUT 合并为紧凑的 `TOKENS I/C/O`，例如 `95.2M/92.7M/405K`。
