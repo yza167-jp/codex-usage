@@ -1,0 +1,73 @@
+name: Apply validated v1.7.0 GPT-6 update
+on:
+  push:
+    branches: [dev/v1.7.0-gpt6]
+    paths: [.github/workflows/v170-apply.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/v1.7.0-gpt6
+          fetch-depth: 0
+      - name: Verify and apply locally tested patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64, gzip, hashlib, subprocess
+          from pathlib import Path
+          encoded = Path('tools/v170-complete.patch.b64').read_text().strip()
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          expected = '7d3f9aae28e37ee65d26ece0853e41f3cf0f0b792398c7753dc70fb26eb9508a'
+          assert hashlib.sha256(patch).hexdigest() == expected, 'Patch digest mismatch'
+          assert subprocess.check_output(['git', 'hash-object', 'codex-usage'], text=True).strip() == '5e63eb8d05509eda87781f8ee431176cc2d5b0bd', 'Unexpected source baseline'
+          Path('/tmp/v170.patch').write_bytes(patch)
+          PY
+          git apply --check /tmp/v170.patch
+          git apply /tmp/v170.patch
+          git diff --check
+      - name: Validate accounting, cache, exports and CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile codex-usage
+          python -m unittest discover -s tests -v 2>&1 | tee /tmp/v170-tests.log
+          python codex-usage --version
+          python codex-usage --help >/dev/null
+          python - <<'PY'
+          import ast, subprocess
+          from pathlib import Path
+          old = ast.parse(subprocess.check_output(['git','show','ba759735ae27136c235bce198fa9b6ffe6277571:codex-usage'],text=True))
+          new = ast.parse(Path('codex-usage').read_text())
+          def mapping(tree, name):
+              return next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.AnnAssign) and isinstance(n.target,ast.Name) and n.target.id==name)
+          for name in ('RATE_CARD','FAST_MULTIPLIERS'):
+              a,b = mapping(old,name),mapping(new,name)
+              assert all(b[k] == v for k,v in a.items()), name + ' changed an existing rate'
+              assert set(b)-set(a) == {'gpt-6-astra'}
+          PY
+      - name: Commit validated production files and remove transport helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/v170-source.yml .github/workflows/v170-apply.yml
+          rm -f tools/v170-patch-0.b64 tools/v170-patch-1.b64 tools/v170-complete.patch.b64
+          git add -A
+          git commit -m 'Add GPT-6 Astra accounting and estimates for v1.7.0'
+          git push origin HEAD:dev/v1.7.0-gpt6
+          git archive --format=tar HEAD > /tmp/v170-validated-source.tar
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v170-validation
+          path: |
+            /tmp/v170-tests.log
+            /tmp/v170-validated-source.tar
+          retention-days: 3
+          if-no-files-found: ignore
