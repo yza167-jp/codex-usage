@@ -1,0 +1,41 @@
+name: Apply validated v1.7.0 source
+
+on:
+  push:
+    branches: [dev/v1.7.0-gpt6]
+    paths: [.github/workflows/v170-apply.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-v170
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Verify and apply source patch
+        run: python tools/apply_v170.py
+      - name: Validate source
+        run: |
+          python -m py_compile codex-usage
+          python -m unittest discover -s tests -v
+          python codex-usage --version
+          python codex-usage --help > /dev/null
+          git diff --check
+      - name: Commit tested source and remove temporary tooling
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm tools/apply_v170.py tools/v170-patch-0.b64 tools/v170-patch-1.b64 tools/v170-patch-2.b64 tools/v170-patch-3.b64
+          git rm .github/workflows/v170-apply.yml .github/workflows/v170-source.yml
+          git add codex-usage tests/test_codex_usage.py tests/test_gpt6.py docs/v1.7.0-gpt6.md README.md README.zh-CN.md CHANGELOG.md
+          git commit -m 'Add GPT-6 Astra pricing and included-allowance metering [v170-applied]'
+          git push origin HEAD:dev/v1.7.0-gpt6
