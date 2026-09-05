@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.1 — 2026-09-05
+
+- Keep full model lists visible using automatic wrapped Models continuation lines instead of ellipsizing names in narrow MODEL(S) cells.
+- Use a complete first model plus an additional-model count, or a compact count when necessary; fitting model lists remain inline.
+- Apply the same display policy to normal/wide summaries, agent breakdowns and long model IDs in model breakdowns.
+- Preserve the 144-cell report cap, SESSION width, numeric alignment, all accounting/calibration code and JSON/CSV exports; no cache rebuild is needed.
+- Add regressions for many/long/CJK model names, mixed tiers, color, narrow/fullscreen layouts, detail tables and unchanged accounting outputs.
+
 ## 1.7.0 — 2026-09-05
 
 - Added GPT-6 Astra Work/Codex reference pricing: 250 / 25 / 1,250 credits per million input / cached input / output tokens, with a 2.5x Fast multiplier.

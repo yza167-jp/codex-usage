@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.7.0", proc.stdout)
+        self.assertIn("1.7.1", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)

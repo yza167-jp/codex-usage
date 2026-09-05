@@ -1,5 +1,20 @@
 # codex-usage
 
+## v1.7.1: complete model lists without wider tables
+
+When `MODEL(S)` does not fit, the main row uses a complete first model plus
+the count of additional models (for example, `5.6 Sol +1`). An indented,
+dim `Models: 5.6 Sol / 6 Astra` continuation then lists every model. A
+fitting list stays inline, so ordinary single-model rows do not grow.
+Very long model identifiers and long lists wrap within the report width
+rather than losing their suffixes to an ellipsis. This applies to normal
+and `--wide` summaries and to model/agent details.
+
+The 144-cell cap, 34-cell wide SESSION column, numeric column alignment,
+accounting, JSON/CSV schemas and cache schema are unchanged. The `+N` in
+MODEL(S) counts additional models; it is not the incomplete-credit `+`.
+No new flag, cache rebuild, fee change or quota recalibration is required.
+
 ## v1.7.0: GPT-6 Astra support
 
 GPT-6 Astra now participates in session, TOTAL, trailing-hour, model/tier and

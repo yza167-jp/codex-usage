@@ -67,7 +67,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
 GPT6_RATE_CARD_AS_OF = "2026-09-05"
@@ -2903,6 +2903,68 @@ def truncate(s: str, width: int) -> str:
     return "".join(out).rstrip("\u200d") + ellipsis
 
 
+def wrap_display_words(text: str, width: int) -> List[str]:
+    """Wrap plain text at terminal-cell boundaries without dropping long IDs.
+
+    Prefer word boundaries. A single overlong model ID is split only when
+    necessary; zero-width combining marks stay with the preceding character.
+    """
+    if width < 2:
+        raise ValueError("display wrapping requires at least two terminal cells")
+    lines: List[str] = []
+    current = ""
+    used = 0
+    for word in text.split():
+        word_width = display_width(word)
+        if current and used + 1 + word_width <= width:
+            current += " " + word
+            used += 1 + word_width
+            continue
+        if current:
+            lines.append(current)
+            current, used = "", 0
+        for ch in word:
+            cells = _terminal_char_width(ch)
+            if used + cells > width:
+                lines.append(current)
+                current, used = "", 0
+            current += ch
+            used += cells
+    if current:
+        lines.append(current)
+    return lines
+
+
+def model_cell_layout(
+    models: Iterable[str], column_width: int, report_width: int,
+) -> Tuple[str, List[str]]:
+    """Keep full model names available without widening the summary table.
+
+    A fitting list stays inline. Overflow uses a complete first model +N (or
+    a model count) and a losslessly wrapped continuation list under that row.
+    Model/tier keys are deduplicated by model, just like the existing label.
+    """
+    names = model_names(models)
+    full = model_label(names)
+    if display_width(full) <= column_width:
+        return full, []
+
+    count = len(names)
+    compact = f"{pretty_model(names[0])} +{count - 1}" if count > 1 else "1 model"
+    if display_width(compact) > column_width:
+        compact = f"{count} models" if count > 1 else "1 model"
+    # Only the count may be clipped on an extremely narrow caller. The full
+    # model list is never ellipsized, including unknown/long model IDs.
+    compact = truncate(compact, column_width)
+    prefix = "  Models: "
+    wrapped = wrap_display_words(full, max(2, report_width - display_width(prefix)))
+    continuation = " " * display_width(prefix)
+    return compact, [
+        (prefix if i == 0 else continuation) + part
+        for i, part in enumerate(wrapped)
+    ]
+
+
 def pad_display(s: str, width: int, right: bool = False) -> str:
     """Truncate and pad a table cell using terminal-cell width."""
     clipped = truncate(s, width)
@@ -3297,16 +3359,19 @@ def render_table(
             burn if burn is not None and burn > 0 else None, quota_calibration, burn_complete
         )
 
+        model_text, model_lines = model_cell_layout(
+            b.usage_by_model.keys(), widths[1], terminal_width
+        )
         if wide_inline:
             row = [
-                title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
+                title, model_text, tier_label(b.usage_by_model.keys()),
                 weekly_text, burn_weekly, credit_text, token_triplet_text(u),
                 f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
             ]
             status_idx, title_idx, burn_idx, cache_idx = 9, 0, 4, 7
         else:
             row = [
-                title, model_label(b.usage_by_model.keys()), tier_label(b.usage_by_model.keys()),
+                title, model_text, tier_label(b.usage_by_model.keys()),
                 weekly_text, burn_weekly, credit_text,
                 f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
             ]
@@ -3343,6 +3408,7 @@ def render_table(
                 styles[burn_idx] = "warn"
 
         lines.append(fmt_row(row, styles))
+        lines.extend(color.wrap(line, color.DIM) for line in model_lines)
         if wide and not wide_inline:
             token_line = f"  TOKENS I/C/O  {token_triplet_text(u)}"
             lines.append(color.wrap(truncate(token_line, terminal_width), color.DIM))
@@ -3573,13 +3639,15 @@ def render_table(
             model_rows.sort(key=lambda x: (x[3] if x[3] is not None else -1), reverse=True)
             for model, tier, u, c, complete, cache_part in model_rows:
                 pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
+                model_text, model_lines = model_cell_layout([model], mw[0], detail_width)
                 lines.append(fmt_detail([
-                    pretty_model(model), service_tier_display(tier, compact=True),
+                    model_text, service_tier_display(tier, compact=True),
                     weekly_percent_text(c, quota_calibration, complete),
                     "—" if c is None else f"{c:.1f}" + ("" if complete else "+"), human_tokens(u.input_tokens),
                     human_tokens(u.cached_input_tokens), human_tokens(u.output_tokens),
                     human_tokens(u.reasoning_output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
                 ], mw, mr))
+                lines.extend(color.wrap(line, color.DIM) for line in model_lines)
 
             # AGENT BREAKDOWN
             lines.append("")
@@ -3606,12 +3674,14 @@ def render_table(
                 pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
                 credit_text = "—" if c is None else f"{c:.1f}" + ("" if complete else "+")
                 role_style = "active" if sid not in b.source_is_subagent and state == "ACTIVE" else None
+                model_text, model_lines = model_cell_layout(by_model.keys(), aw[1], detail_width)
                 lines.append(fmt_detail([
-                    label, model_label(by_model.keys()), tier_label(by_model.keys()),
+                    label, model_text, tier_label(by_model.keys()),
                     weekly_percent_text(c, quota_calibration, complete),
                     credit_text, human_tokens(u.input_tokens), human_tokens(u.cached_input_tokens),
                     human_tokens(u.output_tokens), f"{cache_part:.1f}" if cache_part else "—", pct,
                 ], aw, ar, {0: role_style} if role_style else {}))
+                lines.extend(color.wrap(line, color.DIM) for line in model_lines)
             hidden = len(agent_rows) - len(visible_agents)
             if hidden > 0:
                 lines.append(color.wrap(
