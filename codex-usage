@@ -67,7 +67,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
 GPT6_RATE_CARD_AS_OF = "2026-09-05"
@@ -2802,6 +2802,33 @@ def pretty_model(model: str) -> str:
     return aliases.get(model, model)
 
 
+def model_display_sort_key(key: str) -> Tuple[bool, float, float, float, str]:
+    """Sort model identities by descending Standard reference unit price.
+
+    Uncached input is the primary comparison, then output and cached input.
+    Equal rates use the canonical ID as a deterministic tie-break. Unknown
+    prices sort last without inventing a rate. Neither accumulated spend nor
+    Fast usage changes which model represents a mixed session.
+    """
+    model, _ = split_usage_key(key)
+    rates = RATE_CARD.get(model)
+    if rates is None:
+        return True, 0.0, 0.0, 0.0, model
+    input_rate, cached_rate, output_rate = rates
+    return False, -input_rate, -output_rate, -cached_rate, model
+
+
+def model_tier_display_sort_key(key: str) -> Tuple:
+    """Keep each model together; within a model show Fast before Standard.
+
+    Flex/Unknown stay explicitly unresolved and follow the known tiers. This
+    is presentation ordering only; it does not resolve or price missing tiers.
+    """
+    _, tier = split_usage_key(key)
+    tier_rank = SERVICE_TIER_ORDER.index(tier) if tier in SERVICE_TIER_ORDER else len(SERVICE_TIER_ORDER)
+    return model_display_sort_key(key), tier_rank
+
+
 def model_names(models: Iterable[str]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -2810,7 +2837,7 @@ def model_names(models: Iterable[str]) -> List[str]:
         if model not in seen:
             seen.add(model)
             out.append(model)
-    return out
+    return sorted(out, key=model_display_sort_key)
 
 
 def model_label(models: Iterable[str]) -> str:
@@ -3644,7 +3671,7 @@ def render_table(
                 comp, _ = _credit_components_for_usage_with_completeness(model_key, u, fast)
                 cache_part = comp[1] if comp else 0.0
                 model_rows.append((model, tier, u, c, complete, cache_part))
-            model_rows.sort(key=lambda x: (x[3] if x[3] is not None else -1), reverse=True)
+            model_rows.sort(key=lambda x: model_tier_display_sort_key(usage_key(x[0], x[1])))
             for model, tier, u, c, complete, cache_part in model_rows:
                 pct = f"{100.0 * c / total_credits:.1f}%" if c is not None and total_credits not in (None, 0) else "—"
                 model_text, model_lines = model_cell_layout([model], mw[0], detail_width)
@@ -3780,7 +3807,9 @@ def render_json(
                 "weekly_estimate_is_lower_bound": bool(mc is not None and not mcomplete),
                 "cache_tax_credits": mcomp[1] if mcomp else None,
             })
-        model_breakdown.sort(key=lambda x: x["credit_estimate"] if x["credit_estimate"] is not None else -1, reverse=True)
+        model_breakdown.sort(key=lambda x: model_tier_display_sort_key(
+            usage_key(x["model"], x["service_tier"])
+        ))
 
         tier_breakdown = []
         for tier, tier_map in group_by_service_tier(b.usage_by_model).items():

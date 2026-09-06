@@ -22,25 +22,25 @@ class ModelDisplayTests(unittest.TestCase):
     def test_fitting_multiple_models_stay_inline(self):
         models = ["gpt-5.6-sol", "gpt-6-astra"]
         self.assertEqual(self.m.model_cell_layout(models, 19, 144),
-                         ("5.6 Sol / 6 Astra", []))
+                         ("6 Astra / 5.6 Sol", []))
 
     def test_overflow_lists_all_models_in_continuation(self):
         cell, notes = self.m.model_cell_layout(["gpt-5.6-sol", "gpt-6-astra"], 12, 144)
-        self.assertEqual(cell, "5.6 Sol +1")
-        self.assertEqual(notes, ["  Models: 5.6 Sol / 6 Astra"])
+        self.assertEqual(cell, "6 Astra +1")
+        self.assertEqual(notes, ["  Models: 6 Astra / 5.6 Sol"])
         self.assertNotIn("…", cell + "".join(notes))
 
     def test_count_is_models_not_service_tiers(self):
         keys = [self.m.usage_key("gpt-5.6-sol", t) for t in ("fast", "standard", "unknown")]
         keys += [self.m.usage_key("gpt-6-astra", "standard")]
         self.assertEqual(self.m.model_cell_layout(iter(keys), 12, 144),
-                         ("5.6 Sol +1", ["  Models: 5.6 Sol / 6 Astra"]))
+                         ("6 Astra +1", ["  Models: 6 Astra / 5.6 Sol"]))
 
     def test_narrow_column_uses_count_not_half_a_model(self):
         cell, notes = self.m.model_cell_layout(
             ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra"], 8, 80)
         self.assertEqual(cell, "3 models")
-        self.assertEqual(notes, ["  Models: 5.6 Sol / 5.6 Luna / 6 Astra"])
+        self.assertEqual(notes, ["  Models: 6 Astra / 5.6 Sol / 5.6 Luna"])
 
     def test_long_unknown_identifier_remains_complete(self):
         model = "unpriced-model-" + "x" * 200 + "-final-suffix"
@@ -56,7 +56,7 @@ class ModelDisplayTests(unittest.TestCase):
         for width in (80, 100, 116, 144):
             with self.subTest(width=width):
                 cell, notes = self.m.model_cell_layout(models, 12, width)
-                self.assertEqual(cell, "5.6 Sol +26")
+                self.assertEqual(cell, "6 Astra +26")
                 actual = "".join("".join(line[10:].split()) for line in notes)
                 self.assertEqual(actual, "".join(self.m.model_label(models).split()))
                 self.assertTrue(all(self.m.display_width(line) <= width for line in notes))
@@ -98,8 +98,8 @@ class ModelDisplayTests(unittest.TestCase):
         self.assertEqual(self.m.display_width(header.split("MODEL(S)")[0]), 55)
         main = next(line for line in rows if line.startswith("sample-project"))
         self.assertEqual(self.m.display_width(main), 144)
-        self.assertIn("5.6 Sol +2", main)
-        self.assertIn("  Models: 5.6 Sol / 5.6 Luna / 6 Astra", rows)
+        self.assertIn("6 Astra +2", main)
+        self.assertIn("  Models: 6 Astra / 5.6 Sol / 5.6 Luna", rows)
         total = next(line for line in rows if line.startswith("TOTAL"))
         self.assertIn("100%", total)
         self.assertEqual(sum(line.startswith("TOTAL") for line in rows), 1)
@@ -108,7 +108,7 @@ class ModelDisplayTests(unittest.TestCase):
         for width, wide in ((100, False), (100, True), (116, True), (144, False)):
             with self.subTest(width=width, wide=wide):
                 text = self.render(width=width, wide=wide)
-                self.assertIn("  Models: 5.6 Sol / 5.6 Luna / 6 Astra", text)
+                self.assertIn("  Models: 6 Astra / 5.6 Sol / 5.6 Luna", text)
                 self.assertNotIn("5.6 Sol / 5…", text)
                 if wide and width == 100:
                     self.assertIn("  TOKENS I/C/O", text)
@@ -122,7 +122,7 @@ class ModelDisplayTests(unittest.TestCase):
         agent_section = text.split("\nAgent breakdown\n", 1)[1]
         long_id = "unknown-model-with-a-very-long-identifier-and-unique-suffix"
         self.assertIn("  Models: " + long_id, model_section)
-        self.assertIn("  Models: 5.6 Sol / 5.6 Luna / 6 Astra / " + long_id, agent_section)
+        self.assertIn("  Models: 6 Astra / 5.6 Sol / 5.6 Luna / " + long_id, agent_section)
         for line in text.splitlines():
             self.assertLessEqual(self.m.display_width(line), 144)
 
@@ -147,7 +147,7 @@ class ModelDisplayTests(unittest.TestCase):
                               quota_calibration=cal)
         self.assertEqual(json.loads(before), json.loads(after))
         self.assertIn("Models:", text)
-        self.assertEqual(m.model_label(["gpt-5.6-sol", "gpt-6-astra"]), "5.6 Sol / 6 Astra")
+        self.assertEqual(m.model_label(["gpt-5.6-sol", "gpt-6-astra"]), "6 Astra / 5.6 Sol")
 
 
 if __name__ == "__main__":

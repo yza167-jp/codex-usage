@@ -1,5 +1,24 @@
 # codex-usage
 
+## v1.7.3: highest-priced model first
+
+Model names now use a stable descending **Standard reference unit-price** order,
+not first appearance, alphabetical order, or total credits spent in the session.
+For example, Astra + Sol + Luna is shown as `6 Astra +2` with
+`Models: 6 Astra / 5.6 Sol / 5.6 Luna`. The same order applies to inline lists,
+model details, agent model lists, and JSON/CSV model lists.
+
+Models are compared by uncached-input rate, then output and cached-input rates;
+equal rates use canonical model ID order. A model's Fast usage does not promote
+it above a higher-base-price model. Within the same model, details show Fast,
+Standard, then unresolved Flex/Unknown. Unpriced models remain visible at the
+end; no missing price is guessed. This is display order, not a capability claim.
+
+PROJECT/SESSION widths, the 144-cell cap, session/agent row ordering, numeric
+accounting, Fast multipliers, weekly calibration and cache schema are unchanged.
+JSON/CSV fields and numbers remain compatible; only model-list ordering changes.
+No new flag, network lookup or cache rebuild is needed.
+
 ## v1.7.2: separate PROJECT and SESSION columns
 
 The terminal summary now has independent `PROJECT` and `SESSION` columns.
