@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.3 — 2026-09-06
+
+- Sort model identities by descending Standard reference unit price, so mixed Astra/Sol/Luna sessions display Astra first irrespective of usage volume or insertion order.
+- Apply the same order to inline MODEL(S), compact first-model +N labels, complete Models continuations, model details, agent model lists, and JSON/CSV model lists.
+- Use uncached-input, output, cached-input rates and canonical ID tie-breaks; group tiers per model with Fast before Standard. Keep unpriced models visible last without guessing prices.
+- Preserve session/agent row order, numeric accounting, Fast pricing, weekly calibration, cache schema and the 144-cell PROJECT/SESSION layout. No cache rebuild required.
+- Add price-order, tier, unpriced-model, export compatibility and presentation-only regressions.
+
 ## 1.7.2 — 2026-09-06
 
 - Split terminal PROJECT and SESSION columns using structured project metadata; preserve Codex names, fallback labels, duplicate markers and subagent identity.

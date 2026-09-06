@@ -1,5 +1,20 @@
 # codex-usage
 
+## v1.7.3：优先显示单价更高的模型
+
+多个模型共用一个 session 时，按内置 Standard 参考单价降序显示，不再按出现
+先后或累计消耗排序。例如 Astra + Sol + Luna 的主行显示 `6 Astra +2`，
+续行显示 `Models: 6 Astra / 5.6 Sol / 5.6 Luna`。主表、模型详情、agent 的
+模型列表和 JSON/CSV 中的模型列表采用同一规则。
+
+先比较未缓存输入单价，再比较输出、缓存输入单价；同价按规范化模型 ID 稳定
+排序。Fast 不改变模型本身的排序位置；同模型内部先 Fast、后 Standard，再列
+出未解决的 Flex/Unknown。未定价模型保留在最后，不推测价格或能力高低。
+
+不改变 PROJECT/SESSION 列宽、144 格上限、session/agent 行顺序、金额、weekly
+校准或缓存结构；JSON/CSV 字段和数值保持兼容，仅模型列表顺序改变。
+照常运行即可，无需新参数或重建 cache。
+
 ## v1.7.2：PROJECT 与 SESSION 独立显示
 
 摘要现在分成独立的 `PROJECT` 和 `SESSION` 两列。PROJECT 优先显示 Codex
