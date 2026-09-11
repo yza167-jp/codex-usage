@@ -1,0 +1,23 @@
+name: v1.7.4 source snapshot
+
+on:
+  push:
+    branches: [fix/v1.7.4-quota-calibration]
+    paths: [.github/workflows/v174-source.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/v1.7.4-quota-calibration
+      - run: git archive --format=tar HEAD > /tmp/codex-usage-v174-source.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v174-base-source
+          path: /tmp/codex-usage-v174-source.tar
+          retention-days: 1
