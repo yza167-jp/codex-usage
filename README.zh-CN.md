@@ -1,29 +1,36 @@
 # codex-usage
 
-## v1.8.0：修复 reset 后 weekly 校准失真
+## v1.8.0：整合当前周期校准修复
 
-优先使用当前周期的原始 snapshot 与缓存 token 增量重新校准，不再让两条旧的
-1pp 样本长期支配新周期。重复查询同一百分比平台不会增加独立样本；相邻区间
-共享同一个时间边界，不重叠计数。
+优先使用当前 reset 周期的证据，不再让两条旧样本长期主导换算。已知模型但
+档位未知的区间可在明确假设下参与 **LOW** 估算；互不重叠的学习区间防止重复
+查询虚增可信度。不完整 weekly 以 `12.3%?` 标记，不再宣称严格下界；冲突会
+报警而不是偷偷截成 100%。本版整合并保留 v1.7.4 的修复及全部回归测试。
 
-已知模型但缺少档位的记录可按明确假设参与估算：默认 Standard，`--fast` 时按
-Fast；这些样本始终最高为 LOW，不会冒充完整观测。未定价模型、Flex 等仍排除。
+新增完整分段键的快照/派生表，防止同一时刻不同额度池、窗口长度的记录互相
+覆盖；旧原始快照及仅存 observation 的服务端锚点可重放，不沿用旧 credits
+比例。**无需删除或重建 cache**：schema-3 token、原始 quota 历史、v1.7.4
+派生数据均保留。项目/会话列、模型排序、Fast 参考费率和导出字段保持兼容。
+详见[策略、迁移与局限](docs/v1.8.0-quota-calibration.md)。
 
-```text
-Weekly scale  1% ≈ 549.5 credits* · LOW · current week · 0 complete + 3 assumed / 21.0pp
-```
+## v1.7.4：修复旧 weekly 校准长期不更新
 
-上面是回归测试示例，不是写死的官方换算率。`WEEKLY≈` 的不完整数值现在使用
-`~`，不再以 `≥` 声称是真实订阅扣减的数学下界。明显不一致时显示
-`CALIBRATION MISMATCH`，不会偷偷把结果截为 100% 或强制等于服务端值。
-当前 baseline 会标为 reconciliation；新策略的历史 prior 最长保留七天参考期。
+优先使用**当前 reset 周期**的真实快照和本地 token 增量，重建互不重叠、
+至少跨 3 个百分点的学习区间。同一百分比平台上重复查询不会虚增样本数。
+已知模型但档位未知的区间可在明确假设下参与 **LOW** 估算；未定价模型、Flex
+或历史缺失仍逐区间排除，不会把整个周期永久卡住。
 
-**无需重建缓存。** 保留所有原始 quota 历史和 schema-v3 token 索引，仅隔离并
-重建派生校准样本。模型费率、Fast 计价、项目/会话分列和模型排序不变。
-JSON/CSV 保留旧 lower-bound 字段但设为 false/0，并新增 partial/policy 等元信息。
-详见[校准策略、迁移和局限](docs/v1.8.0-quota-calibration.md)。
+`Weekly scale` 明确显示 `current window`、`assumed tier` 或带日期的历史参考。
+与同一时刻服务端百分比明显矛盾时给出警告，**不把结果偷偷截成 100%**。
+必要时使用明确标记的本机对账 baseline；其与服务端一致是按比例构造的，
+不是 token 统计已获独立验证。
 
-下方历史版本说明记录旧行为；其中旧的“下界”和校准规则以本节及“如何自适应学习”为准。
+不完整的 weekly 估算改用 **`12.3%?`**，不再用 `≥12.3%` 宣称严格下界。
+`CREDITS*` 及其 `+` 标记保留。下面旧版本说明中的校准、下界表述属于历史行为，
+以本节和[新校准说明](docs/v1.7.4-current-window-calibration.md)为准。
+
+**不要删除或重建 cache。** 原始 quota 历史和 schema-3 token 缓存全部保留，
+仅自动重建本轮派生校准。项目/会话分列、模型排序、Fast 费率和 144 格布局不变。
 
 ## v1.7.3：优先显示单价更高的模型
 
@@ -345,29 +352,27 @@ WEEKLY 43% used / 57% left
 
 来自 backend snapshot。脚本同时显示 snapshot age，方便识别 stale telemetry。
 
-## `WEEKLY≈` 如何自适应学习
+## `WEEKLY≈` 如何自适应学习（v1.7.4）
 
-工具先读取当前周期的原始 quota snapshots，再用已缓存的 token 增量重放。
-从一个共同起点开始，首次增长至少 2 个百分点的 snapshot 关闭该区间；下一段
-从同一结束点开始，采用 `(start,end]` 边界，因此重复查询不会重复计费或增加证据量。
+原始快照和校准元数据仍只存本地 SQLite，不复制 token 密钥。新派生表区分
+完整、档位假设和排除区间，并按账号、套餐、模式、额度池、reset、校准策略
+和费率坐标隔离。旧的两条 complete 样本不会再永久盖过当前周期的证据。
 
-当前周期优先，比例使用“不重叠样本的 credits 总和 / 百分比增长总和”，并做有限的
-离群过滤。已知模型的 Unknown 档位按报告使用的同一假设计价，可信度最高 LOW。
-未定价、Flex 或其他不支持的计价不会被假装为完整样本。百分比下降时分段；到达
-100% 的区间不参与学习，因为可能已经发生截断或转入额外付费消耗。
+每次查询用已有缓存的 token 增量重建本轮 `(start,end]` 区间，至少跨 3pp
+才闭合；闭合终点成为下一个起点。重复查询同一个百分比平台不会重复学习。
+Unknown 使用与报表相同的 Standard（或显式 `--fast`）假设，只能给 LOW。
+未定价、Flex、其他 provider 或历史缺失不能伪装成完整区间。
 
-没有可用区间时，依次考虑明确标记的本周期对账 baseline、新策略中七天以内的历史
-prior、经验 plan SEED。旧版标量比例不再直接作为当前有效证据；原始 observations、
-snapshots 和 intervals 均保留。baseline 与服务端总量相等来自构造，不能反证原始
-token 统计正确。
+优先采用本轮区间；不足时可给出明确标记的本机 baseline（假设账户用量主要
+来自本机），再回退至有日期、最多 14 天的历史参考或 SEED。没有固定的官方
+credits/百分比常数。阈值均为工具策略，不是服务端限额；其他设备、工作负载
+变化和遥测延迟都可能引入偏差。
 
-可信度来自不重叠的真实观测，而不是查询次数。明显不一致会显示
-`CALIBRATION MISMATCH`，不裁剪数值或改写 credits。`local/backend≈`（此前的
-coverage）仅是比例诊断，不证明所有额度来自本机。多设备、共享额度池、快照滞后、
-计数缺陷或模型/档位组合变化仍可能影响估算。
+同一快照时刻的本机估算明显超过服务端时，会警告；符合条件才切换到带标签
+的对账 baseline，不偷偷把百分比截成 62% 或 100%。`local coverage≈` 不再
+显示，旧导出字段为 null，因为拟合出来的比例不能证明使用量都来自本机。
 
-新派生表只保存分组键、时间、百分比、计价质量与派生成本，不复制认证 token 或
-对话内容。完整规则见[版本说明](docs/v1.8.0-quota-calibration.md)。
+详见[校准策略与迁移说明](docs/v1.7.4-current-window-calibration.md)。
 
 ## Credits 估算
 
@@ -380,7 +385,7 @@ credits* = uncached input component + cached input component + output component
 
 Reasoning tokens 是 output 的细分，不会重复收费。
 
-`codex-usage` 会从持久化的 `turn_context` / `thread_settings_applied` 设置重建实际档位；`priority` 视为 Fast。缺少档位标记时默认按 Standard 作明确假设的估算；`--fast` 只把这些 Unknown 段按 Fast 估算，不会覆盖已经识别出的 Standard / Fast。
+`codex-usage` 会从持久化的 `turn_context` / `thread_settings_applied` 设置重建实际档位；`priority` 视为 Fast。缺少档位标记时默认按 Standard 给出保守下界；`--fast` 只把这些 Unknown 段按 Fast 估算，不会覆盖已经识别出的 Standard / Fast。
 
 `CREDITS*` 与 `WEEKLY≈` 都不是 OpenAI 官方服务端账单/额度 meter。
 

@@ -46,6 +46,8 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import bisect
+import math
 import base64
 import csv
 import hashlib
@@ -59,8 +61,6 @@ import sys
 import time
 import shutil
 import statistics
-import math
-from bisect import bisect_left, bisect_right
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -76,10 +76,6 @@ GPT6_RATE_CARD_AS_OF = "2026-09-05"
 # Do not invalidate complete historical calibration: no previously priced model
 # or tier changes cost. Old incomplete intervals remain excluded, not relabeled.
 RATE_CARD_CALIBRATION_KEY = "2026-08-12-r3-tier-aware"
-# Separate estimator-policy revision: prices and token schema are unchanged.
-QUOTA_CALIBRATION_POLICY = "2026-09-11-v180-epoch-replay"
-QUOTA_MIN_MOVEMENT_PP = 2.0
-QUOTA_PRIOR_MAX_DAYS = 7
 CACHE_SCHEMA_VERSION = 3
 TREND_MINUTES = 60
 ACTIVE_MINUTES = 15
@@ -278,14 +274,18 @@ class QuotaCalibration:
     observation_count: int = 0
     local_coverage_percent: Optional[float] = None
     source: str = ""
+    revision: str = "2026-09-11-window-v3-scoped"
+    scope: str = ""
+    source_reset_at: Optional[int] = None
+    data_as_of: str = ""
+    evidence_start: str = ""
+    qualified_intervals: int = 0
     assumed_intervals: int = 0
     excluded_intervals: int = 0
-    sample_reset_at: Optional[int] = None
-    sample_start: str = ""
-    sample_end: str = ""
-    comparison_local_percent: Optional[float] = None
+    assumed_credit_percent: float = 0.0
+    prior_credits_per_percent: Optional[float] = None
+    conflict: bool = False
     warnings: List[str] = field(default_factory=list)
-    policy: str = QUOTA_CALIBRATION_POLICY
 
     @property
     def effective_weekly_credits(self) -> Optional[float]:
@@ -1044,7 +1044,7 @@ def _quota_snapshot_from_record(rec: dict, fallback_plan: str = "") -> Optional[
     balance = None
     if isinstance(credits, dict) and credits.get("balance") is not None:
         balance = str(credits.get("balance"))
-    return QuotaSnapshot(
+    snapshot = QuotaSnapshot(
         ts=ts,
         used_percent=float(weekly["used_percent"]),
         window_minutes=int(weekly["window_minutes"]),
@@ -1054,6 +1054,7 @@ def _quota_snapshot_from_record(rec: dict, fallback_plan: str = "") -> Optional[
         source="rollout",
         credit_balance=balance,
     )
+    return snapshot if _valid_quota_snapshot(snapshot) else None
 
 
 def _latest_quota_in_rollout(path: Path, fallback_plan: str) -> Optional[QuotaSnapshot]:
@@ -1111,9 +1112,10 @@ def read_latest_quota_snapshot(codex_home: Path, tz, fallback_plan: str = "") ->
         snap = _latest_quota_in_rollout(path, fallback_plan)
         if snap is None:
             continue
-        if best is None or ((snap.limit_id in ("", "codex")), snap.ts) > (
-            (best.limit_id in ("", "codex")), best.ts
-        ):
+        # Prefer the account-wide Codex pool globally, not merely within
+        # each file; a newer model-specific limit must not replace it.
+        rank = (snap.limit_id in ("", "codex"), snap.ts)
+        if best is None or rank > (best.limit_id in ("", "codex"), best.ts):
             best = snap
     return best
 
@@ -1156,7 +1158,7 @@ def weekly_percent_text(
         text = f"{pct:.2f}%"
     else:
         text = f"{pct:.1f}%"
-    return text if complete else f"~{text}"
+    return text if complete else f"{text}?"
 
 
 def default_cache_path() -> Path:
@@ -1294,21 +1296,33 @@ def _cache_connect(cache_path: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS quota_intervals_lookup
             ON quota_intervals(account_key, plan_type, rate_card, credit_mode, reset_at, end_ts);
-        CREATE TABLE IF NOT EXISTS quota_snapshots_v180 (
-            account_key TEXT NOT NULL, plan_type TEXT NOT NULL, reset_at INTEGER NOT NULL,
-            window_minutes INTEGER NOT NULL, limit_id TEXT NOT NULL, credit_mode TEXT NOT NULL,
-            snapshot_ts TEXT NOT NULL, used_percent REAL NOT NULL, source TEXT NOT NULL,
-            PRIMARY KEY(account_key,plan_type,reset_at,window_minutes,limit_id,credit_mode,snapshot_ts)
+        CREATE TABLE IF NOT EXISTS quota_intervals_v2 (
+            account_key TEXT NOT NULL, plan_type TEXT NOT NULL, credit_mode TEXT NOT NULL,
+            limit_id TEXT NOT NULL, reset_at INTEGER NOT NULL, window_minutes INTEGER NOT NULL,
+            revision TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
+            start_used_percent REAL NOT NULL, end_used_percent REAL NOT NULL,
+            credits REAL NOT NULL, assumed_credits REAL NOT NULL, assumed_events INTEGER NOT NULL,
+            unpriced_events INTEGER NOT NULL, flex_events INTEGER NOT NULL,
+            unsupported_events INTEGER NOT NULL, history_events INTEGER NOT NULL,
+            events INTEGER NOT NULL, quality TEXT NOT NULL,
+            PRIMARY KEY(account_key,plan_type,credit_mode,limit_id,reset_at,revision,start_ts,end_ts)
         );
-        CREATE TABLE IF NOT EXISTS quota_samples_v180 (
-            account_key TEXT NOT NULL, plan_type TEXT NOT NULL, reset_at INTEGER NOT NULL,
-            window_minutes INTEGER NOT NULL, limit_id TEXT NOT NULL, credit_mode TEXT NOT NULL,
-            rate_card TEXT NOT NULL, policy TEXT NOT NULL,
-            start_ts TEXT NOT NULL, end_ts TEXT NOT NULL, start_used REAL NOT NULL, end_used REAL NOT NULL,
-            local_credits REAL NOT NULL, assumed_credits REAL NOT NULL,
-            unpriced_events INTEGER NOT NULL, unsupported_events INTEGER NOT NULL,
-            quality TEXT NOT NULL, movement REAL NOT NULL,
-            PRIMARY KEY(account_key,plan_type,reset_at,window_minutes,limit_id,credit_mode,rate_card,policy,start_ts,end_ts)
+        CREATE TABLE IF NOT EXISTS quota_intervals_v3 (
+            account_key TEXT NOT NULL, plan_type TEXT NOT NULL, credit_mode TEXT NOT NULL,
+            limit_id TEXT NOT NULL, reset_at INTEGER NOT NULL, window_minutes INTEGER NOT NULL,
+            revision TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
+            start_used_percent REAL NOT NULL, end_used_percent REAL NOT NULL,
+            credits REAL NOT NULL, assumed_credits REAL NOT NULL, assumed_events INTEGER NOT NULL,
+            unpriced_events INTEGER NOT NULL, flex_events INTEGER NOT NULL,
+            unsupported_events INTEGER NOT NULL, history_events INTEGER NOT NULL,
+            events INTEGER NOT NULL, quality TEXT NOT NULL,
+            PRIMARY KEY(account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,revision,start_ts,end_ts)
+        );
+        CREATE TABLE IF NOT EXISTS quota_snapshots_v180 (
+            account_key TEXT NOT NULL, plan_type TEXT NOT NULL, credit_mode TEXT NOT NULL,
+            limit_id TEXT NOT NULL, reset_at INTEGER NOT NULL, window_minutes INTEGER NOT NULL,
+            snapshot_ts TEXT NOT NULL, used_percent REAL NOT NULL, source TEXT NOT NULL,
+            PRIMARY KEY(account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,snapshot_ts)
         );
         """
     )
@@ -1319,6 +1333,7 @@ def _cache_connect(cache_path: Path) -> sqlite3.Connection:
     for table, column, declaration in (
         ("files", "current_service_tier", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("events", "service_tier", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("quota_snapshots", "limit_id", "TEXT NOT NULL DEFAULT 'codex'"),
     ):
         columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
@@ -1682,8 +1697,7 @@ def cache_info(conn: sqlite3.Connection, cache_path: Path) -> str:
         f"Indexed rollouts: {files_n}\n"
         f"Token events: {events_n}\n"
         f"Quota observations: {quota_n}\n"
-        f"Quota replay samples: {conn.execute('SELECT COUNT(*) FROM quota_samples_v180').fetchone()[0]}\n"
-        f"Quota policy: {QUOTA_CALIBRATION_POLICY}\n"
+        f"Quota policy: {QUOTA_CALIBRATION_REVISION}\n"
         f"DB size: {size / (1024 * 1024):.2f} MiB\n"
         f"Runtime profile: {machine}"
     )
@@ -1841,41 +1855,25 @@ def _record_quota_snapshot(
     snapshot: QuotaSnapshot,
     fast: bool,
 ) -> None:
-    if snapshot.resets_at is None or not math.isfinite(snapshot.used_percent) or not 0 <= snapshot.used_percent <= 100:
+    if not _valid_quota_snapshot(snapshot):
         return
-    if snapshot.limit_id not in ("", "codex"):
-        conn.execute(
-            "INSERT OR REPLACE INTO quota_snapshots_v180 VALUES(?,?,?,?,?,?,?,?,?)",
-            _quota_scope(auth, snapshot, fast) + (
-                snapshot.ts.astimezone(timezone.utc).isoformat(), snapshot.used_percent, snapshot.source,
-            ),
-        )
-        conn.commit()
-        return
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO quota_snapshots(
-            account_key,plan_type,reset_at,window_minutes,snapshot_ts,
-            used_percent,credit_mode,source
-        ) VALUES(?,?,?,?,?,?,?,?)
-        """,
-        (
-            auth.account_key,
-            _quota_plan(auth, snapshot),
-            int(snapshot.resets_at),
-            int(snapshot.window_minutes),
-            snapshot.ts.astimezone(timezone.utc).isoformat(),
-            float(snapshot.used_percent),
-            _quota_mode(fast),
-            snapshot.source,
-        ),
+    values = (
+        auth.account_key, _quota_plan(auth, snapshot), _quota_mode(fast),
+        snapshot.limit_id or "codex", int(snapshot.resets_at),
+        int(snapshot.window_minutes), snapshot.ts.astimezone(timezone.utc).isoformat(),
+        float(snapshot.used_percent), snapshot.source,
     )
-    conn.execute(
-        "INSERT OR REPLACE INTO quota_snapshots_v180 VALUES(?,?,?,?,?,?,?,?,?)",
-        _quota_scope(auth, snapshot, fast) + (
-            snapshot.ts.astimezone(timezone.utc).isoformat(), snapshot.used_percent, snapshot.source,
-        ),
-    )
+    # v1.7.4 added limit_id as a column, but its old primary key still omitted
+    # pool and duration. Distinct simultaneous observations must not overwrite.
+    conn.execute("""INSERT OR REPLACE INTO quota_snapshots_v180(
+        account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,
+        snapshot_ts,used_percent,source) VALUES(?,?,?,?,?,?,?,?,?)""", values)
+    # Keep a non-destructive compatibility shadow for older audit tools. This
+    # table is no longer authoritative for same-time pool/duration collisions.
+    if values[3] == "codex":
+        conn.execute("""INSERT OR IGNORE INTO quota_snapshots(
+            account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,
+            snapshot_ts,used_percent,source) VALUES(?,?,?,?,?,?,?,?,?)""", values)
     conn.commit()
 
 
@@ -1999,349 +1997,418 @@ def _weighted_median(values: List[Tuple[float, float]]) -> Optional[float]:
     return ordered[-1][0]
 
 
-# v1.8.0 derives calibration from non-overlapping current-epoch snapshots.
-# The old quota tables are kept as evidence; no token rows are migrated.
+# Calibration has its own revision: reference credit rates and token-cache
+# coordinates have NOT changed. Legacy observations remain available as priors.
+QUOTA_CALIBRATION_REVISION = "2026-09-11-window-v3-scoped"
+QUOTA_MIN_INTERVAL_PP = 3.0
+QUOTA_HISTORY_DAYS = 14
+
+
+def _quota_evidence_revision() -> str:
+    return QUOTA_CALIBRATION_REVISION + ":" + RATE_CARD_CALIBRATION_KEY
+
+
 @dataclass
-class QuotaUsage:
+class QuotaCreditSummary:
     credits: float = 0.0
     assumed_credits: float = 0.0
+    assumed_events: int = 0
     unpriced_events: int = 0
+    flex_events: int = 0
     unsupported_events: int = 0
+    history_events: int = 0
+    events: int = 0
+
+    @property
+    def eligible(self) -> bool:
+        return not (self.unpriced_events or self.flex_events or
+                    self.unsupported_events or self.history_events)
 
     @property
     def quality(self) -> str:
-        if self.unpriced_events or self.unsupported_events:
+        if not self.eligible:
             return "excluded"
-        return "assumed_tier" if self.assumed_credits > 1e-9 else "complete"
+        return "assumed_tier" if self.assumed_events else "complete"
 
 
-@dataclass
-class QuotaSample:
-    start_ts: datetime
-    end_ts: datetime
-    start_used: float
-    end_used: float
-    usage: QuotaUsage
+class QuotaCreditLedger:
+    """Query cached token deltas in (start, end] using prefix sums.
 
-    @property
-    def movement(self) -> float:
-        return self.end_used - self.start_used
-
-
-class QuotaTimeline:
-    """One sorted, prefix-summed pass over already indexed token deltas.
-
-    Intervals use (start, end], so the shared boundary event is charged once.
-    Cumulative week totals additionally include the exact window-start event.
-    No transcript is reopened, and old incomplete credits are never promoted
-    to complete: quality is classified afresh from each cached model/tier.
+    Uses the SAME tier-priced credits as the report. Unknown is an explicit
+    assumption, never a silently observed Standard setting. Unpriced/Flex,
+    foreign providers and missing/malformed history cannot teach a conversion.
+    This does not change the existing fork/counter accounting algorithm.
     """
-    def __init__(self, sessions, start: datetime, end: datetime, fast: bool):
-        events = []
-        self.start, self.end = start, end
-        self.has_malformed = False
+    fields = tuple(QuotaCreditSummary.__dataclass_fields__)
+
+    def __init__(self, sessions: Dict[str, RawSession], fast: bool,
+                 start: Optional[datetime] = None, end: Optional[datetime] = None):
+        records = []
         for session in sessions.values():
-            relevant = False
-            provider_ok = (session.model_provider or "openai").lower() in ("openai", "chatgpt")
+            broken_history = bool(session.malformed_lines or (
+                session.lineage_parent() and session.lineage_parent() not in sessions
+            ))
+            foreign = (str(session.model_provider or "").lower() not in
+                       ("", "openai", "chatgpt"))
             for ts, model, tier, usage in compute_deltas(session, sessions):
-                if not start <= ts <= end:
+                if (start is not None and ts < start) or (end is not None and ts > end):
                     continue
-                relevant = True
-                key = usage_key(model, tier)
-                cost, complete = _credit_for_usage_with_completeness(key, usage, fast)
-                assumed = 0.0
-                unpriced, unsupported = int(cost is None), int(not provider_ok)
-                if cost is not None:
-                    if tier == SERVICE_TIER_UNKNOWN:
-                        # --fast is still a declared assumption, not detection.
-                        if fast and normalize_model(model) not in FAST_MULTIPLIERS:
-                            unsupported += 1
-                        else:
-                            assumed = cost
-                    elif not complete:
-                        unsupported += 1  # Flex or Fast without a known multiplier
-                events.append((ts, cost or 0.0, assumed, unpriced, unsupported))
-            if relevant and session.malformed_lines:
-                self.has_malformed = True
-        events.sort(key=lambda item: item[0])
+                cost, complete = _credit_for_usage_with_completeness(
+                    usage_key(model, tier), usage, fast
+                )
+                item = QuotaCreditSummary(
+                    credits=cost or 0.0, events=1,
+                    assumed_credits=(cost or 0.0) if tier == SERVICE_TIER_UNKNOWN else 0.0,
+                    assumed_events=int(tier == SERVICE_TIER_UNKNOWN),
+                    unpriced_events=int(cost is None),
+                    flex_events=int(tier == SERVICE_TIER_FLEX),
+                    unsupported_events=int(foreign or (
+                        not complete and tier not in (SERVICE_TIER_UNKNOWN, SERVICE_TIER_FLEX)
+                        and cost is not None
+                    ) or (fast and tier == SERVICE_TIER_UNKNOWN and
+                          model not in FAST_MULTIPLIERS)),
+                    history_events=int(broken_history),
+                )
+                records.append((ts.timestamp(), item))
+        records.sort(key=lambda entry: entry[0])
         self.times = []
-        self.prefix = [(0.0, 0.0, 0, 0)]
-        for ts, *values in events:
+        self.prefix = [tuple(0 for _ in self.fields)]
+        for ts, item in records:
             self.times.append(ts)
-            self.prefix.append(tuple(a + b for a, b in zip(self.prefix[-1], values)))
+            self.prefix.append(tuple(a + getattr(item, f)
+                                     for a, f in zip(self.prefix[-1], self.fields)))
 
-    def between(self, start: datetime, end: datetime, include_start: bool = False) -> QuotaUsage:
-        left = bisect_left(self.times, start) if include_start else bisect_right(self.times, start)
-        right = bisect_right(self.times, end)
-        values = [max(0, b - a) for a, b in zip(self.prefix[left], self.prefix[right])]
-        if self.has_malformed:
-            values[3] += 1
-        return QuotaUsage(*values)
-
-
-def _quota_scope(auth: LocalAuthContext, snapshot: QuotaSnapshot, fast: bool) -> Tuple:
-    return (auth.account_key, _quota_plan(auth, snapshot), int(snapshot.resets_at or 0),
-            snapshot.window_minutes, snapshot.limit_id or "codex", _quota_mode(fast))
+    def between(self, start: datetime, end: datetime) -> QuotaCreditSummary:
+        a = bisect.bisect_right(self.times, start.timestamp())
+        b = bisect.bisect_right(self.times, end.timestamp())
+        if b <= a:
+            return QuotaCreditSummary()
+        return QuotaCreditSummary(**{
+            f: self.prefix[b][i] - self.prefix[a][i] for i, f in enumerate(self.fields)
+        })
 
 
-def quota_snapshot_points(conn, auth, snapshot, fast) -> List[QuotaSnapshot]:
-    """Import legacy raw snapshots, never their computed credits/complete flags.
+def _valid_quota_snapshot(snapshot: QuotaSnapshot) -> bool:
+    if snapshot.resets_at is None or snapshot.window_minutes <= 0:
+        return False
+    if not math.isfinite(snapshot.used_percent) or not 0 <= snapshot.used_percent <= 100:
+        return False
+    start = snapshot.resets_at - snapshot.window_minutes * 60
+    return start <= snapshot.ts.timestamp() < snapshot.resets_at
 
-    Legacy snapshots predate pool storage and are usable only for the default
-    codex pool. New snapshots are separately keyed by limit ID and duration.
-    Modern records win timestamp ties. Account IDs are never exported.
+
+def _quota_snapshot_points_v180(conn, auth, snapshot, fast):
+    """Merge scoped snapshots with compatible raw legacy anchors, as of one time.
+
+    Missing pool metadata from pre-v1.7.4 observations is only importable for
+    the default Codex pool. Such legacy provenance cannot be recovered exactly.
+    New scoped rows win equal-time collisions; the caller's snapshot wins last.
     """
-    scope = _quota_scope(auth, snapshot, fast)
-    start = quota_window_start(snapshot, timezone.utc)
-    if start is None:
-        return []
+    plan, mode, pool = _quota_plan(auth, snapshot), _quota_mode(fast), snapshot.limit_id or "codex"
+    until = snapshot.ts.astimezone(timezone.utc).isoformat()
+    values = (auth.account_key, plan, mode, pool, snapshot.resets_at,
+              snapshot.window_minutes, until)
+    rows = []
+    if pool == "codex":
+        rows.extend(conn.execute("""SELECT snapshot_ts,used_percent FROM quota_observations
+            WHERE account_key=? AND plan_type=? AND credit_mode=? AND reset_at=?
+              AND window_minutes=? AND snapshot_ts<=? ORDER BY snapshot_ts""",
+            (auth.account_key, plan, mode, snapshot.resets_at, snapshot.window_minutes, until)))
+    rows.extend(conn.execute("""SELECT snapshot_ts,used_percent FROM quota_snapshots
+        WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
+          AND reset_at=? AND window_minutes=? AND snapshot_ts<=? ORDER BY snapshot_ts""", values))
+    rows.extend(conn.execute("""SELECT snapshot_ts,used_percent FROM quota_snapshots_v180
+        WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
+          AND reset_at=? AND window_minutes=? AND snapshot_ts<=? ORDER BY snapshot_ts""", values))
     points = {}
-    if scope[4] == "codex":
-        for table in ("quota_observations", "quota_snapshots"):
-            for row in conn.execute(
-                f"SELECT snapshot_ts,used_percent FROM {table} WHERE account_key=? "
-                "AND plan_type=? AND reset_at=? AND window_minutes=? AND credit_mode=?",
-                (scope[0], scope[1], scope[2], scope[3], scope[5]),
-            ):
-                ts = parse_ts(row["snapshot_ts"])
-                if ts is not None and start <= ts <= snapshot.ts:
-                    points[ts] = float(row["used_percent"])
-    for row in conn.execute(
-        "SELECT snapshot_ts,used_percent FROM quota_snapshots_v180 WHERE "
-        "account_key=? AND plan_type=? AND reset_at=? AND window_minutes=? "
-        "AND limit_id=? AND credit_mode=?", scope,
-    ):
+    for row in rows:
         ts = parse_ts(row["snapshot_ts"])
-        if ts is not None and start <= ts <= snapshot.ts:
-            points[ts] = float(row["used_percent"])
-    points[snapshot.ts] = snapshot.used_percent
-    return [QuotaSnapshot(ts, used, snapshot.window_minutes, snapshot.resets_at,
-                          plan_type=scope[1], limit_id=scope[4])
-            for ts, used in sorted(points.items()) if math.isfinite(used) and 0 <= used <= 100]
+        if ts is None or ts > snapshot.ts:
+            continue
+        point = QuotaSnapshot(ts, float(row["used_percent"]), snapshot.window_minutes,
+                              snapshot.resets_at, plan_type=plan, limit_id=pool)
+        if _valid_quota_snapshot(point):
+            points[ts] = point
+    if _valid_quota_snapshot(snapshot):
+        points[snapshot.ts] = snapshot
+    return sorted(points.values(), key=lambda p: p.ts)
 
 
-def build_quota_samples(points: List[QuotaSnapshot], timeline: QuotaTimeline) -> Tuple[List[QuotaSample], List[str]]:
-    """Freeze the first endpoint that crosses 2pp; repeated plateaus add no vote.
+def _refresh_quota_intervals_v2(conn, auth, snapshot, ledger, fast):
+    """Rebuild derived intervals, never edit/delete the old evidence tables.
 
-    Adjacent accepted/rejected intervals share the same time boundary. An
-    excluded interval advances the anchor too, so one Spark event cannot poison
-    a whole week. Decreases split a regime even if resets_at did not change.
-    Samples ending at 100% are censored and are never used for calibration.
+    Close a block at the FIRST snapshot at least 3pp above its anchor. Both
+    plateau queries and tiny jumps accumulate into that block. Its end becomes
+    the next start, so time and quota movements are never counted twice.
+    A decrease within an unchanged reset ID starts a new segment, not a
+    negative/bridging interval. Saturated endpoints cannot teach a slope.
     """
-    samples, warnings = [], []
-    anchor = previous = None
-    for point in points:
-        if previous is not None and (
-            point.used_percent < previous.used_percent - 1e-9
-            or point.resets_at != previous.resets_at
-            or point.window_minutes != previous.window_minutes
-            or point.limit_id != previous.limit_id
-        ):
-            samples = []
-            anchor = None
-            warnings.append("QUOTA_REGIME_CHANGED")
-        previous = point
-        if point.used_percent >= 100:
-            anchor = None
+    if not _valid_quota_snapshot(snapshot):
+        return
+    params = (auth.account_key, _quota_plan(auth, snapshot), _quota_mode(fast),
+              snapshot.limit_id or "codex", snapshot.resets_at, snapshot.window_minutes)
+    points = []
+    adjustment = False
+    for point in _quota_snapshot_points_v180(conn, auth, snapshot, fast):
+        if points and point.used_percent < points[-1].used_percent:
+            points = []
+            adjustment = True
+        points.append(point)
+    # Stored snapshots may not yet include the caller's final observation.
+    if not points or points[-1].ts < snapshot.ts:
+        if points and snapshot.used_percent < points[-1].used_percent:
+            points = []
+            adjustment = True
+        points.append(snapshot)
+    conn.execute("""DELETE FROM quota_intervals_v3
+        WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
+          AND reset_at=? AND window_minutes=? AND revision=?""",
+        params + (_quota_evidence_revision(),))
+    if not points:
+        return
+    anchor = points[0]
+    for end in points[1:]:
+        if end.used_percent >= 100:
+            break
+        if end.used_percent - anchor.used_percent < QUOTA_MIN_INTERVAL_PP:
             continue
-        if anchor is None:
-            anchor = point
-            continue
-        if point.used_percent - anchor.used_percent < QUOTA_MIN_MOVEMENT_PP:
-            continue
-        usage = timeline.between(anchor.ts, point.ts)
-        samples.append(QuotaSample(anchor.ts, point.ts, anchor.used_percent, point.used_percent, usage))
-        anchor = point
-    return samples, sorted(set(warnings))
-
-
-def save_quota_samples(conn, auth, snapshot, fast, samples) -> None:
-    scope = _quota_scope(auth, snapshot, fast)
-    # This is an explicitly rebuildable derived table, not the original audit
-    # trail. Historical raw snapshots/intervals/observations are untouched.
-    conn.execute(
-        "DELETE FROM quota_samples_v180 WHERE account_key=? AND plan_type=? "
-        "AND reset_at=? AND window_minutes=? AND limit_id=? AND credit_mode=? "
-        "AND rate_card=? AND policy=?", scope + (RATE_CARD_CALIBRATION_KEY, QUOTA_CALIBRATION_POLICY),
-    )
-    conn.executemany(
-        "INSERT INTO quota_samples_v180 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [scope + (RATE_CARD_CALIBRATION_KEY, QUOTA_CALIBRATION_POLICY,
-                  s.start_ts.isoformat(), s.end_ts.isoformat(), s.start_used, s.end_used,
-                  s.usage.credits, s.usage.assumed_credits, s.usage.unpriced_events,
-                  s.usage.unsupported_events, s.usage.quality, s.movement) for s in samples],
-    )
+        summary = ledger.between(anchor.ts, end.ts)
+        conn.execute("""INSERT INTO quota_intervals_v3(
+            account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,
+            revision,start_ts,end_ts,start_used_percent,end_used_percent,
+            credits,assumed_credits,assumed_events,unpriced_events,flex_events,
+            unsupported_events,history_events,events,quality)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", params + (
+                _quota_evidence_revision(), anchor.ts.astimezone(timezone.utc).isoformat(),
+                end.ts.astimezone(timezone.utc).isoformat(),
+                anchor.used_percent, end.used_percent,
+                *(getattr(summary, f) for f in QuotaCreditLedger.fields), summary.quality,
+            ))
+        anchor = end
     conn.commit()
+    return adjustment
 
 
-def _nonoverlapping_samples(samples: List[QuotaSample]) -> List[QuotaSample]:
-    """Defense-in-depth for imported/legacy intervals and programmatic callers."""
-    result, last = [], None
-    for s in sorted(samples, key=lambda s: (s.end_ts, s.start_ts)):
-        if s.end_ts <= s.start_ts or s.movement < QUOTA_MIN_MOVEMENT_PP or not 0 <= s.start_used < s.end_used < 100:
-            continue
-        if last and (s.start_ts < last.end_ts or s.start_used < last.end_used):
-            continue
-        result.append(s)
-        last = s
-    return result
+def _legacy_quota_prior(conn, auth, snapshot, fast) -> QuotaCalibration:
+    """Bounded, explicitly historical fallback; never outranks replayed data.
 
-
-def _legacy_current_samples(conn, auth, snapshot, fast) -> List[QuotaSample]:
-    """Compatibility for stored complete records, not used by live replay.
-
-    Incomplete legacy records have no reason field; only replay can distinguish
-    Unknown tier from an unpriced model. Never guess their quality here.
+    Legacy incomplete intervals do not encode WHY they were incomplete and
+    must not be promoted to complete. Old complete evidence remains a prior.
+    Select one epoch, eliminate overlapping time/quota spans, and avoid future
+    data. A prior's confidence is LOW regardless of old cached sample counts.
     """
-    scope = _quota_scope(auth, snapshot, fast)
-    samples = []
-    if scope[4] != "codex":
-        return samples
-    start = quota_window_start(snapshot, timezone.utc)
-    for row in conn.execute(
-        "SELECT * FROM quota_intervals WHERE account_key=? AND plan_type=? "
-        "AND reset_at=? AND credit_mode=? AND rate_card=? AND complete=1",
-        (scope[0], scope[1], scope[2], scope[5], RATE_CARD_CALIBRATION_KEY),
-    ):
-        a, b = parse_ts(row["start_ts"]), parse_ts(row["end_ts"])
-        cost = row["local_credits"]
-        if a and b and start <= a < b <= snapshot.ts and cost is not None and math.isfinite(float(cost)):
-            samples.append(QuotaSample(a, b, float(row["start_used_percent"]),
-                                       float(row["end_used_percent"]), QuotaUsage(float(cost))))
-    if not samples:
-        rows = list(conn.execute(
-            "SELECT * FROM quota_observations WHERE account_key=? AND plan_type=? "
-            "AND reset_at=? AND credit_mode=? AND rate_card=? AND window_minutes=? ORDER BY snapshot_ts",
-            (scope[0], scope[1], scope[2], scope[5], RATE_CARD_CALIBRATION_KEY, scope[3]),
-        ))
-        for a, b in zip(rows, rows[1:]):
-            ta, tb = parse_ts(a["snapshot_ts"]), parse_ts(b["snapshot_ts"])
-            if ta and tb and start <= ta < tb <= snapshot.ts:
-                samples.append(QuotaSample(ta, tb, float(a["used_percent"]), float(b["used_percent"]),
-                                           QuotaUsage(float(b["local_credits"]) - float(a["local_credits"]))))
-    return _nonoverlapping_samples(samples)
-
-
-def _historical_quota_prior(conn, auth, snapshot, fast) -> Optional[QuotaCalibration]:
-    """Bounded prior only: never compete with current evidence or gain confidence."""
-    scope = _quota_scope(auth, snapshot, fast)
-    since = snapshot.ts - timedelta(days=QUOTA_PRIOR_MAX_DAYS)
-    rows = list(conn.execute(
-        "SELECT * FROM quota_samples_v180 WHERE account_key=? AND plan_type=? "
-        "AND reset_at<>? AND window_minutes=? AND limit_id=? AND credit_mode=? "
-        "AND rate_card=? AND policy=? AND quality IN ('complete','assumed_tier') ORDER BY end_ts DESC",
-        scope + (RATE_CARD_CALIBRATION_KEY, QUOTA_CALIBRATION_POLICY),
-    ))
-    # A legacy coefficient is NOT imported into the new sample table; raw rows
-    # survive for diagnostics and require replay before they can teach v1.8.
-    recent = [r for r in rows if parse_ts(r["end_ts"]) and since <= parse_ts(r["end_ts"]) <= snapshot.ts
-              and r["local_credits"] > 0 and r["movement"] >= QUOTA_MIN_MOVEMENT_PP]
-    if not recent:
-        return None
-    newest_reset = recent[0]["reset_at"]
-    recent = [r for r in recent if r["reset_at"] == newest_reset]
-    usable = _nonoverlapping_samples([
-        QuotaSample(parse_ts(r["start_ts"]), parse_ts(r["end_ts"]), r["start_used"], r["end_used"],
-                    QuotaUsage(r["local_credits"], r["assumed_credits"]))
-        for r in recent if parse_ts(r["start_ts"]) and math.isfinite(r["local_credits"])
-    ])
-    if len(usable) >= 3:
-        center = statistics.median(s.usage.credits / s.movement for s in usable)
-        usable = [s for s in usable if center * 0.5 <= s.usage.credits / s.movement <= center * 2.0]
-    if not usable:
-        return None
-    cpp = sum(s.usage.credits for s in usable) / sum(s.movement for s in usable)
-    return QuotaCalibration(credits_per_percent=cpp, confidence="LOW", source="historical_prior",
-                            sample_reset_at=int(newest_reset), sample_end=usable[-1].end_ts.isoformat())
-
-
-def load_quota_calibration(
-    conn: sqlite3.Connection, auth: LocalAuthContext, snapshot: QuotaSnapshot,
-    current_local_credits: Optional[float], fast: bool,
-    samples: Optional[List[QuotaSample]] = None,
-    current_quality: Optional[QuotaUsage] = None,
-    regime_changed: bool = False,
-) -> QuotaCalibration:
-    """Current-epoch evidence first; ratios and numerator use the same pricing assumptions.
-
-    Unknown tiers are estimateable at the explicitly selected Standard/Fast
-    assumption, but their samples cap confidence at LOW. Flex, unpriced models,
-    malformed local history, and zero-local-usage movements are excluded.
-    """
-    cal = QuotaCalibration(sample_reset_at=snapshot.resets_at)
-    week_start = quota_window_start(snapshot, timezone.utc)
-    proposed = _legacy_current_samples(conn, auth, snapshot, fast) if samples is None else samples
-    all_samples = _nonoverlapping_samples([
-        s for s in proposed if week_start is not None and week_start <= s.start_ts < s.end_ts <= snapshot.ts
-    ])
-    cal.observation_count = len(all_samples)
-    valid = [s for s in all_samples if s.usage.quality != "excluded"
-             and math.isfinite(s.usage.credits) and s.usage.credits > 0]
-    # Isolated rate outliers do not automatically mean external usage. Retain
-    # an explicit exclusion count; avoid outlier filtering with tiny samples.
-    if len(valid) >= 3:
-        ratios = [s.usage.credits / s.movement for s in valid]
-        center = statistics.median(ratios)
-        valid = [s for s in valid if center * 0.5 <= s.usage.credits / s.movement <= center * 2.0]
-    cal.excluded_intervals = len(all_samples) - len(valid)
-    if valid:
-        # Ratio of sums is less vulnerable to percentage rounding than a
-        # lower-median of two one-point jumps, and intervals never overlap.
-        pp = sum(s.movement for s in valid)
-        cal.credits_per_percent = sum(s.usage.credits for s in valid) / pp
-        cal.clean_intervals = sum(s.usage.quality == "complete" for s in valid)
-        cal.assumed_intervals = len(valid) - cal.clean_intervals
-        cal.observed_percent_points = pp
-        cal.sample_start, cal.sample_end = valid[0].start_ts.isoformat(), valid[-1].end_ts.isoformat()
-        cal.source = "current_assumed" if cal.assumed_intervals else "delta"
-        cal.confidence = "LOW"
-        ratios = [s.usage.credits / s.movement for s in valid]
-        spread = (max(ratios) - min(ratios)) / cal.credits_per_percent
-        if not cal.assumed_intervals and len(valid) >= 3 and pp >= 8 and spread <= 0.5:
-            cal.confidence = "HIGH" if len(valid) >= 5 and pp >= 20 and spread <= 0.25 else "MEDIUM"
-    # A fresh baseline is explicitly reconciliation, not independent validation.
-    # Never derive it from a 100%-censored or very small initial percentage.
-    if cal.credits_per_percent is None and not regime_changed and 3 <= snapshot.used_percent < 100:
-        quality = current_quality
-        if quality is None and current_local_credits is not None:
-            quality = QuotaUsage(current_local_credits)
-        if quality and quality.credits > 0 and quality.quality != "excluded":
-            cal.credits_per_percent = quality.credits / snapshot.used_percent
-            cal.source = "current_baseline_assumed" if quality.quality == "assumed_tier" else "baseline"
-            cal.confidence = "LOW"
-        elif samples is None and snapshot.limit_id in ("", "codex"):
-            # Internal compatibility/rebase path. Only current-period, current-
-            # rate complete anchors may provide a baseline.
-            rows = conn.execute(
-                "SELECT * FROM quota_observations WHERE account_key=? AND plan_type=? "
-                "AND reset_at=? AND window_minutes=? AND credit_mode=? AND rate_card=? ORDER BY snapshot_ts DESC",
-                (auth.account_key, _quota_plan(auth, snapshot), snapshot.resets_at, snapshot.window_minutes,
-                 _quota_mode(fast), RATE_CARD_CALIBRATION_KEY),
+    # Older tables did not store pool IDs. They are never a prior for a
+    # model-specific quota pool.
+    if snapshot.limit_id not in ("", "codex"):
+        return QuotaCalibration()
+    since = snapshot.ts.astimezone(timezone.utc) - timedelta(days=QUOTA_HISTORY_DAYS)
+    params = (auth.account_key, _quota_plan(auth, snapshot), RATE_CARD_CALIBRATION_KEY,
+              _quota_mode(fast), since.isoformat(), snapshot.ts.astimezone(timezone.utc).isoformat())
+    rows = conn.execute("""SELECT * FROM quota_intervals
+        WHERE account_key=? AND plan_type=? AND rate_card=? AND credit_mode=?
+          AND complete=1 AND local_credits>0 AND end_ts>=? AND end_ts<=?
+        ORDER BY reset_at DESC,end_ts,start_ts""", params).fetchall()
+    clean = []
+    epoch = None
+    last_end = None
+    last_used = None
+    for row in rows:
+        start, end = parse_ts(row["start_ts"]), parse_ts(row["end_ts"])
+        du = float(row["end_used_percent"]) - float(row["start_used_percent"])
+        if (start is None or end is None or end <= start or du <= 0 or
+                float(row["end_used_percent"]) >= 100):
+            continue
+        if epoch is None:
+            epoch = int(row["reset_at"])
+        if int(row["reset_at"]) != epoch:
+            continue
+        if last_end is not None and (start < last_end or float(row["start_used_percent"]) < last_used):
+            continue
+        cost = float(row["local_credits"])
+        if not math.isfinite(cost):
+            continue
+        clean.append((cost / du, du))
+        last_end, last_used = end, float(row["end_used_percent"])
+    if clean:
+        return QuotaCalibration(
+            credits_per_percent=_weighted_median(clean), confidence="LOW",
+            source="historical_prior", scope="historical", source_reset_at=epoch,
+            data_as_of=last_end.isoformat(), qualified_intervals=len(clean),
+            observed_percent_points=sum(w for _, w in clean),
+        )
+    rows = conn.execute("""SELECT * FROM quota_observations
+        WHERE account_key=? AND plan_type=? AND rate_card=? AND credit_mode=?
+          AND snapshot_ts>=? AND snapshot_ts<=? AND used_percent>=1 AND used_percent<100
+          AND local_credits>0 ORDER BY snapshot_ts DESC""", params).fetchall()
+    if rows:
+        row = rows[0]
+        cost = float(row["local_credits"])
+        if math.isfinite(cost):
+            same = int(row["reset_at"]) == snapshot.resets_at
+            return QuotaCalibration(
+                credits_per_percent=cost / float(row["used_percent"]), confidence="LOW",
+                source="rebased_baseline" if same and row["source"] == "rebased" else "historical_prior",
+                scope="historical", source_reset_at=int(row["reset_at"]),
+                data_as_of=str(row["snapshot_ts"]),
             )
-            for row in rows:
-                ts = parse_ts(row["snapshot_ts"])
-                if ts and ts <= snapshot.ts and 3 <= row["used_percent"] < 100 and row["local_credits"] > 0:
-                    cal.credits_per_percent = row["local_credits"] / row["used_percent"]
-                    cal.source = "rebased_baseline" if row["source"] == "rebased" else "stored_baseline"
-                    cal.confidence = "LOW"
-                    break
-    if cal.credits_per_percent is None and not regime_changed:
-        prior = _historical_quota_prior(conn, auth, snapshot, fast)
-        if prior:
-            cal = prior
-    if current_quality is not None and cal.credits_per_percent:
-        predicted = current_quality.credits / cal.credits_per_percent
-        cal.comparison_local_percent = predicted
-        # This test is an inconsistency detector, not proof that the raw log
-        # counters are right. It never clips displayed usage or rewrites credits.
-        if not regime_changed and snapshot.used_percent < 100 and predicted > snapshot.used_percent + max(3.0, snapshot.used_percent * 0.25):
-            cal.warnings.append("CALIBRATION_MISMATCH")
+    return QuotaCalibration()
+
+
+def load_quota_calibration(conn, auth, snapshot, current_local_credits, fast,
+                           *, ledger=None) -> QuotaCalibration:
+    """Current-window evidence first; historic numbers are only a fallback.
+
+    Unknown-tier intervals can learn an explicitly assumption-dependent scale
+    on the SAME credit basis used by every report row. They are always LOW.
+    Unpriced/Flex/unsupported/incomplete-history intervals cannot teach a slope.
+    No result is a guaranteed provider-quota lower bound, even if credits are
+    partial. Conflicts are surfaced, never hidden by clipping percentages.
+    """
+    if snapshot.limit_id not in ("", "codex"):
+        cal = bootstrap_quota_calibration(auth, snapshot)
+        cal.scope = "seed"
+        cal.warnings.append("Model-specific quota pool: full-account calibration is disabled; using an unvalidated plan seed.")
+        return cal
+    prior = _legacy_quota_prior(conn, auth, snapshot, fast)
+    adjustment = False
+    if ledger is not None:
+        adjustment = bool(_refresh_quota_intervals_v2(conn, auth, snapshot, ledger, fast))
+    params = (auth.account_key, _quota_plan(auth, snapshot), _quota_mode(fast),
+              snapshot.limit_id or "codex", snapshot.resets_at, snapshot.window_minutes,
+              _quota_evidence_revision(), snapshot.ts.astimezone(timezone.utc).isoformat())
+    rows = conn.execute("""SELECT * FROM quota_intervals_v3
+        WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
+          AND reset_at=? AND window_minutes=? AND revision=? AND end_ts<=?
+        ORDER BY end_ts""", params).fetchall()
+    valid = [r for r in rows if r["quality"] != "excluded" and r["credits"] > 0]
+    # Ignore old blocks within a week too: activity composition can change.
+    cutoff = (snapshot.ts.astimezone(timezone.utc) - timedelta(hours=48)).isoformat()
+    valid = [r for r in valid if r["end_ts"] >= cutoff]
+    summary = None
+    if ledger is not None and _valid_quota_snapshot(snapshot):
+        start = quota_window_start(snapshot, timezone.utc) - timedelta(microseconds=1)
+        summary = ledger.between(start, snapshot.ts)
+        current_local_credits = summary.credits
+    cal = QuotaCalibration()
+    if valid:
+        # Robust rejection only after enough independent blocks; never count
+        # repeated queries as additional evidence. Aggregate credits/pp avoids
+        # the lower-of-two weighted-median discontinuity seen in v1.7.3.
+        if len(valid) >= 5:
+            center = statistics.median(r["credits"] / (r["end_used_percent"] - r["start_used_percent"]) for r in valid)
+            valid = [r for r in valid if 0.5 * center <= r["credits"] / (r["end_used_percent"] - r["start_used_percent"]) <= 2 * center]
+        pp = sum(r["end_used_percent"] - r["start_used_percent"] for r in valid)
+        cost = sum(r["credits"] for r in valid)
+        assumed = sum(r["quality"] == "assumed_tier" for r in valid)
+        cal = QuotaCalibration(
+            credits_per_percent=cost / pp, confidence="LOW", scope="current_window",
+            source="current_delta_assumed" if assumed else "current_delta",
+            source_reset_at=snapshot.resets_at, data_as_of=valid[-1]["end_ts"],
+            evidence_start=valid[0]["start_ts"], qualified_intervals=len(valid),
+            clean_intervals=len(valid) - assumed, assumed_intervals=assumed,
+            observed_percent_points=pp,
+            assumed_credit_percent=100 * sum(r["assumed_credits"] for r in valid) / cost,
+        )
+        if not assumed and len(valid) >= 3 and pp >= 10:
+            ratios = [r["credits"] / (r["end_used_percent"] - r["start_used_percent"]) for r in valid]
+            spread = max(ratios) / min(ratios)
+            if spread <= 1.5:
+                cal.confidence = "HIGH" if len(valid) >= 6 and pp >= 20 else "MEDIUM"
+    elif (not adjustment and summary is not None and summary.eligible and summary.events and summary.credits > 0 and
+          3 <= snapshot.used_percent < 100):
+        cal = QuotaCalibration(
+            credits_per_percent=summary.credits / snapshot.used_percent, confidence="LOW",
+            source="current_baseline_assumed" if summary.assumed_events else "current_baseline",
+            scope="current_window", source_reset_at=snapshot.resets_at,
+            data_as_of=snapshot.ts.isoformat(),
+        )
+        cal.warnings.append("Current baseline assumes this machine explains the account usage; agreement is by construction.")
+    else:
+        # Reuse only a recent same-policy, same-pool v2 cohort. Never pool
+        # different reset periods together or import old complete flags.
+        old = conn.execute("""SELECT * FROM quota_intervals_v3
+            WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
+              AND window_minutes=? AND revision=? AND reset_at<>?
+              AND end_ts>=? AND end_ts<=? AND quality<>'excluded' AND credits>0
+            ORDER BY end_ts DESC""", (
+                auth.account_key, _quota_plan(auth, snapshot), _quota_mode(fast),
+                snapshot.limit_id or "codex", snapshot.window_minutes,
+                _quota_evidence_revision(), snapshot.resets_at,
+                (snapshot.ts.astimezone(timezone.utc) - timedelta(days=QUOTA_HISTORY_DAYS)).isoformat(),
+                snapshot.ts.astimezone(timezone.utc).isoformat(),
+            )).fetchall()
+        if old:
+            epoch = old[0]["reset_at"]
+            cohort = [r for r in old if r["reset_at"] == epoch]
+            pp = sum(r["end_used_percent"] - r["start_used_percent"] for r in cohort)
+            if pp > 0:
+                prior = QuotaCalibration(
+                    credits_per_percent=sum(r["credits"] for r in cohort) / pp,
+                    confidence="LOW", source="historical_prior", scope="historical",
+                    source_reset_at=epoch, data_as_of=old[0]["end_ts"],
+                    qualified_intervals=len(cohort), observed_percent_points=pp,
+                    assumed_intervals=sum(r["quality"] == "assumed_tier" for r in cohort),
+                )
+        cal = prior if prior.credits_per_percent else bootstrap_quota_calibration(auth, snapshot)
+        cal.scope = "historical" if prior.credits_per_percent else "seed"
+    cal.excluded_intervals = sum(r["quality"] == "excluded" for r in rows)
+    cal.observation_count = len(rows)
+    # Do not compare partial current-week data to a different moment in time.
+    if not adjustment and current_local_credits is not None and cal.credits_per_percent and snapshot.used_percent >= 3:
+        local_pp = current_local_credits / cal.credits_per_percent
+        tolerance = max(3.0, snapshot.used_percent * 0.25)
+        if local_pp > snapshot.used_percent + tolerance and snapshot.used_percent < 100:
+            cal.conflict = True
+            cal.warnings.append(
+                f"CALIBRATION MISMATCH: local {local_pp:.1f}% vs backend {snapshot.used_percent:.1f}% at snapshot; audit history/external usage."
+            )
+            # An explicit local-only baseline is preferable to silently retaining
+            # an incompatible stale ratio. Unpriceable data must NOT normalize.
+            if summary is not None and summary.eligible and summary.events:
+                cal.prior_credits_per_percent = cal.credits_per_percent
+                cal.credits_per_percent = summary.credits / snapshot.used_percent
+                cal.source = "reconciled_baseline"
+                cal.scope = "current_window"
+                cal.data_as_of = snapshot.ts.isoformat()
+                cal.source_reset_at = snapshot.resets_at
+                cal.confidence = "LOW"
+                cal.clean_intervals = cal.assumed_intervals = cal.qualified_intervals = 0
+                cal.observed_percent_points = 0.0
+                cal.warnings.append("Using a labeled local-only baseline, not independent validation; no clipping was applied.")
+            else:
+                cal.confidence = "CONFLICT"
+        if prior.credits_per_percent and prior.credits_per_percent != cal.credits_per_percent:
+            implied = current_local_credits / prior.credits_per_percent
+            if implied > snapshot.used_percent + tolerance:
+                cal.prior_credits_per_percent = prior.credits_per_percent
+                cal.warnings.append(
+                    f"Old scale {prior.credits_per_percent:.1f} rejected: it implies {implied:.1f}% vs backend {snapshot.used_percent:.1f}%."
+                )
+    if cal.source.endswith("assumed") or cal.assumed_intervals or (summary and summary.assumed_events):
+        if cal.confidence not in ("CONFLICT", "SEED"):
             cal.confidence = "LOW"
-        if cal.source in ("delta", "current_assumed") and snapshot.used_percent > 0:
-            cal.local_coverage_percent = 100 * predicted / snapshot.used_percent
-    if regime_changed:
-        cal.warnings.append("QUOTA_REGIME_CHANGED")
+        assumed_tier = "Fast" if fast else "Standard"
+        cal.warnings.append(f"Unknown tiers assumed {assumed_tier}; model/usage mix can change this LOW-confidence scale.")
+    if cal.scope == "historical" and cal.data_as_of:
+        cal.warnings.append(f"Historical prior from {cal.data_as_of[:10]}; not learned in this reset period.")
+    if cal.excluded_intervals:
+        cal.warnings.append(f"Excluded {cal.excluded_intervals} interval(s): unpriced/Flex/provider or incomplete history; later intervals can still learn.")
+    if adjustment:
+        cal.warnings.append("Quota decreased without a new reset ID; only post-adjustment deltas are used, and whole-week reconciliation is disabled.")
+    if summary is not None and not summary.eligible:
+        cal.warnings.append("Current-week credits include unpriced/Flex/provider or incomplete-history portions; no local-only normalization is allowed.")
+    if snapshot.limit_id not in ("", "codex"):
+        cal.warnings.append("Model-specific quota pool: comparison with all local sessions may be incomplete.")
+    # A scalar fit is not evidence that all account usage came from this device.
+    cal.local_coverage_percent = None
     return cal
+
+
+def quota_calibration_metadata(cal):
+    if cal is None:
+        return None
+    return {f: getattr(cal, f) for f in QuotaCalibration.__dataclass_fields__}
+
 
 def _clean_thread_label(value: object) -> str:
     return " ".join(str(value or "").split())
@@ -2816,8 +2883,8 @@ def _tier_multiplier(model: str, tier: str, assume_fast_unknown: bool) -> Tuple[
             return (multiplier, True) if multiplier is not None else (1.0, False)
         # Standard is a conservative lower bound when this model supports Fast.
         return 1.0, model not in FAST_MULTIPLIERS
-    # Flex is kept distinct in reports. Without a verified Codex subscription
-    # rule, Standard pricing is an assumed diagnostic, not a proven lower bound.
+    # Flex is kept distinct in reports. Until a Codex subscription credit rule
+    # is embedded for it, Standard pricing is only a lower-bound diagnostic.
     return 1.0, False
 
 
@@ -3556,39 +3623,36 @@ def render_table(
     if quota_snapshot is not None:
         used = quota_snapshot.used_percent
         left = max(0.0, 100.0 - used)
+        pool_note = f" [{quota_snapshot.limit_id}]" if quota_snapshot.limit_id not in ("", "codex") else ""
         sub_line = (
-            f"Subscription  {plan_display_name(plan_raw)} · CURRENT WEEK {used:.1f}% used / {left:.1f}% left "
+            f"Subscription  {plan_display_name(plan_raw)}{pool_note} · CURRENT WEEK {used:.1f}% used / {left:.1f}% left "
             f"· reset {human_until(quota_snapshot.resets_at, now)} · snapshot {human_age(quota_snapshot.ts, now)}"
         )
         sub_style = color.RED if used >= 85 else color.YELLOW if used >= 60 else color.GREEN
         lines.append(color.wrap(truncate(sub_line, terminal_width), color.BOLD, sub_style))
+        if quota_snapshot.resets_at is not None and quota_snapshot.resets_at <= now.timestamp():
+            lines.append(color.wrap("Quota note  SNAPSHOT EXPIRED: current-week balance is unknown; displayed snapshot is historical.", color.YELLOW))
+        elif (now - quota_snapshot.ts).total_seconds() > 3600:
+            lines.append(color.wrap("Quota note  Snapshot is over 1h old; percentages after that time are extrapolated estimates.", color.DIM))
         if quota_calibration is not None and quota_calibration.credits_per_percent:
             cal = quota_calibration
             coverage = (
-                f" · local/backend≈{cal.local_coverage_percent:.0f}%"
+                f" · local coverage≈{cal.local_coverage_percent:.0f}%"
                 if cal.local_coverage_percent is not None else ""
             )
-            if cal.source in ("delta", "current_assumed"):
-                cal_meta = (
-                    f" · current week · {cal.clean_intervals} complete + {cal.assumed_intervals} assumed"
-                    f" / {cal.observed_percent_points:.1f}pp"
-                )
-            elif cal.source == "current_baseline_assumed":
-                cal_meta = " · current baseline (tier assumed; reconciliation)"
+            if cal.source.startswith("current_delta"):
+                cal_meta = (f" · current window · {cal.qualified_intervals} blocks / "
+                            f"{cal.observed_percent_points:.1f}pp")
+                if cal.assumed_intervals:
+                    cal_meta += " · assumed tier"
+            elif cal.source in ("current_baseline", "current_baseline_assumed", "reconciled_baseline"):
+                cal_meta = " · current local-only baseline"
             elif cal.source == "historical_prior":
-                cal_meta = " · historical prior (max 7d; not current-week evidence)"
-            elif cal.source == "rebased_baseline":
-                cal_meta = " · rebased baseline"
-            elif cal.source == "historical_rebased":
-                cal_meta = " · historical rebase"
-            elif cal.source == "historical_baseline":
-                cal_meta = " · historical baseline"
-            elif cal.source == "stored_baseline":
-                cal_meta = " · stored baseline"
+                cal_meta = f" · historical prior {cal.data_as_of[:10]}"
             elif cal.source in ("plan_seed", "generic_seed"):
                 cal_meta = " · plan bootstrap"
             else:
-                cal_meta = " · current baseline (reconciliation)"
+                cal_meta = f" · {cal.source or 'baseline'}"
             scale_line = (
                 f"Weekly scale  1% ≈ {cal.credits_per_percent:.1f} credits* · {cal.confidence}"
                 f"{cal_meta}{coverage}"
@@ -3598,7 +3662,7 @@ def render_table(
                 local_week = weekly_percent_text(quota_local_credits, cal, quota_local_complete)
                 credit_mark = f"{quota_local_credits:.1f}" + ("" if quota_local_complete else "+")
             elif not quota_local_complete:
-                local_week = "~0.00%"
+                local_week = "0.00%?"
                 credit_mark = "0.0+"
             else:
                 local_week = "0.00%"
@@ -3607,25 +3671,13 @@ def render_table(
                 truncate(f"Local this week≈ {local_week} · CREDITS* {credit_mark}", terminal_width),
                 color.DIM,
             ))
-            notices = {
-                "CALIBRATION_MISMATCH": (
-                    f"CALIBRATION MISMATCH: local estimate {cal.comparison_local_percent:.1f}% "
-                    f"vs backend {used:.1f}%. Check local accounting, tier mix or shared usage; no clipping applied."
-                ) if cal.comparison_local_percent is not None else "CALIBRATION MISMATCH: scale conflicts with backend usage.",
-                "QUOTA_REGIME_CHANGED": "QUOTA REGIME CHANGED: calibration uses only the segment after the decrease; week totals need caution.",
-                "QUOTA_POOL_UNSUPPORTED": "QUOTA POOL UNSUPPORTED: this snapshot cannot calibrate all local Codex usage; using a labeled prior/seed.",
-                "QUOTA_EXHAUSTED": "QUOTA EXHAUSTED: later local work may use paid credits; WEEKLY≈ remains a workload equivalent, not an included debit.",
-                "QUOTA_SNAPSHOT_STALE": "QUOTA SNAPSHOT STALE (>30m): backend usage is last-observed, not a live balance. Later local usage is extrapolated.",
-            }
             for warning in cal.warnings:
-                for part in wrap_display_words(notices.get(warning, warning), terminal_width):
-                    lines.append(color.wrap(part, color.BOLD, color.YELLOW))
-            if cal.source in ("current_assumed", "current_baseline_assumed"):
-                assumption = "Fast" if fast else "Standard"
-                lines.append(color.wrap(
-                    f"Quota assumption: unresolved tiers priced as {assumption}; this is an estimate, not an exact allowance debit.",
-                    color.DIM,
-                ))
+                for part in wrap_display_words("Quota note  " + warning, terminal_width):
+                    lines.append(color.wrap(part, color.YELLOW if "MISMATCH" in warning else color.DIM))
+            if details:
+                evidence = (f"Calibration evidence  {cal.evidence_start or cal.data_as_of or 'none'}"
+                            f" → {cal.data_as_of or 'none'} · excluded {cal.excluded_intervals}")
+                lines.extend(color.wrap(part, color.DIM) for part in wrap_display_words(evidence, terminal_width))
     elif plan_raw:
         lines.append(color.wrap(
             truncate(f"Subscription  {plan_display_name(plan_raw)} · WEEKLY snapshot unavailable in recent rollout telemetry", terminal_width),
@@ -3769,7 +3821,7 @@ def render_table(
         ))
     lines.append("")
     lines.append(color.wrap(
-        "* WEEKLY≈ expresses the selected local usage as a share of one plan weekly allowance; it can span quota resets.",
+        "* WEEKLY≈ estimates selected local usage in weekly equivalents; it can span resets and is not a provider quota bound.",
         color.DIM,
     ))
     lines.append(color.wrap(
@@ -3793,7 +3845,7 @@ def render_table(
         ))
     if any_partial:
         lines.append(color.wrap(
-            "  CREDITS* + is incomplete pricing. WEEKLY≈ ~ is assumed/partial, NOT a proven lower bound on subscription usage.",
+            "  '+' marks partial reference credits; '?' marks partial WEEKLY≈. Weekly estimates are not guaranteed quota bounds.",
             color.DIM,
         ))
 
@@ -4045,7 +4097,6 @@ def render_json(
     quota_snapshot: Optional[QuotaSnapshot] = None,
     quota_calibration: Optional[QuotaCalibration] = None,
     quota_local_credits: Optional[float] = None,
-    quota_local_complete: bool = True,
 ) -> str:
     out = {
         "period": period_label,
@@ -4059,7 +4110,6 @@ def render_json(
             "weekly_resets_at": quota_snapshot.resets_at if quota_snapshot else None,
             "snapshot_at": quota_snapshot.ts.isoformat() if quota_snapshot else None,
             "local_week_credits": quota_local_credits,
-            "local_weekly_estimate_is_partial": not quota_local_complete,
             "local_weekly_estimate_percent": (quota_local_credits / quota_calibration.credits_per_percent) if (quota_local_credits is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
             "weekly_estimate_basis": "one_plan_weekly_allowance",
             "credits_per_weekly_percent": quota_calibration.credits_per_percent if quota_calibration else None,
@@ -4069,14 +4119,9 @@ def render_json(
             "calibration_clean_intervals": quota_calibration.clean_intervals if quota_calibration else 0,
             "calibration_observed_percent_points": quota_calibration.observed_percent_points if quota_calibration else 0.0,
             "local_coverage_percent": quota_calibration.local_coverage_percent if quota_calibration else None,
-            "calibration_policy": QUOTA_CALIBRATION_POLICY,
-            "calibration_assumed_intervals": quota_calibration.assumed_intervals if quota_calibration else 0,
-            "calibration_excluded_intervals": quota_calibration.excluded_intervals if quota_calibration else 0,
-            "calibration_sample_reset_at": quota_calibration.sample_reset_at if quota_calibration else None,
-            "calibration_sample_start": quota_calibration.sample_start if quota_calibration else None,
-            "calibration_sample_end": quota_calibration.sample_end if quota_calibration else None,
-            "calibration_warnings": quota_calibration.warnings if quota_calibration else [],
+            "calibration": quota_calibration_metadata(quota_calibration),
             "weekly_estimate_is_lower_bound": False,
+            "weekly_estimate_semantics": "assumption-dependent weekly equivalent, not provider debit or a bound",
         },
         "sessions": [],
     }
@@ -4099,8 +4144,8 @@ def render_json(
                 "credit_estimate": mc,
                 "credit_estimate_complete": mcomplete,
                 "weekly_estimate_percent": (mc / quota_calibration.credits_per_percent) if (mc is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
-                "weekly_estimate_is_lower_bound": False,
-                "weekly_estimate_is_partial": not mcomplete,
+                "weekly_estimate_is_lower_bound": False,  # deprecated: not a quota bound
+                "weekly_estimate_is_partial": bool(mc is not None and not mcomplete),
                 "cache_tax_credits": mcomp[1] if mcomp else None,
             })
         model_breakdown.sort(key=lambda x: model_tier_display_sort_key(
@@ -4115,8 +4160,8 @@ def render_json(
                 "credit_estimate": tc,
                 "credit_estimate_complete": tcomplete,
                 "weekly_estimate_percent": (tc / quota_calibration.credits_per_percent) if (tc is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
-                "weekly_estimate_is_lower_bound": False,
-                "weekly_estimate_is_partial": not tcomplete,
+                "weekly_estimate_is_lower_bound": False,  # deprecated: not a quota bound
+                "weekly_estimate_is_partial": bool(tc is not None and not tcomplete),
             })
         tier_breakdown.sort(key=lambda x: SERVICE_TIER_ORDER.index(x["service_tier"]) if x["service_tier"] in SERVICE_TIER_ORDER else 99)
 
@@ -4136,9 +4181,6 @@ def render_json(
                 "output_tokens": au.output_tokens,
                 "reasoning_output_tokens": au.reasoning_output_tokens,
                 "credit_estimate": ac,
-                "weekly_estimate_percent": (ac / quota_calibration.credits_per_percent) if (ac is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
-                "weekly_estimate_is_lower_bound": False,
-                "weekly_estimate_is_partial": not acomplete,
                 "cache_tax_credits": acache,
                 "credit_estimate_complete": acomplete,
             })
@@ -4163,7 +4205,6 @@ def render_json(
             "thread_health": health,
             "last_activity": b.last_activity.isoformat() if b.last_activity else None,
             "trailing_1h_weekly_estimate_percent": (burn / quota_calibration.credits_per_percent) if (burn is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
-            "trailing_1h_weekly_estimate_is_partial": not burn_complete,
             "trailing_1h_credit_burn": burn,
             "trailing_1h_cache_tax": recent_cache,
             "cache_tax_credits": cache_tax,
@@ -4178,8 +4219,8 @@ def render_json(
             "reasoning_output_tokens": u.reasoning_output_tokens,
             "credit_estimate": credits,
             "weekly_estimate_percent": (credits / quota_calibration.credits_per_percent) if (credits is not None and quota_calibration and quota_calibration.credits_per_percent) else None,
-            "weekly_estimate_is_lower_bound": False,
-            "weekly_estimate_is_partial": not complete,
+            "weekly_estimate_is_lower_bound": False,  # deprecated: not a quota bound
+            "weekly_estimate_is_partial": bool(credits is not None and not complete),
             "credit_estimate_complete": complete,
             "rolled_up_subagents": sorted(b.child_sessions),
             "tier_breakdown": tier_breakdown,
@@ -4211,9 +4252,10 @@ def render_csv(
         "weekly_used_percent", "calibration_credits_per_percent", "calibration_confidence",
         "calibration_source", "main_credit_estimate", "subagent_credit_estimate",
         "thread_state", "thread_health", "last_activity", "trailing_1h_credit_burn",
-        "trailing_1h_cache_tax", "rolled_up_subagents", "weekly_estimate_is_partial",
-        "calibration_policy", "calibration_assumed_intervals", "calibration_observed_pp",
-        "calibration_warnings",
+        "trailing_1h_cache_tax", "rolled_up_subagents",
+        "weekly_estimate_is_partial", "calibration_revision", "calibration_scope",
+        "calibration_data_as_of", "calibration_qualified_intervals", "calibration_assumed_intervals",
+        "calibration_excluded_intervals", "calibration_conflict",
     ])
     for b in buckets.values():
         u = b.total_usage()
@@ -4243,7 +4285,7 @@ def render_csv(
             u.reasoning_output_tokens,
             "" if credits is None else f"{credits:.6f}",
             "" if (credits is None or not quota_calibration or not quota_calibration.credits_per_percent) else f"{credits / quota_calibration.credits_per_percent:.6f}",
-            "0",  # deprecated lower-bound flag: weekly conversion is estimated
+            "0",  # deprecated weekly_estimate_is_lower_bound
             f"{cache_tax:.6f}",
             (quota_snapshot.plan_type if quota_snapshot else "") or (auth_context.plan_type if auth_context else ""),
             "" if quota_snapshot is None else f"{quota_snapshot.used_percent:.6f}",
@@ -4258,11 +4300,14 @@ def render_csv(
             "" if burn is None else f"{burn:.6f}",
             f"{recent_cache:.6f}",
             len(b.child_sessions),
-            "0" if credit_complete else "1",
-            QUOTA_CALIBRATION_POLICY,
+            "1" if (credits is not None and not credit_complete) else "0",
+            quota_calibration.revision if quota_calibration else "",
+            quota_calibration.scope if quota_calibration else "",
+            quota_calibration.data_as_of if quota_calibration else "",
+            quota_calibration.qualified_intervals if quota_calibration else 0,
             quota_calibration.assumed_intervals if quota_calibration else 0,
-            quota_calibration.observed_percent_points if quota_calibration else 0,
-            ";".join(quota_calibration.warnings) if quota_calibration else "",
+            quota_calibration.excluded_intervals if quota_calibration else 0,
+            int(quota_calibration.conflict) if quota_calibration else 0,
         ])
     return sio.getvalue()
 
@@ -4450,35 +4495,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             quota_conn = _cache_connect(cache_path)
             try:
                 _record_quota_snapshot(quota_conn, auth_context, quota_snapshot, args.fast)
-                timeline = QuotaTimeline(sessions, quota_week_start, quota_snapshot.ts, args.fast)
-                quality = timeline.between(quota_week_start, quota_snapshot.ts, include_start=True)
-                points = quota_snapshot_points(quota_conn, auth_context, quota_snapshot, args.fast)
-                samples, sample_warnings = build_quota_samples(points, timeline)
-                # A non-Codex pool cannot calibrate all local Codex model usage.
-                if quota_snapshot.limit_id not in ("", "codex"):
-                    samples = []
-                    quality.unsupported_events += 1
-                    sample_warnings.append("QUOTA_POOL_UNSUPPORTED")
-                save_quota_samples(quota_conn, auth_context, quota_snapshot, args.fast, samples)
+                ledger = QuotaCreditLedger(sessions, args.fast, quota_week_start, quota_snapshot.ts)
                 quota_calibration = load_quota_calibration(
-                    quota_conn, auth_context, quota_snapshot, None, args.fast,
-                    samples=samples, current_quality=quality,
-                    regime_changed="QUOTA_REGIME_CHANGED" in sample_warnings,
+                    quota_conn, auth_context, quota_snapshot, quota_local_credits,
+                    args.fast, ledger=ledger,
                 )
-                if not quota_calibration.credits_per_percent:
-                    warnings = quota_calibration.warnings
-                    quota_calibration = bootstrap_quota_calibration(auth_context, quota_snapshot)
-                    quota_calibration.warnings = warnings
-                    if quality.credits > 0 and 3 <= quota_snapshot.used_percent < 100:
-                        predicted = quality.credits / quota_calibration.credits_per_percent
-                        quota_calibration.comparison_local_percent = predicted
-                        if predicted > quota_snapshot.used_percent + max(3, quota_snapshot.used_percent * 0.25):
-                            quota_calibration.warnings.append("CALIBRATION_MISMATCH")
-                if quota_snapshot.used_percent >= 100:
-                    sample_warnings.append("QUOTA_EXHAUSTED")
-                if (now - quota_snapshot.ts).total_seconds() > 30 * 60:
-                    sample_warnings.append("QUOTA_SNAPSHOT_STALE")
-                quota_calibration.warnings = sorted(set(quota_calibration.warnings + sample_warnings))
             finally:
                 quota_conn.close()
 
@@ -4487,7 +4508,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.json:
         print(render_json(
             buckets, sessions, period_label, tz, args.fast, now, live_report,
-            auth_context, quota_snapshot, quota_calibration, quota_local_credits, quota_complete,
+            auth_context, quota_snapshot, quota_calibration, quota_local_credits,
         ))
     elif args.csv:
         print(render_csv(

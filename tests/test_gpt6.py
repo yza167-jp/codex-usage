@@ -222,9 +222,12 @@ class GPT6Tests(unittest.TestCase):
                 m._record_quota_interval(conn, auth, snapshots[1], snapshots[2], new_credits, True, False)
                 cal = m.load_quota_calibration(conn, auth, snapshots[2], None, False)
                 self.assertEqual(cal.credits_per_percent, 341.25)
-                self.assertEqual(cal.clean_intervals, 2)
-                self.assertEqual(cal.source, "delta")
-                self.assertEqual(cal.confidence, "LOW")  # only 4pp across two observations
+                # v1.7.4 keeps these legacy rows as a labeled LOW prior.
+                # Fresh independently bounded deltas are tested in test_quota_window.
+                self.assertEqual(cal.clean_intervals, 0)
+                self.assertEqual(cal.qualified_intervals, 2)
+                self.assertEqual(cal.source, "historical_prior")
+                self.assertEqual(cal.confidence, "LOW")
             finally:
                 conn.close()
 

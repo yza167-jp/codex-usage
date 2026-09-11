@@ -2,14 +2,24 @@
 
 ## 1.8.0 — 2026-09-11
 
-- Rebuilt quota learning from current-epoch raw snapshots and cached model/tier deltas; old one-point historical intervals no longer dominate new weeks.
-- Freeze non-overlapping shared-endpoint samples at the first >=2pp advance; repeated plateau queries cannot inflate sample count or observed movement.
-- Separate complete, assumed-tier and excluded samples. Known-model Unknown tiers can teach under the report's explicit assumption, capped at LOW confidence; Flex/unpriced/unsupported usage remains excluded.
-- Prefer current evidence, label reconciliation baselines and expire new-policy historical priors after seven days. Guard reset/decrease, 100% saturation, future/scope mismatch, outliers and stale snapshots.
-- Show CALIBRATION MISMATCH instead of silently trusting a scale that conflicts with backend usage; never clip estimates or modify raw credits to force agreement.
-- Replace misleading weekly lower-bound markers with `~`; retain the legacy JSON/CSV lower-bound flag as false and add partial/policy/quality metadata.
-- Add isolated quota snapshot/sample tables without changing schema-v3 token data, prices, Fast parsing, project/session columns or model ordering. Original quota history is preserved.
-- Add audit-shaped synthetic replay, migration, warm-cache/no-cache parity, repeated-query and export regressions. No cache rebuild is required.
+- Consolidated the concurrently merged v1.7.4 current-window calibration repair instead of replacing its estimator, reconciliation behavior or tests.
+- Added scope-complete raw snapshot keys including quota pool and window duration, preventing equal-time observations from overwriting one another.
+- Replayed compatible legacy raw snapshots and observation-only backend anchors, never their stored credit scalars; new scoped snapshots win equal-time conflicts.
+- Added duration-safe policy-versioned derived evidence while retaining all v1.7.4 derived data and schema-3 raw token/quota history.
+- Excluded Unknown-as-Fast learning when a model has no published Fast multiplier; preserved all existing Unknown/Standard behavior and missing-parent safeguards.
+- Kept weekly partial `?` semantics, explicit mismatch/reconciliation warnings, 3pp independent blocks and current-epoch priority, with no rate change or undocumented allowance factor.
+- Preserved PROJECT/SESSION layout, model ordering, raw accounting, exports and warm-cache behavior. No manual cache rebuild.
+- Retained 118 tests and added 16 scope, migration, replay and assumption regressions (134 total).
+
+## 1.7.4 — 2026-09-11
+
+- Fixed stale cross-reset calibration dominating new quota evidence; current-window replay now takes precedence over dated <=14-day historical priors and plan seeds.
+- Rebuilt independent `(start,end]` blocks from raw snapshots and cached token deltas, with >=3pp movements, no duplicate plateau samples, no bridging resets/decreases, and no learning at saturation.
+- Distinguished assumed Unknown tiers from unpriced/Flex/provider/incomplete-history exclusions; assumption-dependent scales stay LOW and use exactly the report's credit basis.
+- Added same-timestamp mismatch diagnostics and explicit local-only baseline/reconciliation labels rather than silent percentage clipping or fabricated coverage.
+- Replaced misleading weekly lower-bound `≥` with a partial-estimate `?`; deprecated export lower-bound flags are false and additive partial/provenance fields are provided.
+- Added derived calibration-policy storage without deleting quota observations, raw snapshots, legacy intervals or schema-3 token events. No manual cache rebuild, no rate change, no Astra 1.10 factor.
+- Kept project/session layout, descending model-price order, Fast pricing and raw credit/token calculations unchanged; added current-evidence dates and warnings.
 
 ## 1.7.3 — 2026-09-06
 

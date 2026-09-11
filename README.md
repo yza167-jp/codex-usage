@@ -1,30 +1,42 @@
 # codex-usage
 
-## v1.8.0: repair weekly calibration after resets
+## v1.8.0: consolidated current-window quota repair
 
-Current-week snapshot replay now takes priority over stale historical scales.
-Repeated plateau readings cannot create overlapping evidence; a known model's
-Unknown tier can participate under the displayed Standard/`--fast` assumption,
-but confidence stays LOW. Unpriced/Flex intervals remain excluded, not invented.
+Current reset-period evidence replaces stale historical calibration. Known-model
+Unknown tiers may teach a clearly assumed **LOW** estimate; non-overlapping
+blocks prevent repeated queries from inflating confidence. Partial weekly values
+use `12.3%?`, not a guaranteed lower bound. Conflicts are reported rather than
+silently clipped. This includes the v1.7.4 correction and all its tests.
 
-```text
-Weekly scale  1% ≈ 549.5 credits* · LOW · current week · 0 complete + 3 assumed / 21.0pp
-```
+New scoped snapshot/derived tables prevent equal-time observations from different
+pools or window durations overwriting each other. Legacy raw snapshots and
+observation-only anchors can be replayed without reusing old credit scalars.
+**No cache rebuild:** token schema 3, original quota history and v1.7.4 derived
+rows are retained. PROJECT/SESSION, model order, Fast/reference rates and JSON/CSV
+fields remain compatible. See [policy and migration](docs/v1.8.0-quota-calibration.md).
 
-This is an illustrative fixture, not a fixed price. Estimates now use `~` for
-assumed/partial usage rather than claiming `≥` is a true quota lower bound.
-A local/backend inconsistency is visibly flagged, never hidden by capping at
-100% or forcing every total to equal the backend. Current baselines are labeled
-reconciliation; historical priors expire after seven days.
+## v1.7.4: repair stale weekly calibration
 
-**No cache rebuild.** Raw quota history and schema-v3 token indexes are retained.
-Only the derived estimator policy changes; model rates, Fast accounting,
-PROJECT/SESSION columns and price-descending model order remain unchanged.
-JSON/CSV keep the old lower-bound flag but set it false and add partial/policy
-metadata. See [v1.8.0 policy, migration and limitations](docs/v1.8.0-quota-calibration.md).
+Current reset-period evidence now takes precedence over old calibration.
+Stored snapshots are replayed into non-overlapping blocks of at least 3pp;
+repeated queries on one percentage plateau do not multiply the sample count.
+Unknown-tier usage can learn an explicitly assumed, LOW-confidence scale;
+unpriced/Flex or incomplete-history intervals are excluded individually.
 
-The historical release notes below describe earlier behavior. This section and
-“How WEEKLY≈ learns” supersede their old lower-bound/calibration claims.
+`Weekly scale` shows **current window**, **assumed tier**, or a dated historical
+prior. Contradictions with the simultaneous backend percentage produce a warning,
+not a hidden clamp to 100%. An explicitly labeled local-only baseline may be
+used; its agreement with the backend is not independent validation.
+
+Partial weekly estimates now display **`12.3%?`**, not `≥12.3%`: neither complete
+nor partial local estimates are guaranteed quota bounds. Reference `CREDITS*`
+and its `+` marker are unchanged. Earlier version notes below describe historical
+behavior; this policy supersedes their calibration and weekly lower-bound claims.
+
+**No cache rebuild.** Raw quota history and schema-3 token indexes are retained;
+only derived current-window calibration is rebuilt. PROJECT/SESSION columns,
+model order, Fast prices and the 144-cell report width remain unchanged.
+See [policy, migration and limitations](docs/v1.7.4-current-window-calibration.md).
 
 ## v1.7.3: highest-priced model first
 
@@ -129,7 +141,7 @@ Fast              5.4%      945.0       65.9%
 Standard          2.8%      490.0       34.1%
 ```
 
-For older/truncated records with no persisted tier marker, the default estimate uses Standard pricing as a conservative lower bound and marks the row with `+` / `≥`. `--fast` is retained as an explicit fallback, but now resolves **only Unknown segments** as Fast; it never overrides a detected Standard or Fast setting.
+For older/truncated records with no persisted tier marker, the default estimate uses Standard pricing as a conservative lower bound and marks reference credits with `+` and weekly estimates with `?` (v1.7.4). `--fast` is retained as an explicit fallback, but now resolves **only Unknown segments** as Fast; it never overrides a detected Standard or Fast setting.
 
 A persisted `thread_settings_applied` item is a full settings snapshot: when its optional `service_tier` field is absent, v1.6 treats it as Standard/default instead of carrying an earlier Fast setting forward.
 
@@ -221,7 +233,7 @@ SESSION                         MODEL(S)       CREDITS*  WEEKLY≈  CACHE TAX  1
 another task                    5.6 Sol            203.1     0.51%      125.1     203.1  15.2%  ACTIVE/OK
 ```
 
-`WEEKLY≈` is intentionally marked with `≈`: it is an attribution estimate, **not** an authoritative OpenAI billing/quota meter. In v1.8+, partial/assumed values use `~`; they are **not proven lower bounds** on subscription usage.
+`WEEKLY≈` is intentionally marked with `≈`: it is an attribution estimate, **not** an authoritative OpenAI billing/quota meter. When the credit total is partial because an unpriced model is present, `WEEKLY≈ x%?` marks a partial estimate; it is **not a guaranteed quota lower bound** (v1.7.4).
 
 ## Highlights
 
@@ -363,35 +375,34 @@ plan_type
 
 The displayed `WEEKLY 43% used / 57% left` comes from this backend snapshot. Its age is shown so stale telemetry is visible.
 
-## How `WEEKLY≈` learns
+## How `WEEKLY≈` learns (v1.7.4)
 
-The estimator replays current-epoch raw snapshots against cached token deltas.
-The first snapshot that advances at least 2pp closes a sample. Samples share
-exact endpoints and include events in `(start,end]`, so repeated queries neither
-double-count local work nor inflate independent percentage movement.
+Raw snapshots and local calibration metadata remain in the local SQLite cache;
+no access/refresh/ID tokens are copied into it. A new derived table distinguishes
+complete, assumed-tier and excluded intervals, and includes account/plan/mode,
+quota pool, reset, policy revision and rate-card coordinates.
 
-Current samples are combined using the ratio of summed reference credits to
-summed quota growth, with conservative outlier filtering. Known-model Unknown
-tiers are priced under the same explicit assumption as the report and cap
-confidence at LOW. Unpriced models, Flex and unsupported pricing remain excluded.
-A decrease or reset starts a new regime; a sample ending at 100% cannot teach a rate.
+The tool replays current-period snapshots and cached token deltas into disjoint
+`(start,end]` blocks with at least 3pp observed movement. The first qualifying
+endpoint becomes the next anchor. Unknown tiers use the same explicit Standard
+(or `--fast`) assumption as the report and always remain LOW. Unpriced/Flex,
+unsupported providers and incomplete history are not silently normalized.
 
-Fallbacks are an explicitly labeled current reconciliation baseline, a new-policy
-historical prior no older than seven days, then the empirical plan SEED. Old
-scalar conversions are not reused as current evidence; original snapshots and
-observations remain available for replay. Baseline agreement with backend usage
-is true by construction, not independent validation.
+Current blocks outrank legacy priors. A current local-only baseline can be used
+when blocks are insufficient; it assumes this machine explains the account
+usage. Otherwise a dated <=14-day prior or visible plan SEED provides an estimate.
+No fixed Pro/Plus credit-to-percent conversion is claimed. All thresholds are
+heuristics; workload changes, outside usage and telemetry lag can bias results.
 
-`LOW`, `MEDIUM` and `HIGH` describe support from non-overlapping observations.
-Assumption-dependent samples never earn HIGH just because more queries were run.
-A significant local/backend disagreement shows `CALIBRATION MISMATCH`; it does
-not silently cap values or alter raw credits. The `local/backend≈` diagnostic
-(formerly “coverage”) is a consistency ratio, not proof of local attribution.
-Other devices, shared pools, stale snapshots, counter defects and tier/model mix
-changes may still produce bias. See the [full policy](docs/v1.8.0-quota-calibration.md).
+Conflicting local/backend numbers are compared at one snapshot timestamp. Large
+overestimates trigger a warning and, only with eligible history, an explicitly
+labeled reconciled baseline. There is no percentage clipping. `local coverage≈`
+is no longer displayed because a fitted conversion does not establish how much
+account usage originated on this device. The legacy export field remains null.
 
-New tables contain only scope/timestamps, percentages, pricing/quality metadata
-and derived costs. Raw auth tokens and conversation contents are not copied.
+See [the full policy and migration notes](docs/v1.7.4-current-window-calibration.md)
+for independent-block counts, confidence criteria, resets, saturation, assumptions,
+export compatibility and the regression tests.
 
 ## Credit estimation
 
@@ -404,7 +415,7 @@ credits* = uncached input component + cached input component + output component
 
 Reasoning tokens are a subset/detail of output and are not charged twice.
 
-`codex-usage` reconstructs the active tier from persisted `turn_context` / `thread_settings_applied` settings. `priority` is treated as Fast. When no tier marker exists, Standard pricing is an explicit estimate; `--fast` changes only those unresolved segments to a Fast assumption.
+`codex-usage` reconstructs the active tier from persisted `turn_context` / `thread_settings_applied` settings. `priority` is treated as Fast. When no tier marker exists, Standard pricing is shown as a lower bound; `--fast` changes only those unresolved segments to a Fast assumption.
 
 Neither `CREDITS*` nor `WEEKLY≈` is the authoritative server-side meter.
 
