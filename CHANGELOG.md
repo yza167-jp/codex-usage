@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.0 — 2026-09-11
+
+- Consolidated the concurrently merged v1.7.4 current-window calibration repair instead of replacing its estimator, reconciliation behavior or tests.
+- Added scope-complete raw snapshot keys including quota pool and window duration, preventing equal-time observations from overwriting one another.
+- Replayed compatible legacy raw snapshots and observation-only backend anchors, never their stored credit scalars; new scoped snapshots win equal-time conflicts.
+- Added duration-safe policy-versioned derived evidence while retaining all v1.7.4 derived data and schema-3 raw token/quota history.
+- Excluded Unknown-as-Fast learning when a model has no published Fast multiplier; preserved all existing Unknown/Standard behavior and missing-parent safeguards.
+- Kept weekly partial `?` semantics, explicit mismatch/reconciliation warnings, 3pp independent blocks and current-epoch priority, with no rate change or undocumented allowance factor.
+- Preserved PROJECT/SESSION layout, model ordering, raw accounting, exports and warm-cache behavior. No manual cache rebuild.
+- Retained 118 tests and added 16 scope, migration, replay and assumption regressions (134 total).
+
 ## 1.7.4 — 2026-09-11
 
 - Fixed stale cross-reset calibration dominating new quota evidence; current-window replay now takes precedence over dated <=14-day historical priors and plan seeds.

@@ -112,7 +112,7 @@ class QuotaWindowTests(unittest.TestCase):
             self.assertEqual(newer.qualified_intervals,cal.qualified_intervals)
             self.assertEqual(newer.observed_percent_points,cal.observed_percent_points)
             self.assertAlmostEqual(newer.credits_per_percent,cal.credits_per_percent)
-        rows = self.conn.execute('SELECT * FROM quota_intervals_v2 ORDER BY start_ts').fetchall()
+        rows = self.conn.execute('SELECT * FROM quota_intervals_v3 ORDER BY start_ts').fetchall()
         self.assertEqual(len(rows),2)
         self.assertEqual(rows[0]['end_ts'],rows[1]['start_ts'])
         self.assertEqual(rows[0]['end_used_percent'],rows[1]['start_used_percent'])
@@ -135,7 +135,7 @@ class QuotaWindowTests(unittest.TestCase):
         self.assertEqual(cal.excluded_intervals,1)
         self.assertEqual(cal.assumed_intervals,1)
         self.assertAlmostEqual(cal.credits_per_percent,550)
-        raw=self.conn.execute('SELECT * FROM quota_intervals_v2 ORDER BY start_ts').fetchall()
+        raw=self.conn.execute('SELECT * FROM quota_intervals_v3 ORDER BY start_ts').fetchall()
         self.assertEqual(raw[0]['quality'],'excluded')
         self.assertEqual(raw[0]['unpriced_events'],1)
         self.assertEqual(raw[1]['quality'],'assumed_tier')
@@ -209,7 +209,7 @@ class QuotaWindowTests(unittest.TestCase):
         cal=self.calc(self.snap(b,100),sessions)
         self.assertEqual(cal.confidence,'SEED')
         self.assertEqual(cal.qualified_intervals,0)
-        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM quota_intervals_v2').fetchone()[0],0)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM quota_intervals_v3').fetchone()[0],0)
 
     def test_reset_zero_uses_visible_prior_and_old_prior_expires(self):
         self.old_prior()
@@ -279,9 +279,9 @@ class QuotaWindowTests(unittest.TestCase):
     def test_replay_is_idempotent_and_adds_no_fake_history(self):
         snaps,sessions=self.audit_fixture()
         cal=self.calc(snaps[-1],sessions)
-        before=[tuple(r) for r in self.conn.execute('SELECT * FROM quota_intervals_v2 ORDER BY start_ts')]
+        before=[tuple(r) for r in self.conn.execute('SELECT * FROM quota_intervals_v3 ORDER BY start_ts')]
         for _ in range(3):self.calc(snaps[-1],sessions)
-        after=[tuple(r) for r in self.conn.execute('SELECT * FROM quota_intervals_v2 ORDER BY start_ts')]
+        after=[tuple(r) for r in self.conn.execute('SELECT * FROM quota_intervals_v3 ORDER BY start_ts')]
         self.assertEqual(before,after)
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM quota_intervals').fetchone()[0],2)
 
@@ -384,7 +384,7 @@ class QuotaWindowTests(unittest.TestCase):
                 'rate_limits':{'limit_id':'codex','plan_type':'pro','secondary':{'used_percent':3,'window_minutes':10080,'resets_at':reset}}}},
         ]
         # No auth token; the CLI's fallback account key is local.
-        self.conn.execute("UPDATE quota_snapshots SET account_key='local'");self.conn.commit()
+        self.conn.execute("UPDATE quota_snapshots SET account_key='local'");self.conn.execute("UPDATE quota_snapshots_v180 SET account_key='local'");self.conn.commit()
         (logs/'rollout-test-cli.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records),encoding='utf-8')
         script=Path(__file__).resolve().parents[1]/'codex-usage'
         cmd=[sys.executable,str(script),'24h','--codex-home',str(home),'--cache-path',str(self.path),'--json','--perf']
@@ -418,7 +418,7 @@ class QuotaWindowTests(unittest.TestCase):
             window_minutes INTEGER NOT NULL,snapshot_ts TEXT NOT NULL,used_percent REAL NOT NULL,
             credit_mode TEXT NOT NULL,source TEXT NOT NULL,
             PRIMARY KEY(account_key,plan_type,reset_at,snapshot_ts,credit_mode))''')
-        self.conn.execute('DROP TABLE quota_intervals_v2');self.conn.commit()
+        self.conn.execute('DROP TABLE quota_intervals_v3');self.conn.commit()
         self.conn.close();self.conn=m._cache_connect(self.path)
         self.assertIn('limit_id',{r[1] for r in self.conn.execute('PRAGMA table_info(quota_snapshots)')})
         self.assertEqual(before,[tuple(r) for r in self.conn.execute('SELECT * FROM events')])

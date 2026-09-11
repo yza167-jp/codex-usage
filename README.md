@@ -1,5 +1,20 @@
 # codex-usage
 
+## v1.8.0: consolidated current-window quota repair
+
+Current reset-period evidence replaces stale historical calibration. Known-model
+Unknown tiers may teach a clearly assumed **LOW** estimate; non-overlapping
+blocks prevent repeated queries from inflating confidence. Partial weekly values
+use `12.3%?`, not a guaranteed lower bound. Conflicts are reported rather than
+silently clipped. This includes the v1.7.4 correction and all its tests.
+
+New scoped snapshot/derived tables prevent equal-time observations from different
+pools or window durations overwriting each other. Legacy raw snapshots and
+observation-only anchors can be replayed without reusing old credit scalars.
+**No cache rebuild:** token schema 3, original quota history and v1.7.4 derived
+rows are retained. PROJECT/SESSION, model order, Fast/reference rates and JSON/CSV
+fields remain compatible. See [policy and migration](docs/v1.8.0-quota-calibration.md).
+
 ## v1.7.4: repair stale weekly calibration
 
 Current reset-period evidence now takes precedence over old calibration.

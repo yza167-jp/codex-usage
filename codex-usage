@@ -69,7 +69,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.7.4"
+VERSION = "1.8.0"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
 GPT6_RATE_CARD_AS_OF = "2026-09-05"
@@ -274,7 +274,7 @@ class QuotaCalibration:
     observation_count: int = 0
     local_coverage_percent: Optional[float] = None
     source: str = ""
-    revision: str = "2026-09-11-window-v2"
+    revision: str = "2026-09-11-window-v3-scoped"
     scope: str = ""
     source_reset_at: Optional[int] = None
     data_as_of: str = ""
@@ -1307,6 +1307,23 @@ def _cache_connect(cache_path: Path) -> sqlite3.Connection:
             events INTEGER NOT NULL, quality TEXT NOT NULL,
             PRIMARY KEY(account_key,plan_type,credit_mode,limit_id,reset_at,revision,start_ts,end_ts)
         );
+        CREATE TABLE IF NOT EXISTS quota_intervals_v3 (
+            account_key TEXT NOT NULL, plan_type TEXT NOT NULL, credit_mode TEXT NOT NULL,
+            limit_id TEXT NOT NULL, reset_at INTEGER NOT NULL, window_minutes INTEGER NOT NULL,
+            revision TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
+            start_used_percent REAL NOT NULL, end_used_percent REAL NOT NULL,
+            credits REAL NOT NULL, assumed_credits REAL NOT NULL, assumed_events INTEGER NOT NULL,
+            unpriced_events INTEGER NOT NULL, flex_events INTEGER NOT NULL,
+            unsupported_events INTEGER NOT NULL, history_events INTEGER NOT NULL,
+            events INTEGER NOT NULL, quality TEXT NOT NULL,
+            PRIMARY KEY(account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,revision,start_ts,end_ts)
+        );
+        CREATE TABLE IF NOT EXISTS quota_snapshots_v180 (
+            account_key TEXT NOT NULL, plan_type TEXT NOT NULL, credit_mode TEXT NOT NULL,
+            limit_id TEXT NOT NULL, reset_at INTEGER NOT NULL, window_minutes INTEGER NOT NULL,
+            snapshot_ts TEXT NOT NULL, used_percent REAL NOT NULL, source TEXT NOT NULL,
+            PRIMARY KEY(account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,snapshot_ts)
+        );
         """
     )
 
@@ -1680,6 +1697,7 @@ def cache_info(conn: sqlite3.Connection, cache_path: Path) -> str:
         f"Indexed rollouts: {files_n}\n"
         f"Token events: {events_n}\n"
         f"Quota observations: {quota_n}\n"
+        f"Quota policy: {QUOTA_CALIBRATION_REVISION}\n"
         f"DB size: {size / (1024 * 1024):.2f} MiB\n"
         f"Runtime profile: {machine}"
     )
@@ -1839,25 +1857,23 @@ def _record_quota_snapshot(
 ) -> None:
     if not _valid_quota_snapshot(snapshot):
         return
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO quota_snapshots(
-            account_key,plan_type,reset_at,window_minutes,snapshot_ts,
-            used_percent,credit_mode,source,limit_id
-        ) VALUES(?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            auth.account_key,
-            _quota_plan(auth, snapshot),
-            int(snapshot.resets_at),
-            int(snapshot.window_minutes),
-            snapshot.ts.astimezone(timezone.utc).isoformat(),
-            float(snapshot.used_percent),
-            _quota_mode(fast),
-            snapshot.source,
-            snapshot.limit_id or "codex",
-        ),
+    values = (
+        auth.account_key, _quota_plan(auth, snapshot), _quota_mode(fast),
+        snapshot.limit_id or "codex", int(snapshot.resets_at),
+        int(snapshot.window_minutes), snapshot.ts.astimezone(timezone.utc).isoformat(),
+        float(snapshot.used_percent), snapshot.source,
     )
+    # v1.7.4 added limit_id as a column, but its old primary key still omitted
+    # pool and duration. Distinct simultaneous observations must not overwrite.
+    conn.execute("""INSERT OR REPLACE INTO quota_snapshots_v180(
+        account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,
+        snapshot_ts,used_percent,source) VALUES(?,?,?,?,?,?,?,?,?)""", values)
+    # Keep a non-destructive compatibility shadow for older audit tools. This
+    # table is no longer authoritative for same-time pool/duration collisions.
+    if values[3] == "codex":
+        conn.execute("""INSERT OR IGNORE INTO quota_snapshots(
+            account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,
+            snapshot_ts,used_percent,source) VALUES(?,?,?,?,?,?,?,?,?)""", values)
     conn.commit()
 
 
@@ -1983,7 +1999,7 @@ def _weighted_median(values: List[Tuple[float, float]]) -> Optional[float]:
 
 # Calibration has its own revision: reference credit rates and token-cache
 # coordinates have NOT changed. Legacy observations remain available as priors.
-QUOTA_CALIBRATION_REVISION = "2026-09-11-window-v2"
+QUOTA_CALIBRATION_REVISION = "2026-09-11-window-v3-scoped"
 QUOTA_MIN_INTERVAL_PP = 3.0
 QUOTA_HISTORY_DAYS = 14
 
@@ -2049,7 +2065,8 @@ class QuotaCreditLedger:
                     unsupported_events=int(foreign or (
                         not complete and tier not in (SERVICE_TIER_UNKNOWN, SERVICE_TIER_FLEX)
                         and cost is not None
-                    )),
+                    ) or (fast and tier == SERVICE_TIER_UNKNOWN and
+                          model not in FAST_MULTIPLIERS)),
                     history_events=int(broken_history),
                 )
                 records.append((ts.timestamp(), item))
@@ -2080,6 +2097,43 @@ def _valid_quota_snapshot(snapshot: QuotaSnapshot) -> bool:
     return start <= snapshot.ts.timestamp() < snapshot.resets_at
 
 
+def _quota_snapshot_points_v180(conn, auth, snapshot, fast):
+    """Merge scoped snapshots with compatible raw legacy anchors, as of one time.
+
+    Missing pool metadata from pre-v1.7.4 observations is only importable for
+    the default Codex pool. Such legacy provenance cannot be recovered exactly.
+    New scoped rows win equal-time collisions; the caller's snapshot wins last.
+    """
+    plan, mode, pool = _quota_plan(auth, snapshot), _quota_mode(fast), snapshot.limit_id or "codex"
+    until = snapshot.ts.astimezone(timezone.utc).isoformat()
+    values = (auth.account_key, plan, mode, pool, snapshot.resets_at,
+              snapshot.window_minutes, until)
+    rows = []
+    if pool == "codex":
+        rows.extend(conn.execute("""SELECT snapshot_ts,used_percent FROM quota_observations
+            WHERE account_key=? AND plan_type=? AND credit_mode=? AND reset_at=?
+              AND window_minutes=? AND snapshot_ts<=? ORDER BY snapshot_ts""",
+            (auth.account_key, plan, mode, snapshot.resets_at, snapshot.window_minutes, until)))
+    rows.extend(conn.execute("""SELECT snapshot_ts,used_percent FROM quota_snapshots
+        WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
+          AND reset_at=? AND window_minutes=? AND snapshot_ts<=? ORDER BY snapshot_ts""", values))
+    rows.extend(conn.execute("""SELECT snapshot_ts,used_percent FROM quota_snapshots_v180
+        WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
+          AND reset_at=? AND window_minutes=? AND snapshot_ts<=? ORDER BY snapshot_ts""", values))
+    points = {}
+    for row in rows:
+        ts = parse_ts(row["snapshot_ts"])
+        if ts is None or ts > snapshot.ts:
+            continue
+        point = QuotaSnapshot(ts, float(row["used_percent"]), snapshot.window_minutes,
+                              snapshot.resets_at, plan_type=plan, limit_id=pool)
+        if _valid_quota_snapshot(point):
+            points[ts] = point
+    if _valid_quota_snapshot(snapshot):
+        points[snapshot.ts] = snapshot
+    return sorted(points.values(), key=lambda p: p.ts)
+
+
 def _refresh_quota_intervals_v2(conn, auth, snapshot, ledger, fast):
     """Rebuild derived intervals, never edit/delete the old evidence tables.
 
@@ -2093,25 +2147,11 @@ def _refresh_quota_intervals_v2(conn, auth, snapshot, ledger, fast):
         return
     params = (auth.account_key, _quota_plan(auth, snapshot), _quota_mode(fast),
               snapshot.limit_id or "codex", snapshot.resets_at, snapshot.window_minutes)
-    rows = conn.execute("""
-        SELECT snapshot_ts,used_percent FROM quota_snapshots
-        WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
-          AND reset_at=? AND window_minutes=? AND snapshot_ts<=?
-        ORDER BY snapshot_ts
-    """, params + (snapshot.ts.astimezone(timezone.utc).isoformat(),)).fetchall()
     points = []
     adjustment = False
-    for row in rows:
-        ts = parse_ts(row["snapshot_ts"])
-        if ts is None:
-            continue
-        point = QuotaSnapshot(ts, float(row["used_percent"]), snapshot.window_minutes,
-                              snapshot.resets_at, plan_type=snapshot.plan_type,
-                              limit_id=snapshot.limit_id)
-        if not _valid_quota_snapshot(point):
-            continue
+    for point in _quota_snapshot_points_v180(conn, auth, snapshot, fast):
         if points and point.used_percent < points[-1].used_percent:
-            points = []  # keep only the post-adjustment segment
+            points = []
             adjustment = True
         points.append(point)
     # Stored snapshots may not yet include the caller's final observation.
@@ -2120,7 +2160,7 @@ def _refresh_quota_intervals_v2(conn, auth, snapshot, ledger, fast):
             points = []
             adjustment = True
         points.append(snapshot)
-    conn.execute("""DELETE FROM quota_intervals_v2
+    conn.execute("""DELETE FROM quota_intervals_v3
         WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
           AND reset_at=? AND window_minutes=? AND revision=?""",
         params + (_quota_evidence_revision(),))
@@ -2133,7 +2173,7 @@ def _refresh_quota_intervals_v2(conn, auth, snapshot, ledger, fast):
         if end.used_percent - anchor.used_percent < QUOTA_MIN_INTERVAL_PP:
             continue
         summary = ledger.between(anchor.ts, end.ts)
-        conn.execute("""INSERT INTO quota_intervals_v2(
+        conn.execute("""INSERT INTO quota_intervals_v3(
             account_key,plan_type,credit_mode,limit_id,reset_at,window_minutes,
             revision,start_ts,end_ts,start_used_percent,end_used_percent,
             credits,assumed_credits,assumed_events,unpriced_events,flex_events,
@@ -2236,7 +2276,7 @@ def load_quota_calibration(conn, auth, snapshot, current_local_credits, fast,
     params = (auth.account_key, _quota_plan(auth, snapshot), _quota_mode(fast),
               snapshot.limit_id or "codex", snapshot.resets_at, snapshot.window_minutes,
               _quota_evidence_revision(), snapshot.ts.astimezone(timezone.utc).isoformat())
-    rows = conn.execute("""SELECT * FROM quota_intervals_v2
+    rows = conn.execute("""SELECT * FROM quota_intervals_v3
         WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
           AND reset_at=? AND window_minutes=? AND revision=? AND end_ts<=?
         ORDER BY end_ts""", params).fetchall()
@@ -2286,7 +2326,7 @@ def load_quota_calibration(conn, auth, snapshot, current_local_credits, fast,
     else:
         # Reuse only a recent same-policy, same-pool v2 cohort. Never pool
         # different reset periods together or import old complete flags.
-        old = conn.execute("""SELECT * FROM quota_intervals_v2
+        old = conn.execute("""SELECT * FROM quota_intervals_v3
             WHERE account_key=? AND plan_type=? AND credit_mode=? AND limit_id=?
               AND window_minutes=? AND revision=? AND reset_at<>?
               AND end_ts>=? AND end_ts<=? AND quality<>'excluded' AND credits>0
