@@ -1,0 +1,20 @@
+name: Export concurrent v1.7.4 source
+on:
+  push:
+    branches: [fix/v1.8.0-quota-calibration]
+    paths: [.github/workflows/v180-reconcile-source.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 127ebc9ba573509e3f9cc0629ab73cecf20418d8
+      - run: git archive --format=tar HEAD > /tmp/v174-source.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v174-reconcile-source
+          path: /tmp/v174-source.tar
+          retention-days: 1
