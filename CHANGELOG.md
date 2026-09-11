@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.4 — 2026-09-11
+
+- Fixed stale cross-reset calibration dominating new quota evidence; current-window replay now takes precedence over dated <=14-day historical priors and plan seeds.
+- Rebuilt independent `(start,end]` blocks from raw snapshots and cached token deltas, with >=3pp movements, no duplicate plateau samples, no bridging resets/decreases, and no learning at saturation.
+- Distinguished assumed Unknown tiers from unpriced/Flex/provider/incomplete-history exclusions; assumption-dependent scales stay LOW and use exactly the report's credit basis.
+- Added same-timestamp mismatch diagnostics and explicit local-only baseline/reconciliation labels rather than silent percentage clipping or fabricated coverage.
+- Replaced misleading weekly lower-bound `≥` with a partial-estimate `?`; deprecated export lower-bound flags are false and additive partial/provenance fields are provided.
+- Added derived calibration-policy storage without deleting quota observations, raw snapshots, legacy intervals or schema-3 token events. No manual cache rebuild, no rate change, no Astra 1.10 factor.
+- Kept project/session layout, descending model-price order, Fast pricing and raw credit/token calculations unchanged; added current-evidence dates and warnings.
+
 ## 1.7.3 — 2026-09-06
 
 - Sort model identities by descending Standard reference unit price, so mixed Astra/Sol/Luna sessions display Astra first irrespective of usage volume or insertion order.
