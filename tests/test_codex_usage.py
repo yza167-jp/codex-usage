@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.7.3", proc.stdout)
+        self.assertIn("1.7.4", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -154,8 +154,10 @@ class CodexUsageSmokeTests(unittest.TestCase):
                 snap = self.mod.QuotaSnapshot(now+self.mod.timedelta(seconds=4), 3.0, 10080, reset, plan_type="prolite")
                 cal = self.mod.load_quota_calibration(conn, auth, snap, None, False)
                 self.assertAlmostEqual(cal.credits_per_percent, 180.0, delta=0.01)
-                self.assertEqual(cal.source, "delta")
-                self.assertEqual(cal.clean_intervals, 1)
+                # Legacy rows are retained as priors, not new-policy clean evidence.
+                self.assertEqual(cal.source, "historical_prior")
+                self.assertEqual(cal.clean_intervals, 0)
+                self.assertEqual(cal.qualified_intervals, 1)
             finally:
                 conn.close()
 
@@ -184,13 +186,13 @@ class CodexUsageSmokeTests(unittest.TestCase):
         self.assertEqual(self.mod.RATE_CARD["gpt-5.2"], (43.75, 4.375, 350.0))
         self.assertNotIn("gpt-5.3-codex-spark", self.mod.RATE_CARD)
 
-    def test_partial_weekly_estimate_is_lower_bound(self):
+    def test_partial_weekly_estimate_is_not_a_quota_lower_bound(self):
         cal = self.mod.QuotaCalibration(credits_per_percent=172.3, confidence="LOW")
         exact = self.mod.weekly_percent_text(543.1, cal, True)
         partial = self.mod.weekly_percent_text(543.1, cal, False)
         self.assertFalse(exact.startswith("≥"))
-        self.assertTrue(partial.startswith("≥"))
-        self.assertEqual(partial[1:], exact)
+        self.assertFalse(partial.startswith("≥"))
+        self.assertEqual(partial, exact + "?")
 
     def test_legacy_rate_totals_are_not_used_directly(self):
         now = datetime.now(timezone.utc)
@@ -211,8 +213,9 @@ class CodexUsageSmokeTests(unittest.TestCase):
                 conn.commit()
                 snap = self.mod.QuotaSnapshot(now, 97.0, 10080, reset, plan_type="prolite")
                 cal = self.mod.load_quota_calibration(conn, auth, snap, None, False)
-                self.assertIsNone(cal.credits_per_percent)
-                self.assertEqual(cal.confidence, "LEARNING")
+                self.assertEqual(cal.credits_per_percent, 175.0)
+                self.assertEqual(cal.confidence, "SEED")
+                self.assertEqual(cal.source, "plan_seed")
             finally:
                 conn.close()
 
@@ -316,8 +319,9 @@ class CodexUsageSmokeTests(unittest.TestCase):
                 )
                 self.assertIsNone(rebased)
                 cal = self.mod.load_quota_calibration(conn, auth, snap, None, False)
-                self.assertIsNone(cal.credits_per_percent)
-                self.assertEqual(cal.confidence, "LEARNING")
+                self.assertEqual(cal.credits_per_percent, 175.0)
+                self.assertEqual(cal.confidence, "SEED")
+                self.assertEqual(cal.source, "plan_seed")
             finally:
                 conn.close()
 
@@ -342,7 +346,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
         self.assertEqual(snap.window_minutes, 10080)
         self.assertEqual(snap.used_percent, 37.5)
 
-    def test_quota_calibration_learns_delta_ratio(self):
+    def test_legacy_cumulative_observations_are_only_low_confidence_priors(self):
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as td:
             conn = self.mod._cache_connect(Path(td) / "index.sqlite3")
@@ -360,8 +364,9 @@ class CodexUsageSmokeTests(unittest.TestCase):
                 latest = self.mod.QuotaSnapshot(samples[-1][0], 25.0, 10080, reset, plan_type="prolite")
                 cal = self.mod.load_quota_calibration(conn, auth, latest, 10000.0, False)
                 self.assertAlmostEqual(cal.credits_per_percent, 400.0, delta=1.0)
-                self.assertGreaterEqual(cal.clean_intervals, 2)
-                self.assertIn(cal.confidence, ("MEDIUM", "HIGH"))
+                self.assertEqual(cal.clean_intervals, 0)
+                self.assertEqual(cal.confidence, "LOW")
+                self.assertEqual(cal.scope, "historical")
             finally:
                 conn.close()
 
