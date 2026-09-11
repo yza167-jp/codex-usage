@@ -36,7 +36,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
-        self.assertIn("1.7.3", proc.stdout)
+        self.assertIn("1.8.0", proc.stdout)
 
     def test_terminal_display_width_handles_cjk_and_combining(self):
         self.assertEqual(self.mod.display_width("ASCII"), 5)
@@ -184,12 +184,13 @@ class CodexUsageSmokeTests(unittest.TestCase):
         self.assertEqual(self.mod.RATE_CARD["gpt-5.2"], (43.75, 4.375, 350.0))
         self.assertNotIn("gpt-5.3-codex-spark", self.mod.RATE_CARD)
 
-    def test_partial_weekly_estimate_is_lower_bound(self):
+    def test_partial_weekly_estimate_is_not_a_claimed_lower_bound(self):
         cal = self.mod.QuotaCalibration(credits_per_percent=172.3, confidence="LOW")
         exact = self.mod.weekly_percent_text(543.1, cal, True)
         partial = self.mod.weekly_percent_text(543.1, cal, False)
         self.assertFalse(exact.startswith("≥"))
-        self.assertTrue(partial.startswith("≥"))
+        self.assertTrue(partial.startswith("~"))
+        self.assertNotIn("≥", partial)
         self.assertEqual(partial[1:], exact)
 
     def test_legacy_rate_totals_are_not_used_directly(self):
@@ -361,7 +362,7 @@ class CodexUsageSmokeTests(unittest.TestCase):
                 cal = self.mod.load_quota_calibration(conn, auth, latest, 10000.0, False)
                 self.assertAlmostEqual(cal.credits_per_percent, 400.0, delta=1.0)
                 self.assertGreaterEqual(cal.clean_intervals, 2)
-                self.assertIn(cal.confidence, ("MEDIUM", "HIGH"))
+                self.assertEqual(cal.confidence, "LOW")  # two small intervals are insufficient
             finally:
                 conn.close()
 

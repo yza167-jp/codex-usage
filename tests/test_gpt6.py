@@ -224,7 +224,7 @@ class GPT6Tests(unittest.TestCase):
                 self.assertEqual(cal.credits_per_percent, 341.25)
                 self.assertEqual(cal.clean_intervals, 2)
                 self.assertEqual(cal.source, "delta")
-                self.assertEqual(cal.confidence, "MEDIUM")
+                self.assertEqual(cal.confidence, "LOW")  # only 4pp across two observations
             finally:
                 conn.close()
 

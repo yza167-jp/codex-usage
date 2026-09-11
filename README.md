@@ -1,5 +1,31 @@
 # codex-usage
 
+## v1.8.0: repair weekly calibration after resets
+
+Current-week snapshot replay now takes priority over stale historical scales.
+Repeated plateau readings cannot create overlapping evidence; a known model's
+Unknown tier can participate under the displayed Standard/`--fast` assumption,
+but confidence stays LOW. Unpriced/Flex intervals remain excluded, not invented.
+
+```text
+Weekly scale  1% ≈ 549.5 credits* · LOW · current week · 0 complete + 3 assumed / 21.0pp
+```
+
+This is an illustrative fixture, not a fixed price. Estimates now use `~` for
+assumed/partial usage rather than claiming `≥` is a true quota lower bound.
+A local/backend inconsistency is visibly flagged, never hidden by capping at
+100% or forcing every total to equal the backend. Current baselines are labeled
+reconciliation; historical priors expire after seven days.
+
+**No cache rebuild.** Raw quota history and schema-v3 token indexes are retained.
+Only the derived estimator policy changes; model rates, Fast accounting,
+PROJECT/SESSION columns and price-descending model order remain unchanged.
+JSON/CSV keep the old lower-bound flag but set it false and add partial/policy
+metadata. See [v1.8.0 policy, migration and limitations](docs/v1.8.0-quota-calibration.md).
+
+The historical release notes below describe earlier behavior. This section and
+“How WEEKLY≈ learns” supersede their old lower-bound/calibration claims.
+
 ## v1.7.3: highest-priced model first
 
 Model names now use a stable descending **Standard reference unit-price** order,
@@ -195,7 +221,7 @@ SESSION                         MODEL(S)       CREDITS*  WEEKLY≈  CACHE TAX  1
 another task                    5.6 Sol            203.1     0.51%      125.1     203.1  15.2%  ACTIVE/OK
 ```
 
-`WEEKLY≈` is intentionally marked with `≈`: it is an attribution estimate, **not** an authoritative OpenAI billing/quota meter. When the credit total is partial because an unpriced model is present, `WEEKLY≈ ≥x%` is a **lower bound based only on the priced usage**.
+`WEEKLY≈` is intentionally marked with `≈`: it is an attribution estimate, **not** an authoritative OpenAI billing/quota meter. In v1.8+, partial/assumed values use `~`; they are **not proven lower bounds** on subscription usage.
 
 ## Highlights
 
@@ -339,59 +365,33 @@ The displayed `WEEKLY 43% used / 57% left` comes from this backend snapshot. Its
 
 ## How `WEEKLY≈` learns
 
-The tool keeps local quota observations in the same SQLite cache used for rollout indexing. Each observation contains only the calibration metadata it needs:
+The estimator replays current-epoch raw snapshots against cached token deltas.
+The first snapshot that advances at least 2pp closes a sample. Samples share
+exact endpoints and include events in `(start,end]`, so repeated queries neither
+double-count local work nor inflate independent percentage movement.
 
-```text
-hashed local account key
-plan type
-weekly reset timestamp
-weekly used percent
-local credit-equivalent usage
-rate-card version
-standard/fast credit mode
-snapshot timestamp/source
-```
+Current samples are combined using the ratio of summed reference credits to
+summed quota growth, with conservative outlier filtering. Known-model Unknown
+tiers are priced under the same explicit assumption as the report and cap
+confidence at LOW. Unpriced models, Flex and unsupported pricing remain excluded.
+A decrease or reset starts a new regime; a sample ending at 100% cannot teach a rate.
 
-Raw access/refresh/ID tokens are **not** copied into the `codex-usage` database or printed.
+Fallbacks are an explicitly labeled current reconciliation baseline, a new-policy
+historical prior no older than seven days, then the empirical plan SEED. Old
+scalar conversions are not reused as current evidence; original snapshots and
+observations remain available for replay. Baseline agreement with backend usage
+is true by construction, not independent validation.
 
-### First estimate
+`LOW`, `MEDIUM` and `HIGH` describe support from non-overlapping observations.
+Assumption-dependent samples never earn HIGH just because more queries were run.
+A significant local/backend disagreement shows `CALIBRATION MISMATCH`; it does
+not silently cap values or alter raw credits. The `local/backend≈` diagnostic
+(formerly “coverage”) is a consistency ratio, not proof of local attribution.
+Other devices, shared pools, stale snapshots, counter defects and tier/model mix
+changes may still produce bias. See the [full policy](docs/v1.8.0-quota-calibration.md).
 
-When a weekly snapshot is available, the tool reconstructs local credits from the beginning of that weekly window through the snapshot time.
-
-If the backend says `40%` is used and local history accounts for `15,200 CREDITS*`, the initial effective conversion is:
-
-```text
-1 weekly percentage point ≈ 380 CREDITS*
-effective weekly capacity ≈ 38,000 CREDITS*
-confidence: LOW
-```
-
-This does **not** mean OpenAI granted 38,000 purchased credits. It is only an effective credit-equivalent scale for attributing the included weekly allowance.
-
-### Repeated observations
-
-As new quota snapshots appear, the tool learns from deltas inside the same weekly reset period:
-
-```text
-Δ local CREDITS* / Δ backend weekly used%
-```
-
-It uses a weighted median and rejects conspicuously low/high intervals. Low local-credit-per-percentage intervals often mean some weekly allowance moved because of activity that this machine cannot see.
-
-Confidence progresses roughly as:
-
-- `LEARNING` — no usable conversion yet
-- `LOW` — baseline or too little observed quota movement
-- `MEDIUM` — multiple clean delta intervals
-- `HIGH` — several consistent intervals covering a meaningful amount of weekly movement
-
-Calibration is segmented by account, plan, rate-card version, credit mode, and weekly reset epoch. A new plan/reset therefore does not blindly reuse an incompatible weekly observation series.
-
-## Local coverage
-
-`local coverage≈` compares the locally explained weekly movement with the backend-used percentage under the current calibration.
-
-A low value can indicate activity outside the local transcript set—for example another device or another product sharing the same agentic allowance—or simply an immature calibration. It is diagnostic, not an account audit.
+New tables contain only scope/timestamps, percentages, pricing/quality metadata
+and derived costs. Raw auth tokens and conversation contents are not copied.
 
 ## Credit estimation
 
@@ -404,7 +404,7 @@ credits* = uncached input component + cached input component + output component
 
 Reasoning tokens are a subset/detail of output and are not charged twice.
 
-`codex-usage` reconstructs the active tier from persisted `turn_context` / `thread_settings_applied` settings. `priority` is treated as Fast. When no tier marker exists, Standard pricing is shown as a lower bound; `--fast` changes only those unresolved segments to a Fast assumption.
+`codex-usage` reconstructs the active tier from persisted `turn_context` / `thread_settings_applied` settings. `priority` is treated as Fast. When no tier marker exists, Standard pricing is an explicit estimate; `--fast` changes only those unresolved segments to a Fast assumption.
 
 Neither `CREDITS*` nor `WEEKLY≈` is the authoritative server-side meter.
 

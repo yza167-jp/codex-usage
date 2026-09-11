@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.0 — 2026-09-11
+
+- Rebuilt quota learning from current-epoch raw snapshots and cached model/tier deltas; old one-point historical intervals no longer dominate new weeks.
+- Freeze non-overlapping shared-endpoint samples at the first >=2pp advance; repeated plateau queries cannot inflate sample count or observed movement.
+- Separate complete, assumed-tier and excluded samples. Known-model Unknown tiers can teach under the report's explicit assumption, capped at LOW confidence; Flex/unpriced/unsupported usage remains excluded.
+- Prefer current evidence, label reconciliation baselines and expire new-policy historical priors after seven days. Guard reset/decrease, 100% saturation, future/scope mismatch, outliers and stale snapshots.
+- Show CALIBRATION MISMATCH instead of silently trusting a scale that conflicts with backend usage; never clip estimates or modify raw credits to force agreement.
+- Replace misleading weekly lower-bound markers with `~`; retain the legacy JSON/CSV lower-bound flag as false and add partial/policy/quality metadata.
+- Add isolated quota snapshot/sample tables without changing schema-v3 token data, prices, Fast parsing, project/session columns or model ordering. Original quota history is preserved.
+- Add audit-shaped synthetic replay, migration, warm-cache/no-cache parity, repeated-query and export regressions. No cache rebuild is required.
+
 ## 1.7.3 — 2026-09-06
 
 - Sort model identities by descending Standard reference unit price, so mixed Astra/Sol/Luna sessions display Astra first irrespective of usage volume or insertion order.

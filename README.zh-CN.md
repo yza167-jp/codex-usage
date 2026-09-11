@@ -1,5 +1,30 @@
 # codex-usage
 
+## v1.8.0：修复 reset 后 weekly 校准失真
+
+优先使用当前周期的原始 snapshot 与缓存 token 增量重新校准，不再让两条旧的
+1pp 样本长期支配新周期。重复查询同一百分比平台不会增加独立样本；相邻区间
+共享同一个时间边界，不重叠计数。
+
+已知模型但缺少档位的记录可按明确假设参与估算：默认 Standard，`--fast` 时按
+Fast；这些样本始终最高为 LOW，不会冒充完整观测。未定价模型、Flex 等仍排除。
+
+```text
+Weekly scale  1% ≈ 549.5 credits* · LOW · current week · 0 complete + 3 assumed / 21.0pp
+```
+
+上面是回归测试示例，不是写死的官方换算率。`WEEKLY≈` 的不完整数值现在使用
+`~`，不再以 `≥` 声称是真实订阅扣减的数学下界。明显不一致时显示
+`CALIBRATION MISMATCH`，不会偷偷把结果截为 100% 或强制等于服务端值。
+当前 baseline 会标为 reconciliation；新策略的历史 prior 最长保留七天参考期。
+
+**无需重建缓存。** 保留所有原始 quota 历史和 schema-v3 token 索引，仅隔离并
+重建派生校准样本。模型费率、Fast 计价、项目/会话分列和模型排序不变。
+JSON/CSV 保留旧 lower-bound 字段但设为 false/0，并新增 partial/policy 等元信息。
+详见[校准策略、迁移和局限](docs/v1.8.0-quota-calibration.md)。
+
+下方历史版本说明记录旧行为；其中旧的“下界”和校准规则以本节及“如何自适应学习”为准。
+
 ## v1.7.3：优先显示单价更高的模型
 
 多个模型共用一个 session 时，按内置 Standard 参考单价降序显示，不再按出现
@@ -322,79 +347,27 @@ WEEKLY 43% used / 57% left
 
 ## `WEEKLY≈` 如何自适应学习
 
-脚本在原有 SQLite cache 中额外保存 quota observation，只存校准需要的元信息：
+工具先读取当前周期的原始 quota snapshots，再用已缓存的 token 增量重放。
+从一个共同起点开始，首次增长至少 2 个百分点的 snapshot 关闭该区间；下一段
+从同一结束点开始，采用 `(start,end]` 边界，因此重复查询不会重复计费或增加证据量。
 
-```text
-哈希后的本地账户分段键
-plan type
-weekly reset timestamp
-weekly used percent
-本机 credit-equivalent usage
-rate-card version
-standard / fast credit mode
-snapshot timestamp / source
-```
+当前周期优先，比例使用“不重叠样本的 credits 总和 / 百分比增长总和”，并做有限的
+离群过滤。已知模型的 Unknown 档位按报告使用的同一假设计价，可信度最高 LOW。
+未定价、Flex 或其他不支持的计价不会被假装为完整样本。百分比下降时分段；到达
+100% 的区间不参与学习，因为可能已经发生截断或转入额外付费消耗。
 
-**不会**把原始 access token、refresh token、ID token 复制进 `codex-usage` 的数据库，也不会主动打印这些 token。
+没有可用区间时，依次考虑明确标记的本周期对账 baseline、新策略中七天以内的历史
+prior、经验 plan SEED。旧版标量比例不再直接作为当前有效证据；原始 observations、
+snapshots 和 intervals 均保留。baseline 与服务端总量相等来自构造，不能反证原始
+token 统计正确。
 
-### 第一次估算
+可信度来自不重叠的真实观测，而不是查询次数。明显不一致会显示
+`CALIBRATION MISMATCH`，不裁剪数值或改写 credits。`local/backend≈`（此前的
+coverage）仅是比例诊断，不证明所有额度来自本机。多设备、共享额度池、快照滞后、
+计数缺陷或模型/档位组合变化仍可能影响估算。
 
-拿到 weekly snapshot 后，脚本会从当前 weekly window 的起点到 snapshot 时刻，重建本机累计 credits。
-
-假设 backend 显示：
-
-```text
-weekly used = 40%
-```
-
-本地历史重建得到：
-
-```text
-15,200 CREDITS*
-```
-
-则第一次会得到：
-
-```text
-1 weekly percentage point ≈ 380 CREDITS*
-effective weekly capacity ≈ 38,000 CREDITS*
-confidence: LOW
-```
-
-这里**不是**说 OpenAI 给了 38,000 个可购买 credits；它只是为了把 included weekly allowance 映射到一个有效的 credit-equivalent 坐标系。
-
-### 多次查询后逐渐校准
-
-随着 Codex 产生新的 quota snapshot，脚本在同一个 weekly reset epoch 内学习：
-
-```text
-Δ 本机 CREDITS* / Δ backend weekly used%
-```
-
-估计器使用 weighted median，并过滤明显偏低/偏高的 interval。
-
-如果 backend weekly% 增长很多、但本机 credits 几乎没变，这通常说明还有本工具看不到的 quota 消耗来源；这种 interval 不应该直接把 conversion ratio 拉低。
-
-Confidence 大致分为：
-
-- `LEARNING`：还没有可用换算关系
-- `LOW`：只有初始 baseline，或有效 quota movement 太少
-- `MEDIUM`：已有多个 clean delta interval
-- `HIGH`：已有多个相互一致的 interval，并覆盖了足够的 weekly 百分比变化
-
-校准会按 account、plan、rate-card version、credit mode、weekly reset epoch 分段。换套餐或进入新的 weekly window 时，不会简单把旧 epoch 当成同一个观测序列。
-
-## Local coverage
-
-`local coverage≈` 表示在当前 calibration 下，backend weekly used% 中有多少大致可以被本机 transcript 中的 credits 解释。
-
-如果它很低，可能意味着：
-
-- 另一台设备也在用 Codex；
-- 还有本机 transcript 看不到的 agentic usage；
-- 当前 calibration 样本还太少。
-
-它只是诊断指标，不是账户审计结果。
+新派生表只保存分组键、时间、百分比、计价质量与派生成本，不复制认证 token 或
+对话内容。完整规则见[版本说明](docs/v1.8.0-quota-calibration.md)。
 
 ## Credits 估算
 
@@ -407,7 +380,7 @@ credits* = uncached input component + cached input component + output component
 
 Reasoning tokens 是 output 的细分，不会重复收费。
 
-`codex-usage` 会从持久化的 `turn_context` / `thread_settings_applied` 设置重建实际档位；`priority` 视为 Fast。缺少档位标记时默认按 Standard 给出保守下界；`--fast` 只把这些 Unknown 段按 Fast 估算，不会覆盖已经识别出的 Standard / Fast。
+`codex-usage` 会从持久化的 `turn_context` / `thread_settings_applied` 设置重建实际档位；`priority` 视为 Fast。缺少档位标记时默认按 Standard 作明确假设的估算；`--fast` 只把这些 Unknown 段按 Fast 估算，不会覆盖已经识别出的 Standard / Fast。
 
 `CREDITS*` 与 `WEEKLY≈` 都不是 OpenAI 官方服务端账单/额度 meter。
 
