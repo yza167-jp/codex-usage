@@ -1,0 +1,15 @@
+name: Remove redundant v1.7.4 snapshot branch
+
+on:
+  push:
+    branches: [fix/v1.7.4-quota-calibration]
+    paths: [.github/workflows/v174-cleanup.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" --delete fix/v1.7.4-quota-calibration
