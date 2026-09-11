@@ -1,0 +1,64 @@
+name: Apply v1.8.0 quota calibration
+on:
+  push:
+    branches: [fix/v1.8.0-quota-calibration]
+    paths: [.github/workflows/v180-apply.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Verify and apply locally tested source
+        shell: bash
+        run: |
+          python - <<'PY'
+          import base64, hashlib, lzma, subprocess
+          from pathlib import Path
+          expected_base = 'a245db5f501a90be28bdfc58f14fae4ea5d23be5'
+          actual_base = subprocess.check_output(['git', 'hash-object', 'codex-usage'], text=True).strip()
+          assert actual_base == expected_base, (actual_base, expected_base)
+          encoded = ''.join(Path(f'tools/v180-part-{i}.b64').read_text(encoding='utf-8').strip() for i in range(5))
+          patch = lzma.decompress(base64.b64decode(encoded, validate=True))
+          digest = hashlib.sha256(patch).hexdigest()
+          assert digest == 'b9563ef218e6b78322b497baf7c924a80ca18d2bae4d42f63c7b892b6878e39a', digest
+          p = Path('/tmp/v180.patch')
+          p.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--unidiff-zero', '--check', str(p)], check=True)
+          subprocess.run(['git', 'apply', '--unidiff-zero', str(p)], check=True)
+          expected = {
+            'CHANGELOG.md': 'c246f6a16fa080455fa614b68748189734eebc4202ae3e8133a67e2caf8100fe',
+            'README.md': '7e87a65254c819ca33703de2f8d7177ae465a3e02d6886c729421dcaf11907cd',
+            'README.zh-CN.md': '09b4b943d0712ad25701c8acbb0694540878098dc644279de19ec56dd7375fe1',
+            'codex-usage': 'e00f7e9035e3fc983b403da369ebf4a6704dc02dbecdcaf16c85d5c8af66c421',
+            'docs/v1.8.0-quota-calibration.md': '98fb7c28b1333b2408e064f3445bee945065e9a3c0a1a397cb989e365cafa338',
+            'tests/test_codex_usage.py': '3f092c9bf12d8a91bfcd26c212850c6469aaec9fdd067a5550696643cc008f90',
+            'tests/test_gpt6.py': 'e0993d878eabbe3ec441998b9d50968774cc85c7f0e4248d92870093486cc37e',
+            'tests/test_quota_v180.py': 'b5401e39de8049688ff30eb85a9be9d07a93d95b78d3b7b2e63dba8bbe5b1d99',
+          }
+          for filename, sha in expected.items():
+              actual = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
+              assert actual == sha, (filename, actual, sha)
+          print('Verified patch and all 8 source files.')
+          PY
+      - name: Validate source
+        shell: bash
+        run: |
+          python -m py_compile codex-usage
+          python -m unittest discover -s tests -v
+          python codex-usage --version
+          python codex-usage --help >/dev/null
+          git diff --check
+      - name: Commit tested source without transport helpers
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/v180-source.yml .github/workflows/v180-apply.yml tools/v180-part-{0,1,2,3,4}.b64
+          git add CHANGELOG.md README.md README.zh-CN.md codex-usage docs/v1.8.0-quota-calibration.md tests/test_codex_usage.py tests/test_gpt6.py tests/test_quota_v180.py
+          git commit -m 'v1.8.0: rebuild quota calibration from current-epoch evidence'
+          git push origin HEAD:fix/v1.8.0-quota-calibration
