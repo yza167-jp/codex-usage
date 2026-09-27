@@ -1,5 +1,26 @@
 # codex-usage
 
+## v1.8.1: GPT-6 Sol and Luna
+
+`gpt-6-sol` and `gpt-6-luna` now have **separate** reference rates and display as
+`6 Sol` and `6 Luna`. Standard rates, in credits per million uncached input /
+cached input / output tokens, are **50 / 5 / 250** and **2.5 / 0.25 / 12.5**;
+Fast/priority is **2.5x** for both. They are not aliases of Astra or GPT-5.6.
+Model lists remain sorted by Standard reference unit price, not version number.
+
+**No cache rebuild.** Previously indexed Sol/Luna events become priceable on the
+next query, and current quota blocks are replayed from existing raw snapshots
+and deltas. All historical quota records and the v1.8.0 calibration policy are
+preserved. Enough eligible quota movement is still needed for a current delta
+scale; fallback/LOW labels remain honest. The prices are Work/Codex reference
+credits, not a guaranteed Plus/Pro weekly-allowance conversion.
+
+A terminal report with other missing model rates now names their canonical IDs
+instead of showing unexplained dashes. Their tokens remain counted; their credit
+and weekly estimates are unavailable/partial, never silently zero. Unknown
+service tiers of priced models remain a different condition.
+See [rates, compatibility and validation](docs/v1.8.1-gpt6-sol-luna.md).
+
 ## v1.8.0: consolidated current-window quota repair
 
 Current reset-period evidence replaces stale historical calibration. Known-model

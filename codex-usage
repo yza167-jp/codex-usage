@@ -69,12 +69,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
-GPT6_RATE_CARD_AS_OF = "2026-09-05"
-# Do not invalidate complete historical calibration: no previously priced model
-# or tier changes cost. Old incomplete intervals remain excluded, not relabeled.
+GPT6_RATE_CARD_AS_OF = "2026-09-27"
+# Additive rates do not change previously priced model/tier costs or cached
+# token coordinates. Current quota blocks are replayed from raw snapshots and
+# deltas on each query, so formerly unpriced Sol/Luna blocks are re-evaluated;
+# legacy incomplete credit scalars are never promoted without replay.
 RATE_CARD_CALIBRATION_KEY = "2026-08-12-r3-tier-aware"
 CACHE_SCHEMA_VERSION = 3
 TREND_MINUTES = 60
@@ -106,10 +108,13 @@ PLAN_WEEKLY_SEED_CPP = {
 
 # Official Codex ChatGPT credit rate card, credits per 1M tokens.
 # Existing GPT-5.x entries are the pinned v1.6.2 reference rates, not a claim
-# about current purchased-credit promotions. GPT-6 Astra's Work/Codex reference
-# rates (checked 2026-09-05) are documented in docs/v1.7.0-gpt6.md.
+# about current purchased-credit promotions. GPT-6 Work/Codex reference rates
+# (checked 2026-09-27) include distinct Astra, Sol and Luna entries; see
+# docs/v1.8.1-gpt6-sol-luna.md. They are not fixed Plus/Pro quota conversions.
 RATE_CARD: Dict[str, Tuple[float, float, float]] = {
     "gpt-6-astra": (250.0, 25.0, 1250.0),
+    "gpt-6-sol": (50.0, 5.0, 250.0),
+    "gpt-6-luna": (2.5, 0.25, 12.5),
     "gpt-5.6-sol": (125.0, 12.5, 750.0),
     "gpt-5.6": (125.0, 12.5, 750.0),  # Codex default alias -> Sol family
     "daybreak-blue": (125.0, 12.5, 750.0),
@@ -127,6 +132,8 @@ RATE_CARD: Dict[str, Tuple[float, float, float]] = {
 # Fast mode multipliers published by OpenAI.
 FAST_MULTIPLIERS: Dict[str, float] = {
     "gpt-6-astra": 2.5,  # Work/Codex, not the API Fast rate
+    "gpt-6-sol": 2.5,
+    "gpt-6-luna": 2.5,
     "gpt-5.6-sol": 2.5,
     "gpt-5.6": 2.5,
     "gpt-5.6-terra": 2.5,
@@ -557,12 +564,14 @@ def normalize_model(model: object) -> str:
     # check to credit calculation.
     if s.startswith("openai."):
         s = s[len("openai."):]
-    # Exact shorthand aliases are a tool compatibility convention. Match dated
-    # Astra IDs narrowly; never price every gpt-6-* variant as the base model.
+    # Existing shorthand aliases still mean Astra for backward compatibility.
+    # Dated IDs retain their exact family; never price every gpt-6-* variant
+    # as Astra or infer a rate for an unverified Pro/preview/WM suffix.
     if s in ("gpt-6", "gpt6"):
         return "gpt-6-astra"
-    if re.fullmatch(r"gpt-6-astra-\d{4}-\d{2}-\d{2}", s):
-        return "gpt-6-astra"
+    dated = re.fullmatch(r"(gpt-6-(?:astra|sol|luna))-\d{4}-\d{2}-\d{2}", s)
+    if dated:
+        return dated.group(1)
     return s
 
 
@@ -3109,6 +3118,8 @@ def pretty_model(model: str) -> str:
     model, _ = split_usage_key(model)
     aliases = {
         "gpt-6-astra": "6 Astra",
+        "gpt-6-sol": "6 Sol",
+        "gpt-6-luna": "6 Luna",
         "gpt-6-astra-wm": "6 Astra WM",  # recognized, separate price unverified
         "gpt-5.6-sol": "5.6 Sol",
         "gpt-5.6": "5.6 Sol",
@@ -3169,6 +3180,26 @@ def model_names(models: Iterable[str]) -> List[str]:
 def model_label(models: Iterable[str]) -> str:
     items = [pretty_model(m) for m in model_names(models)]
     return " / ".join(items) if items else "?"
+
+
+def unpriced_model_names(buckets: Dict[str, Bucket]) -> List[str]:
+    """Identify missing model rates, separately from unresolved service tiers."""
+    return model_names(
+        key for bucket in buckets.values() for key in bucket.usage_by_model
+        if split_usage_key(key)[0] not in RATE_CARD
+    )
+
+
+def unpriced_model_notes(buckets: Dict[str, Bucket]) -> List[str]:
+    """Report missing canonical IDs without silently treating their usage as zero."""
+    names = unpriced_model_names(buckets)
+    if not names:
+        return []
+    return [
+        "Unpriced models (selected period): " + " / ".join(names),
+        "Tokens retained; reference credits and WEEKLY estimates exclude these models. "
+        "Update codex-usage for newer rate support.",
+    ]
 
 
 def service_tier_display(tier: str, compact: bool = False) -> str:
@@ -3683,6 +3714,9 @@ def render_table(
             truncate(f"Subscription  {plan_display_name(plan_raw)} · WEEKLY snapshot unavailable in recent rollout telemetry", terminal_width),
             color.DIM,
         ))
+    for note in unpriced_model_notes(buckets):
+        lines.extend(color.wrap(part, color.YELLOW)
+                     for part in wrap_display_words(note, terminal_width))
     lines.append("")
 
     if not rows:
