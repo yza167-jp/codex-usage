@@ -1,0 +1,32 @@
+name: Apply v1.8.1 GPT-6 model support
+on:
+  push:
+    branches: [fix/v1.8.1-gpt6-sol-luna]
+    paths: [.github/workflows/v181-apply.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/v1.8.1-gpt6-sol-luna
+          fetch-depth: 0
+      - name: Apply tested source edits
+        run: |
+          python tools/v181_update.py
+          cp tools/v181_tests.py tests/test_gpt6_sol_luna.py
+          python -m py_compile codex-usage
+          python -m unittest discover -s tests -v
+          python codex-usage --version
+          python codex-usage --help >/dev/null
+          git diff --check
+      - name: Commit release source without transport helpers
+        run: |
+          rm tools/v181_update.py tools/v181_tests.py .github/workflows/v181-source.yml .github/workflows/v181-apply.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add codex-usage README.md README.zh-CN.md CHANGELOG.md docs/v1.8.1-gpt6-sol-luna.md tests .github/workflows tools
+          git commit -m 'v1.8.1: support GPT-6 Sol/Luna and name unpriced models'
+          git push origin HEAD:fix/v1.8.1-gpt6-sol-luna
