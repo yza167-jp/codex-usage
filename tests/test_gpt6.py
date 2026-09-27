@@ -162,7 +162,7 @@ class GPT6Tests(unittest.TestCase):
         self.assertIn("8.07%", table)
         self.assertIn("TOKENS I/C/O", table)
         self.assertIn("Service tier breakdown", table)
-        self.assertIn("GPT-6 2026-09-05", table)
+        self.assertIn(f"GPT-6 {m.GPT6_RATE_CARD_AS_OF}", table)
 
     def test_cached_previously_unpriced_gpt6_needs_no_rebuild(self):
         m = self.m

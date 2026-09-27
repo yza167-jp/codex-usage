@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.8.1 — 2026-09-27
+
+- Add distinct GPT-6 Sol (50 / 5 / 250) and GPT-6 Luna (2.5 / 0.25 / 12.5) Work/Codex reference credit rates per million uncached-input / cached-input / output tokens; both support a 2.5x Fast multiplier.
+- Recognize canonical and narrowly matched dated Sol/Luna IDs, displaying `6 Sol` and `6 Luna`; preserve Astra aliases and do not guess other GPT-6 variant prices.
+- Restore session/TOTAL/1H, component, agent/model/tier, weekly and JSON/CSV estimates for already indexed Sol/Luna usage. Keep price-descending model order based on reference unit price, not generation.
+- Name missing-rate models explicitly in terminal reports. Retain their tokens and unknown/partial results; a known model with an Unknown tier is not reported as an unpriced model.
+- Re-evaluate current-period quota blocks from existing raw snapshots and token deltas, including blocks previously excluded for missing Sol/Luna rates. Preserve schema-3 token caches, all quota history, calibration policy and previously priced model rates. No rebuild is needed.
+- Add regressions for Standard/Fast/Unknown, independent model identities, mixed subagents/exports, all-unpriced warnings, warm-cache upgrade and excluded-to-eligible quota replay.
+
 ## 1.8.0 — 2026-09-11
 
 - Consolidated the concurrently merged v1.7.4 current-window calibration repair instead of replacing its estimator, reconciliation behavior or tests.
