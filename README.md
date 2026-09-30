@@ -1,5 +1,22 @@
 # codex-usage
 
+## v1.8.2: GPT-6.1 Sol
+
+Add distinct `gpt-6.1-sol` support, displayed as **6.1 Sol**. Standard reference
+credits per million uncached-input / cached-input / output tokens are
+**50 / 2.5 / 250**. Cached input is half GPT-6 Sol's rate; the models are not aliases.
+
+Fast/priority uses the existing **2.5x included-allowance reference scale**.
+The current official rate card separately sets purchased-credit Fast at **2x**;
+`CREDITS*` is a diagnostic reference coordinate, not that invoice. A terminal
+note explains this when GPT-6.1 Sol Fast is used. See [sources and semantics](docs/v1.8.2-gpt61-sol.md).
+
+**No cache rebuild.** Existing GPT-6.1 Sol tokens become priceable immediately,
+and current quota blocks are re-evaluated from stored snapshots and deltas.
+All prior prices, calibration history, model price order, exports and the
+144-cell PROJECT/SESSION layout remain compatible. Unsupported suffixes,
+including Ultrafast, are not silently priced as the base model.
+
 ## v1.8.1: GPT-6 Sol and Luna
 
 `gpt-6-sol` and `gpt-6-luna` now have **separate** reference rates and display as

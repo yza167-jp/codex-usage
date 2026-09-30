@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.2 — 2026-09-30
+
+- Add independent GPT-6.1 Sol Standard reference rates (50 / 2.5 / 250 credits per 1M uncached/cached/output tokens) and the `6.1 Sol` display label.
+- Recognize canonical and strictly dated IDs; do not alias GPT-6 Sol, Astra, generic 6.1 or unverified Ultrafast/Pro/WM variants.
+- Apply the 2.5x included-allowance Fast reference multiplier per segment. Document the distinct current 2x purchased-credit Fast rate and show a note for GPT-6.1 Sol Fast; CREDITS* is not a bill.
+- Reprice existing cached events and replay formerly excluded current quota blocks without rebuilding token indexes or deleting quota history.
+- Preserve all previously supported reference prices, calibration policy/keys, price-descending model order, exports and terminal layout. Add GPT-6.1 accounting, display, export and warm-cache regressions.
+
 ## 1.8.1 — 2026-09-27
 
 - Add distinct GPT-6 Sol (50 / 5 / 250) and GPT-6 Luna (2.5 / 0.25 / 12.5) Work/Codex reference credit rates per million uncached-input / cached-input / output tokens; both support a 2.5x Fast multiplier.

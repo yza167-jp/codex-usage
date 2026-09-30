@@ -69,13 +69,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
-GPT6_RATE_CARD_AS_OF = "2026-09-27"
+GPT6_RATE_CARD_AS_OF = "2026-09-30"
 # Additive rates do not change previously priced model/tier costs or cached
 # token coordinates. Current quota blocks are replayed from raw snapshots and
-# deltas on each query, so formerly unpriced Sol/Luna blocks are re-evaluated;
+# deltas on each query, so newly supported model blocks are re-evaluated;
 # legacy incomplete credit scalars are never promoted without replay.
 RATE_CARD_CALIBRATION_KEY = "2026-08-12-r3-tier-aware"
 CACHE_SCHEMA_VERSION = 3
@@ -108,11 +108,13 @@ PLAN_WEEKLY_SEED_CPP = {
 
 # Official Codex ChatGPT credit rate card, credits per 1M tokens.
 # Existing GPT-5.x entries are the pinned v1.6.2 reference rates, not a claim
-# about current purchased-credit promotions. GPT-6 Work/Codex reference rates
-# (checked 2026-09-27) include distinct Astra, Sol and Luna entries; see
-# docs/v1.8.1-gpt6-sol-luna.md. They are not fixed Plus/Pro quota conversions.
+# about current purchased-credit promotions. GPT-6.1 Sol Standard reference
+# rates were checked 2026-09-30; previously supported rates remain unchanged.
+# See docs/v1.8.2-gpt61-sol.md for allowance vs purchased-credit Fast semantics.
+# These are reference coordinates, not fixed Plus/Pro quota conversions.
 RATE_CARD: Dict[str, Tuple[float, float, float]] = {
     "gpt-6-astra": (250.0, 25.0, 1250.0),
+    "gpt-6.1-sol": (50.0, 2.5, 250.0),
     "gpt-6-sol": (50.0, 5.0, 250.0),
     "gpt-6-luna": (2.5, 0.25, 12.5),
     "gpt-5.6-sol": (125.0, 12.5, 750.0),
@@ -129,9 +131,13 @@ RATE_CARD: Dict[str, Tuple[float, float, float]] = {
     "gpt-5.2": (43.75, 4.375, 350.0),
 }
 
-# Fast mode multipliers published by OpenAI.
+# Subscription-oriented reference multipliers; keep the existing scale.
+# For GPT-6-family models the current included-allowance Fast multiplier is
+# 2.5x, whereas purchased-credit Fast billing is 2x (checked 2026-09-30).
+# This map is NOT a purchased-credit invoice calculator.
 FAST_MULTIPLIERS: Dict[str, float] = {
-    "gpt-6-astra": 2.5,  # Work/Codex, not the API Fast rate
+    "gpt-6-astra": 2.5,  # included-allowance reference, not purchased credits
+    "gpt-6.1-sol": 2.5,
     "gpt-6-sol": 2.5,
     "gpt-6-luna": 2.5,
     "gpt-5.6-sol": 2.5,
@@ -569,7 +575,7 @@ def normalize_model(model: object) -> str:
     # as Astra or infer a rate for an unverified Pro/preview/WM suffix.
     if s in ("gpt-6", "gpt6"):
         return "gpt-6-astra"
-    dated = re.fullmatch(r"(gpt-6-(?:astra|sol|luna))-\d{4}-\d{2}-\d{2}", s)
+    dated = re.fullmatch(r"(gpt-6-(?:astra|sol|luna)|gpt-6\.1-sol)-\d{4}-\d{2}-\d{2}", s)
     if dated:
         return dated.group(1)
     return s
@@ -3118,6 +3124,7 @@ def pretty_model(model: str) -> str:
     model, _ = split_usage_key(model)
     aliases = {
         "gpt-6-astra": "6 Astra",
+        "gpt-6.1-sol": "6.1 Sol",
         "gpt-6-sol": "6 Sol",
         "gpt-6-luna": "6 Luna",
         "gpt-6-astra-wm": "6 Astra WM",  # recognized, separate price unverified
@@ -3200,6 +3207,22 @@ def unpriced_model_notes(buckets: Dict[str, Bucket]) -> List[str]:
         "Tokens retained; reference credits and WEEKLY estimates exclude these models. "
         "Update codex-usage for newer rate support.",
     ]
+
+
+def fast_reference_notes(buckets: Dict[str, Bucket], assume_fast_unknown: bool) -> List[str]:
+    """Explain the reference basis when the new model contributes Fast usage."""
+    for bucket in buckets.values():
+        for key in bucket.usage_by_model:
+            model, tier = split_usage_key(key)
+            if model == "gpt-6.1-sol" and (
+                tier == SERVICE_TIER_FAST
+                or (assume_fast_unknown and tier == SERVICE_TIER_UNKNOWN)
+            ):
+                return [
+                    "Pricing note  6.1 Sol Fast uses the 2.5x included-allowance reference; "
+                    "purchased-credit Fast is 2x. CREDITS* is not a bill."
+                ]
+    return []
 
 
 def service_tier_display(tier: str, compact: bool = False) -> str:
@@ -3714,6 +3737,9 @@ def render_table(
             truncate(f"Subscription  {plan_display_name(plan_raw)} · WEEKLY snapshot unavailable in recent rollout telemetry", terminal_width),
             color.DIM,
         ))
+    for note in fast_reference_notes(buckets, fast):
+        lines.extend(color.wrap(part, color.DIM)
+                     for part in wrap_display_words(note, terminal_width))
     for note in unpriced_model_notes(buckets):
         lines.extend(color.wrap(part, color.YELLOW)
                      for part in wrap_display_words(note, terminal_width))
