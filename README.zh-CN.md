@@ -1,5 +1,20 @@
 # codex-usage
 
+## v1.8.2：支持 GPT-6.1 Sol
+
+新增独立的 `gpt-6.1-sol`，显示为 **6.1 Sol**。每百万未缓存输入／缓存输入／
+输出 tokens 的 Standard 参考 credits 为 **50 / 2.5 / 250**。缓存输入单价
+是 GPT-6 Sol 的一半，不能把两个型号当成别名或把整个任务费用直接减半。
+
+Fast/priority 沿用工具的 **2.5 倍订阅内额度参考口径**；官方当前对购买 credits
+另列 **2 倍** Fast 费率。`CREDITS*` 是用于估算的参考量，不是购买 credits 的
+账单。涉及 GPT-6.1 Sol Fast 时终端会提示这个区别，详见[来源与语义](docs/v1.8.2-gpt61-sol.md)。
+
+**无需重建或删除 cache。** 已缓存的新模型 tokens 会直接恢复计价，当前校准
+区间由原始快照及 token 增量重新评估。旧模型费率、校准历史、价格排序、导出
+和 144 格 PROJECT/SESSION 布局保留。Ultrafast、Pro、WM 等未核实后缀不会被
+静默并入普通 Sol。本次仅新增模型，weekly 仍需实际观测校准。
+
 ## v1.8.1：支持 GPT-6 Sol 和 Luna
 
 新增 `gpt-6-sol`、`gpt-6-luna` 的独立参考费率，显示为 **6 Sol / 6 Luna**。
