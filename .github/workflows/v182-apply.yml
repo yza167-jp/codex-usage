@@ -1,0 +1,29 @@
+name: Apply v1.8.2 GPT-6.1 Sol support
+on:
+  push:
+    branches: [fix/v1.8.2-gpt61-sol]
+    paths: [.github/workflows/v182-apply.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/v1.8.2-gpt61-sol
+      - name: Apply and validate
+        run: |
+          python tools/apply_v182.py
+          python -m py_compile codex-usage
+          python -m unittest discover -s tests -v
+          python codex-usage --version
+          python codex-usage --help > /dev/null
+      - name: Commit source without transport helpers
+        run: |
+          rm .github/workflows/v182-source.yml .github/workflows/v182-apply.yml tools/apply_v182.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'v1.8.2: add GPT-6.1 Sol reference accounting and cache replay'
+          git push origin HEAD:fix/v1.8.2-gpt61-sol
