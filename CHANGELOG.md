@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — Cloud usage capability work (v1.10.0 blocked)
+
+- Add the official bounded `/query` request and token/estimated-credit parser alongside `/query_v2`; retain usable metrics when either endpoint is denied, unsupported or unavailable. Stop querying a failed interface for the remaining batches.
+- Preserve integer token counters and credit micros, algebraically derive only supported missing totals, mark partial or inconsistent fields, and expose model/effort/speed groups using existing model names and price order.
+- Add Cloud token/EST CREDITS details and additive JSON/CSV fields while keeping exact-ID presentation joins, separate scopes, local totals, 144-cell widths, local rates/Fast/quota policy and offline defaults.
+- Save minimal account-scoped Cloud counter snapshots on explicit queries, separately from the local token index. Report only whole-interval observed posting increments for 1h/12h/24h/7d and selected periods; keep coverage, gaps, decreases and unknowns explicit. No background monitoring or historical reconstruction.
+- Live read-only verification found `/query_v2` usable for three existing sessions, but `/query` returned HTTP 403. No real token/estimated-credit availability is claimed; version remains 1.9.1 pending resolution and live confirmation.
+
 ## 1.9.1 — 2026-10-18
 
 - Replace the appended Cloud table with a single source-aware local/Cloud inventory before details; preserve distinct PERIOD≈ and lifetime LIFE % columns.

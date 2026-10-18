@@ -1,5 +1,34 @@
 # codex-usage
 
+## 开发中：Cloud tokens、档位与入账增量
+
+**v1.10.0 暂缓发布：2026-10-18 当前账号的官方 `/query` 接口返回 HTTP 403。**
+已有 `/query_v2` 仍可读，3 个实测会话有模型／reasoning effort／speed 分组，但没有
+tokens 或 estimated credits。下面的 token 功能已用官方格式的 mock 回归验证，
+仅在服务端实际返回字段时显示；403 会明确提示，不会变成 0 或本地参考估值。
+
+```bash
+codex-usage cloud --details       # 累计数据、模型/effort/speed、接口可用性和四个入账窗口
+codex-usage 12h --cloud --wide    # 统一 PROJECT/SESSION/SRC；本地时段与 Cloud 入账增量分开
+codex-usage 24h --cloud --json    # tokens、原始 credits micros、完整性与 posting_windows
+codex-usage cloud --csv          # 旧字段保留，追加累计 tokens/estimated credits/分组/窗口
+codex-usage cloud --no-cache     # 查询但不读写 Cloud 快照
+```
+
+可用账号的 `/query` 累计 tokens 包括 input、cached input、uncached input、output、total。
+缺失值仍未知；只在等式所需字段均已知时推导 input/uncached/total。部分分组的小计标
+`+?`，JSON 带逐字段完整性。**EST CREDITS** 保留服务端估算及原始百万分之一单位，
+与 Local **CREDITS\***、订阅 lifetime weekly %、购买／余额 credits 分开。
+
+普通 Local 命令仍离线；只有 `cloud` / `--cloud` 联网。每次显式 Cloud 查询默认保存
+最小累计快照，后续提供 `1h/12h/24h/7d` 和所选时段的**服务端统计入账观测增量**。
+首次查询没有历史；只计算两端均在窗口内的完整观测区间，显示覆盖秒数和部分覆盖，
+不插值、不把 lifetime 填入 12h/24h，也不等于任务执行时间。没有定时后台服务。
+快照不存标题、内容或凭证，不修改原 token cache、费率或 quota 记录。
+
+同 ID 仍只合并展示，不重复加总；JSON/CSV 保留独立 host/scope。
+详见[实测、字段语义与时间窗口限制](docs/cloud-token-usage.md)。
+
 ## v1.9.1：Cloud / Local 会话统一显示
 
 `codex-usage 12h --cloud --details` 现在先在**同一张表里显示全部会话**，再进入

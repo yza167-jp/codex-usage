@@ -1,5 +1,39 @@
 # codex-usage
 
+## In development: Cloud tokens, tiers and observed posting deltas
+
+**v1.10.0 release is blocked:** the signed-in account returned HTTP 403 from
+the official `/query` interface on 2026-10-18. `/query_v2` worked for all three
+sampled sessions, with model/effort/speed groups but no tokens or estimated
+credits. Token parsing is covered by official-schema mocks; values appear only
+when the server supplies them. Access denial is explicit, never a zero.
+
+```bash
+codex-usage cloud --details       # Lifetime metrics, model/effort/speed, availability and posting windows
+codex-usage 12h --cloud --wide     # Unified PROJECT/SESSION/SRC with separate measurement scopes
+codex-usage 24h --cloud --json     # Additive tokens, credit micros, completeness and posting_windows
+codex-usage cloud --csv           # Existing columns plus tokens, estimated credits, groups and windows
+codex-usage cloud --no-cache      # Disable Cloud snapshot reads/writes
+```
+
+When `/query` is available, input/cached/uncached/output/total tokens and server
+**EST CREDITS** are retained, grouped by model, reasoning effort and speed.
+Missing fields stay unknown; partial token sums use `+?` and per-field
+completeness flags. Server credit estimates remain separate from Local
+`CREDITS*`, lifetime allowance percentages and purchased/balance credits.
+
+Explicit Cloud queries save minimal cumulative snapshots. Subsequent queries
+can show `1h/12h/24h/7d` and selected-period **observed server posting deltas**,
+including coverage seconds. These are not execution-time usage: the first query
+has no history, only whole observation intervals inside each window count, and
+boundary-crossing intervals are never interpolated. Lifetime is never recent
+usage. No scheduled service is installed. Titles, content and credentials are
+not stored; existing token cache, rates and quota history are preserved.
+
+Local queries remain offline; Cloud remains opt-in. Exact-ID matching still
+joins presentation only, with separate host/scope measurements and no combined
+total. See [live verification, fields and limitations](docs/cloud-token-usage.md).
+
 ## v1.9.1: one local / Cloud session list
 
 `codex-usage 12h --cloud --details` now lists **all sessions before any details**,
