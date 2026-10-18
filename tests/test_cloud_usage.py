@@ -243,7 +243,7 @@ class CloudUsageTests(unittest.TestCase):
             }],
         }
 
-        rendered = self.mod.render_cloud_usage(report, "table")
+        rendered = self.mod.render_cloud_usage(report, "table", details=True)
 
         self.assertIn("lifetime", rendered)
         self.assertIn("Data as of: unavailable", rendered)
