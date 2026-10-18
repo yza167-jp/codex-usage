@@ -1,5 +1,31 @@
 # codex-usage
 
+## v1.9.1：Cloud / Local 会话统一显示
+
+`codex-usage 12h --cloud --details` 现在先在**同一张表里显示全部会话**，再进入
+详情，不再把 Cloud 区块放在全部 Local 详情之后。保留 PROJECT / SESSION 分列：
+**PERIOD≈** 表示所选时段的本地 weekly 估算，**LIFE %** 表示服务端 Cloud 的
+lifetime weekly 用量，**不是本周或过去 12 小时的扣减**。SRC 为 LOCAL / CLOUD /
+BOTH，表示数据来源，不是工具执行位置。
+
+仅同一 thread ID 合并展示为一个条目，两种测量仍分别保留；同名、同项目不合并。
+按项目与会话名排序，无用量数据的条目排在最后，不能按 lifetime 与 12h 数字混排
+成消耗榜。合计明确标为 **LOCAL TOTAL**，不把 Cloud 累计用量相加，也不对 Cloud
+子线程额外汇总。Cloud 会话可能包含 Mac 执行，不能按来源相加当作去重。
+
+详情顺序与摘要一致。同 ID 的本地详情中同时显示 Cloud 累计用量；纯 Cloud
+详情只展示 weekly/5h、余额 credits、数据状态和更新时间，不生成空 token 表。
+`--wide` 的 token/cache/share 和 Cloud 余额信息放在续行；保持 144 格上限，
+PROJECT / SESSION 在全宽下各 18 / 34 格。窄终端会把次要字段移到续行。
+
+`cloud` 单独查询也使用同一布局，支持 `--details`、`--wide` 和配色。JSON 保留
+旧字段，新增按会话组织的 `unified_sessions`；CSV 对同 ID 的两种测量保留相邻
+的两行，并保留 host/scope 和分开的金额列，Cloud 元信息列仅追加。
+
+**不用重建 cache，也没有新必需参数。** 仍需显式使用 `--cloud` 才联网；本地默认
+命令、计价、Fast、quota 校准、Cloud 查询接口与请求次数均不改变。
+详见[统一显示与计量范围说明](docs/v1.9.1-unified-sessions.md)。
+
 ## v1.9.0：dot / Cloud 会话统计
 
 dot 发起的会话在 App 中标为 **Cloud**，链接中为 `hostId=durable`，

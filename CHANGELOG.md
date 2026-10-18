@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.1 — 2026-10-18
+
+- Replace the appended Cloud table with a single source-aware local/Cloud inventory before details; preserve distinct PERIOD≈ and lifetime LIFE % columns.
+- Match only exact root thread IDs, retain both measurements, and annotate Cloud threads whose local tokens are already rolled into a parent. Do not add lifetime, local totals or balance credits together.
+- Sort the unified inventory by project/name, with missing-data-only entries last. LOCAL TOTAL remains a local selected-period subtotal, not an account-wide total.
+- Reuse the inventory order for details; Cloud-only details retain lifetime amounts, availability and freshness without empty token breakdowns. Preserve 144-cell/CJK/color layout and useful wide diagnostics.
+- Preserve existing JSON objects and CSV fields, adding unified_sessions to combined JSON and optional Cloud metadata to CSV. Shared-ID CSV measurements are adjacent but remain separate host/scope rows.
+- Keep explicit Cloud opt-in, read-only network/auth behavior, raw accounting, rates and cache schemas unchanged. No cache rebuild.
+- Add unified-view regression coverage for scope separation, exact-ID matching, rollups, missing/zero values, model display, color/CJK/widths, exports and CLI compatibility.
+
 ## 1.9.0 — 2026-10-04
 
 - Add `cloud` and `--cloud` reports for dot-created durable sessions, including sessions whose tools execute on the user's Mac.

@@ -1,5 +1,37 @@
 # codex-usage
 
+## v1.9.1: one local / Cloud session list
+
+`codex-usage 12h --cloud --details` now lists **all sessions before any details**,
+in one PROJECT / SESSION table. Two weekly-first columns keep scopes explicit:
+**PERIOD≈** is the selected local window's weekly-equivalent estimate;
+**LIFE %** is the Cloud backend's lifetime weekly amount, not current-week usage.
+**SRC** is LOCAL, CLOUD or BOTH (telemetry source, not the executor location).
+
+An exact root thread ID appears once with both measurements. Matching names or
+projects do not merge threads. Rows use project/name order, not a false ranking
+of lifetime amounts against a 12h window; entries without any usage data stay
+visible at the end. Only **LOCAL TOTAL** is computed. There is no combined
+period or Cloud lifetime total, no extra Cloud rollup, and no double charge for
+matching IDs. Cloud records may include Mac execution.
+
+`--details` follows the same inventory order. A shared thread has one detail
+section containing separately labeled local/Cloud amounts; Cloud-only entries
+show lifetime weekly/5h, balance credits, availability and freshness without
+empty token tables. `--wide` moves token/cache/share and Cloud balance diagnostics
+to continuation lines. At 144 cells PROJECT/SESSION retain 18/34 cells; smaller
+terminals move model/tier/credit diagnostics below each row.
+
+Cloud-only `cloud` uses the same layout and honors `--details` / `--wide` / color.
+JSON retains `sessions` and `cloud_usage`, adding `unified_sessions` with separate
+measurement objects. CSV retains two measurement rows for a shared ID, now
+adjacent, with explicit host/scope and separate amount columns; Cloud metadata
+columns are additive. Normal local commands remain offline and unchanged.
+
+**No cache rebuild or new flag:** keep using `--cloud` explicitly. Network
+requests, rate cards, quota calibration and raw accounting are unchanged.
+See [display, scopes and compatibility](docs/v1.9.1-unified-sessions.md).
+
 ## v1.9.0: dot / Cloud sessions
 
 Dot-created sessions use the App's **Cloud** / `hostId=durable` conversation
@@ -7,7 +39,7 @@ backend even when their tools execute on your Mac. They may have no local
 rollout JSONL, so a local directory scan cannot discover their usage.
 
 ```bash
-codex-usage 24h --cloud       # Local window report plus separate Cloud lifetime usage
+codex-usage 24h --cloud       # Unified session table with separate period/lifetime amounts
 codex-usage cloud            # Discover and query the account's durable sessions
 codex-usage cloud --json     # --csv also supported
 codex-usage cloud --no-archived

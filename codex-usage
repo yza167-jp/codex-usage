@@ -78,7 +78,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
 GPT6_RATE_CARD_AS_OF = "2026-09-30"
@@ -3640,6 +3640,7 @@ def render_table(
     quota_calibration: Optional[QuotaCalibration] = None,
     quota_local_credits: Optional[float] = None,
     quota_local_complete: bool = True,
+    cloud_report: Optional[dict] = None,
 ) -> str:
     rows = []
     known_credit_total = 0.0
@@ -3754,7 +3755,7 @@ def render_table(
                      for part in wrap_display_words(note, terminal_width))
     lines.append("")
 
-    if not rows:
+    if not rows and cloud_report is None:
         lines.append("No token_count usage found for this period.")
         return "\n".join(lines)
 
@@ -3794,132 +3795,146 @@ def render_table(
             cells.append(styled_cell(padded, styles.get(i)))
         return summary_separator.join(cells)
 
-    lines.append(fmt_row(headers, {i: "header" for i in range(len(headers))}))
-    lines.append(color.wrap(summary_separator.join("-" * w for w in widths), color.DIM))
-
-    for b, u, credits, complete, cache_tax, state, health, burn, recent_cache, burn_complete, is_orphan in rows:
-        credit_text = "—"
-        share_text = "—"
-        if credits is not None:
-            credit_text = f"{credits:.1f}" + ("" if complete else "+")
-            if known_credit_total > 0:
-                share_text = f"{100.0 * credits / known_credit_total:.1f}%"
-        project, session_name = bucket_identity(b)
-        raw_title = session_name + (f" (+{len(b.child_sessions)} sub)" if b.child_sessions else "")
-        title = truncate(raw_title, widths[1])
-        status = status_text(state, health, is_orphan)
-        weekly_text = weekly_percent_text(credits, quota_calibration, complete)
-        burn_weekly = weekly_percent_text(
-            burn if burn is not None and burn > 0 else None, quota_calibration, burn_complete
-        )
-
-        model_text, model_lines = model_cell_layout(
-            b.usage_by_model.keys(), widths[2], terminal_width
-        )
-        row = [
-            project or "—", title, model_text, tier_label(b.usage_by_model.keys()),
-            weekly_text, burn_weekly, credit_text,
-            f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
-        ]
-        status_idx, title_idx, burn_idx, cache_idx = 9, 1, 5, 7
-
-        styles = {}
-        if is_orphan:
-            styles[status_idx] = "orphan"
-            styles[title_idx] = "orphan"
-        elif state in ("ACTIVE", "RECENT") and health == "ROTATE":
-            styles[title_idx] = "rotate"
-        elif state in ("ACTIVE", "RECENT") and health == "WATCH":
-            styles[title_idx] = "watch"
-        elif state in ("ACTIVE", "RECENT") and health == "OK":
-            styles[title_idx] = "ok" if state == "ACTIVE" else "recent"
-        else:
-            styles[title_idx] = "idle"
-
-        if health == "ROTATE":
-            styles[status_idx] = "rotate"
-        elif health == "WATCH":
-            styles[status_idx] = "watch"
-        elif health == "OK" and state in ("ACTIVE", "RECENT"):
-            styles[status_idx] = "ok"
-        elif not is_orphan:
-            styles[status_idx] = "idle"
-
-        if credits and cache_tax / credits >= 0.70:
-            styles[cache_idx] = "warn"
-        if burn is not None:
-            if burn >= 500:
-                styles[burn_idx] = "hot"
-            elif burn >= 100:
-                styles[burn_idx] = "warn"
-
-        styles[0] = "idle" if state == "IDLE" else "recent"
-        lines.append(fmt_row(row, styles))
-        lines.extend(color.wrap(line, color.DIM) for line in model_lines)
-        if wide and not wide_inline:
-            token_line = f"  TOKENS I/C/O  {token_triplet_text(u)}"
-            lines.append(color.wrap(truncate(token_line, terminal_width), color.DIM))
-
-    total_usage = Usage()
-    total_cache_tax = 0.0
-    total_recent = 0.0
-    for _, u, _, _, cache_tax, _, _, burn, _, _, _ in rows:
-        total_usage = total_usage + u
-        total_cache_tax += cache_tax
-        if burn is not None:
-            total_recent += burn
-    total_credit_text = f"{known_credit_total:.1f}" + ("" if all_credit_complete else "+") if known_credit_total > 0 else "—"
-    total_weekly_text = weekly_percent_text(
-        known_credit_total if known_credit_total > 0 else None, quota_calibration, all_credit_complete
-    )
-    total_burn_complete = all(r[9] for r in rows if r[7] is not None and r[7] > 0)
-    total_burn_weekly = weekly_percent_text(
-        total_recent if total_recent > 0 else None, quota_calibration, total_burn_complete
-    )
-    total_row = [
-        "TOTAL", "", "", "", total_weekly_text, total_burn_weekly, total_credit_text,
-        f"{total_cache_tax:.1f}" if total_cache_tax else "—",
-        "100%" if known_credit_total > 0 else "—", "",
-    ]
-    lines.append(color.wrap(summary_separator.join("-" * w for w in widths), color.DIM))
-    lines.append(fmt_row(total_row, {i: "total" for i in range(len(total_row))}))
-    if wide and not wide_inline:
-        lines.append(color.wrap(
-            truncate(f"  TOKENS I/C/O  {token_triplet_text(total_usage)}", terminal_width),
-            color.DIM,
-        ))
-    lines.append("")
-    lines.append(color.wrap(
-        "* WEEKLY≈ estimates selected local usage in weekly equivalents; it can span resets and is not a provider quota bound.",
-        color.DIM,
-    ))
-    lines.append(color.wrap(
-        "  1H≈ is the same weekly-equivalent metric for the trailing 60 minutes. CREDITS* and CACHE TAX are secondary diagnostics.",
-        color.DIM,
-    ))
-    lines.append(color.wrap(STATUS_NOTE, color.DIM))
-    if not wide:
-        lines.append(color.wrap("  Use --wide to add a compact INPUT/CACHED/OUTPUT token triplet.", color.DIM))
-    elif not wide_inline:
-        lines.append(color.wrap(
-            "  --wide token diagnostics use continuation lines to keep PROJECT and SESSION readable.",
-            color.DIM,
-        ))
+    entries = None
+    if cloud_report is not None:
+        items = [{"session_id": r[0].session_id, "title": bucket_identity(r[0])[1],
+                  "project_name": bucket_identity(r[0])[0], "local": r,
+                  "source_ids": list(r[0].usage_by_source)} for r in rows]
+        entries = join_session_views(items, cloud_report)
+        lines.extend(render_unified_summary(entries, cloud_report, period_label,
+                                           terminal_width, color, quota_calibration, wide))
     else:
-        lines.append(color.wrap("  TOKENS I/C/O = INPUT / CACHED / OUTPUT.", color.DIM))
-    if fast:
+        lines.append(fmt_row(headers, {i: "header" for i in range(len(headers))}))
+        lines.append(color.wrap(summary_separator.join("-" * w for w in widths), color.DIM))
+
+        for b, u, credits, complete, cache_tax, state, health, burn, recent_cache, burn_complete, is_orphan in rows:
+            credit_text = "—"
+            share_text = "—"
+            if credits is not None:
+                credit_text = f"{credits:.1f}" + ("" if complete else "+")
+                if known_credit_total > 0:
+                    share_text = f"{100.0 * credits / known_credit_total:.1f}%"
+            project, session_name = bucket_identity(b)
+            raw_title = session_name + (f" (+{len(b.child_sessions)} sub)" if b.child_sessions else "")
+            title = truncate(raw_title, widths[1])
+            status = status_text(state, health, is_orphan)
+            weekly_text = weekly_percent_text(credits, quota_calibration, complete)
+            burn_weekly = weekly_percent_text(
+                burn if burn is not None and burn > 0 else None, quota_calibration, burn_complete
+            )
+
+            model_text, model_lines = model_cell_layout(
+                b.usage_by_model.keys(), widths[2], terminal_width
+            )
+            row = [
+                project or "—", title, model_text, tier_label(b.usage_by_model.keys()),
+                weekly_text, burn_weekly, credit_text,
+                f"{cache_tax:.1f}" if cache_tax > 0 else "—", share_text, status,
+            ]
+            status_idx, title_idx, burn_idx, cache_idx = 9, 1, 5, 7
+
+            styles = {}
+            if is_orphan:
+                styles[status_idx] = "orphan"
+                styles[title_idx] = "orphan"
+            elif state in ("ACTIVE", "RECENT") and health == "ROTATE":
+                styles[title_idx] = "rotate"
+            elif state in ("ACTIVE", "RECENT") and health == "WATCH":
+                styles[title_idx] = "watch"
+            elif state in ("ACTIVE", "RECENT") and health == "OK":
+                styles[title_idx] = "ok" if state == "ACTIVE" else "recent"
+            else:
+                styles[title_idx] = "idle"
+
+            if health == "ROTATE":
+                styles[status_idx] = "rotate"
+            elif health == "WATCH":
+                styles[status_idx] = "watch"
+            elif health == "OK" and state in ("ACTIVE", "RECENT"):
+                styles[status_idx] = "ok"
+            elif not is_orphan:
+                styles[status_idx] = "idle"
+
+            if credits and cache_tax / credits >= 0.70:
+                styles[cache_idx] = "warn"
+            if burn is not None:
+                if burn >= 500:
+                    styles[burn_idx] = "hot"
+                elif burn >= 100:
+                    styles[burn_idx] = "warn"
+
+            styles[0] = "idle" if state == "IDLE" else "recent"
+            lines.append(fmt_row(row, styles))
+            lines.extend(color.wrap(line, color.DIM) for line in model_lines)
+            if wide and not wide_inline:
+                token_line = f"  TOKENS I/C/O  {token_triplet_text(u)}"
+                lines.append(color.wrap(truncate(token_line, terminal_width), color.DIM))
+
+        total_usage = Usage()
+        total_cache_tax = 0.0
+        total_recent = 0.0
+        for _, u, _, _, cache_tax, _, _, burn, _, _, _ in rows:
+            total_usage = total_usage + u
+            total_cache_tax += cache_tax
+            if burn is not None:
+                total_recent += burn
+        total_credit_text = f"{known_credit_total:.1f}" + ("" if all_credit_complete else "+") if known_credit_total > 0 else "—"
+        total_weekly_text = weekly_percent_text(
+            known_credit_total if known_credit_total > 0 else None, quota_calibration, all_credit_complete
+        )
+        total_burn_complete = all(r[9] for r in rows if r[7] is not None and r[7] > 0)
+        total_burn_weekly = weekly_percent_text(
+            total_recent if total_recent > 0 else None, quota_calibration, total_burn_complete
+        )
+        total_row = [
+            "TOTAL", "", "", "", total_weekly_text, total_burn_weekly, total_credit_text,
+            f"{total_cache_tax:.1f}" if total_cache_tax else "—",
+            "100%" if known_credit_total > 0 else "—", "",
+        ]
+        lines.append(color.wrap(summary_separator.join("-" * w for w in widths), color.DIM))
+        lines.append(fmt_row(total_row, {i: "total" for i in range(len(total_row))}))
+        if wide and not wide_inline:
+            lines.append(color.wrap(
+                truncate(f"  TOKENS I/C/O  {token_triplet_text(total_usage)}", terminal_width),
+                color.DIM,
+            ))
+        lines.append("")
         lines.append(color.wrap(
-            "  --fast resolves only UNKNOWN tier segments as Fast; detected Standard/Fast segments are unchanged.",
+            "* WEEKLY≈ estimates selected local usage in weekly equivalents; it can span resets and is not a provider quota bound.",
             color.DIM,
         ))
-    if any_partial:
         lines.append(color.wrap(
-            "  '+' marks partial reference credits; '?' marks partial WEEKLY≈. Weekly estimates are not guaranteed quota bounds.",
+            "  1H≈ is the same weekly-equivalent metric for the trailing 60 minutes. CREDITS* and CACHE TAX are secondary diagnostics.",
             color.DIM,
         ))
+        lines.append(color.wrap(STATUS_NOTE, color.DIM))
+        if not wide:
+            lines.append(color.wrap("  Use --wide to add a compact INPUT/CACHED/OUTPUT token triplet.", color.DIM))
+        elif not wide_inline:
+            lines.append(color.wrap(
+                "  --wide token diagnostics use continuation lines to keep PROJECT and SESSION readable.",
+                color.DIM,
+            ))
+        else:
+            lines.append(color.wrap("  TOKENS I/C/O = INPUT / CACHED / OUTPUT.", color.DIM))
+        if fast:
+            lines.append(color.wrap(
+                "  --fast resolves only UNKNOWN tier segments as Fast; detected Standard/Fast segments are unchanged.",
+                color.DIM,
+            ))
+        if any_partial:
+            lines.append(color.wrap(
+                "  '+' marks partial reference credits; '?' marks partial WEEKLY≈. Weekly estimates are not guaranteed quota bounds.",
+                color.DIM,
+            ))
 
     if details:
-        for b, total_u, total_credits, total_complete, total_cache_tax, state, health, burn, recent_cache, burn_complete, is_orphan in rows:
+        detail_entries = entries if entries is not None else [{"local": row, "cloud": None} for row in rows]
+        for entry in detail_entries:
+            if entry["local"] is None:
+                lines.extend(render_cloud_detail(entry, cloud_report or {}, terminal_width, color))
+                continue
+            b, total_u, total_credits, total_complete, total_cache_tax, state, health, burn, recent_cache, burn_complete, is_orphan = entry["local"]
             lines.append("")
             detail_width = terminal_width
             lines.append(color.wrap("=" * detail_width, color.BLUE))
@@ -3971,7 +3986,10 @@ def render_table(
 
             usage_weekly = weekly_percent_text(total_credits, quota_calibration, total_complete)
             credit_mark = "—" if total_credits is None else f"{total_credits:.1f}" + ("" if total_complete else "+")
-            lines.append(f"Usage      WEEKLY≈ {usage_weekly} · CREDITS* {credit_mark}")
+            scope_prefix = "Local selected-period" if cloud_report is not None else "Usage"
+            lines.append(f"{scope_prefix}      WEEKLY≈ {usage_weekly} · CREDITS* {credit_mark}")
+            if entry.get("cloud") is not None:
+                lines.extend(render_cloud_detail(entry, cloud_report or {}, detail_width, color, heading=False))
             if burn is not None and burn > 0:
                 burn_weekly = weekly_percent_text(burn, quota_calibration, burn_complete)
                 projection_weekly = weekly_percent_text(burn * 2.0, quota_calibration, burn_complete)
@@ -4587,6 +4605,8 @@ def discover_cloud_threads(codex_home: Path, include_archived: bool = True) -> L
                         "id": row["id"], "title": row.get("name") or row.get("title") or row.get("preview") or row["id"],
                         "created_at": datetime.fromtimestamp(created, timezone.utc).isoformat() if created else None,
                         "archived": archived,
+                        "cwd": row.get("cwd") if isinstance(row.get("cwd"), str) else None,
+                        "project_name": row.get("projectName") if isinstance(row.get("projectName"), str) else None,
                     }
                 cursor = result.get("nextCursor")
                 if cursor is None:
@@ -4637,6 +4657,8 @@ def read_cloud_usage(codex_home: Path, threads: List[dict]) -> dict:
         status = row.get("data_status") or "unavailable"
         sessions.append({
             "session_id": sid, "title": meta.get("title") or sid,
+            "project_name": meta.get("project_name") or _cwd_project_label(meta.get("cwd")) or None,
+            "cwd": meta.get("cwd"),
             "host": "cloud", "host_id": "durable", "scope": "lifetime", "data_status": status,
             "usage_source": row.get("usage_source") or "unknown",
             **{key: _cloud_amount(row.get(key)) if status != "unavailable" else None for key in fields},
@@ -4650,40 +4672,266 @@ def read_cloud_usage(codex_home: Path, threads: List[dict]) -> dict:
     }
 
 
-def render_cloud_usage(report: dict, output: str = "table") -> str:
+def _terminal_label(value: object) -> str:
+    """Sanitize untrusted metadata only at the terminal boundary."""
+    return _clean_thread_label(re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(value or "")))
+
+
+def cloud_models(row: dict) -> List[str]:
+    """Use only explicit backend model IDs; never price Cloud lifetime groups."""
+    return model_names(g["model"] for g in row.get("groups", [])
+                       if isinstance(g, dict) and isinstance(g.get("model"), str) and g["model"])
+
+
+def cloud_value(row: dict, key: str) -> Optional[float]:
+    if row.get("data_status") == "unavailable":
+        return None
+    return _cloud_amount(row.get(key))
+
+
+def cloud_value_text(row: dict, key: str, percent: bool = False) -> str:
+    value = cloud_value(row, key)
+    if value is None:
+        return "—"
+    # Keep small real nonzero values distinguishable from zero.
+    number = "<0.0001" if 0 < value < 0.0001 else f"{value:.4f}"
+    return number + ("%" if percent else "")
+
+
+def join_session_views(local_items: Iterable[dict], cloud_report: dict) -> List[dict]:
+    """One identity per exact root thread ID, with two *separate* measurements.
+
+    The local payload is opaque to this join (a render tuple or export record).
+    Names/projects never serve as join keys. A Cloud thread already included in
+    a local parent's rollup stays its own lifetime row; it is not added again.
+    Sorting by metadata, not unlike-scope usage amounts, keeps the unified list
+    from posing as a combined period ranking.
+    """
+    entries: Dict[object, dict] = {}
+    parents: Dict[str, str] = {}
+    for item in local_items:
+        sid = item["session_id"]
+        entries[sid] = dict(item, cloud=None, sources=["local"], local_rollup_parent=None)
+        for child in item.get("source_ids", []):
+            if child != sid:
+                parents[child] = sid
+    for position, cloud in enumerate(cloud_report.get("sessions", [])):
+        sid = cloud.get("session_id")
+        key = sid if sid else ("anonymous_cloud", position)
+        if key in entries:
+            entries[key]["cloud"] = cloud
+            if "cloud" not in entries[key]["sources"]:
+                entries[key]["sources"].append("cloud")
+            if not entries[key].get("project_name"):
+                entries[key]["project_name"] = cloud.get("project_name") or _cwd_project_label(cloud.get("cwd"))
+        else:
+            entries[key] = {
+                "session_id": sid, "title": cloud.get("title") or sid or "Unnamed Cloud session",
+                "project_name": cloud.get("project_name") or _cwd_project_label(cloud.get("cwd")),
+                "local": None, "cloud": cloud, "sources": ["cloud"],
+                "local_rollup_parent": parents.get(sid),
+            }
+    def order(entry):
+        cloud = entry["cloud"] or {}
+        has_data = entry["local"] is not None or any(
+            cloud_value(cloud, key) is not None
+            for key in ("weekly_limit_percent", "five_hour_limit_percent", "balance_usage_credits")
+        )
+        return (not has_data, _terminal_label(entry.get("project_name")).casefold() or "\uffff",
+                _terminal_label(entry["title"]).casefold(), str(entry["session_id"] or ""))
+    return sorted(entries.values(), key=order)
+
+
+def _unified_layout(width: int) -> Tuple[List[str], List[int], int]:
+    # Weekly period and lifetime columns are deliberately distinct. Secondary
+    # token/cache/share diagnostics live on --wide continuation lines.
+    gap = 2 if width >= 132 else 1
+    if width >= 116:
+        headers = ["PROJECT", "SESSION", "SRC", "PERIOD≈", "LIFE %", "MODEL(S)", "TIER(S)", "1H≈", "CREDITS*", "STATE/DATA"]
+        widths = shrink_widths_to_target(
+            [18, 34, 5, 9, 9, 12, 9, 8, 9, 13],
+            [10, 24, 5, 9, 9, 8, 5, 8, 9, 11], width,
+            (0, 5, 6, 1, 9), gap=gap,
+        )
+    else:
+        headers = ["PROJECT", "SESSION", "SRC", "PERIOD≈", "LIFE %", "STATE/DATA"]
+        widths = shrink_widths_to_target(
+            [18, 34, 5, 10, 10, 13], [8, 20, 5, 9, 9, 11], width,
+            (0, 1, 3, 4, 5), gap=gap,
+        )
+    widths = fit_widths_to_target(widths, width, (1,), gap=gap)
+    return headers, widths, gap
+
+
+def render_unified_summary(
+    entries: List[dict], report: dict, period_label: str, width: int,
+    color: Colorizer, calibration: Optional[QuotaCalibration], wide: bool,
+    include_local: bool = True,
+) -> List[str]:
+    headers, widths, gap = _unified_layout(width)
+    numeric = {i for i, h in enumerate(headers) if h in ("PERIOD≈", "LIFE %", "1H≈", "CREDITS*")}
+    def line(values, heading=False, emphasis=None):
+        cells = []
+        for i, (value, w) in enumerate(zip(values, widths)):
+            cell = pad_display(_terminal_label(value), w, right=i in numeric)
+            if heading:
+                cell = color.wrap(cell, color.BOLD, color.CYAN)
+            elif headers[i] == "SRC":
+                cell = color.wrap(cell, color.CYAN if value == "LOCAL" else color.MAGENTA)
+            elif headers[i] in ("SESSION", "STATE/DATA") and emphasis:
+                cell = color.wrap(cell, emphasis)
+            cells.append(cell)
+        return (" " * gap).join(cells)
+    def note(text):
+        return [color.wrap(part, color.DIM) for part in wrap_display_words(_terminal_label(text), width)]
+    lines = note("Sessions — local and Cloud together; ordered by project/name, missing-data-only entries last.")
+    lines += note(f"PERIOD≈ = local weekly equivalent for {period_label}; LIFE % = Cloud lifetime weekly amount (not current week).")
+    lines += note("Cloud Data as of: " + (report.get("data_as_of") or "unavailable"))
+    separator = (" " * gap).join("-" * w for w in widths)
+    lines += ["", line(headers, heading=True), color.wrap(separator, color.DIM)]
+    local_rows = [e["local"] for e in entries if e["local"] is not None]
+    known_total = sum(row[2] for row in local_rows if row[2] is not None)
+    for entry in entries:
+        row, cloud = entry["local"], entry["cloud"]
+        source = "BOTH" if len(entry["sources"]) == 2 else entry["sources"][0].upper()
+        values = {h: "—" for h in headers}
+        values.update(PROJECT=entry.get("project_name") or "—", SESSION=entry["title"], SRC=source)
+        extras = []
+        emphasis = None
+        if row is not None:
+            b, u, credits, complete, cache, state, health, burn, _, burn_complete, orphan = row
+            values["SESSION"] += f" (+{len(b.child_sessions)} sub)" if b.child_sessions else ""
+            values["PERIOD≈"] = weekly_percent_text(credits, calibration, complete)
+            values["1H≈"] = weekly_percent_text(burn if burn is not None and burn > 0 else None, calibration, burn_complete)
+            values["CREDITS*"] = "—" if credits is None else f"{credits:.1f}" + ("" if complete else "+")
+            values["TIER(S)"] = tier_label(b.usage_by_model.keys())
+            values["STATE/DATA"] = status_text(state, health, orphan)
+            models = list(b.usage_by_model)
+            emphasis = (color.RED if health == "ROTATE" else color.YELLOW if health == "WATCH"
+                        else color.GREEN if state == "ACTIVE" else color.CYAN if state == "RECENT" else None)
+            if wide:
+                share = f"{100 * credits / known_total:.1f}%" if credits is not None and known_total > 0 else "—"
+                extras.append(f"TOKENS I/C/O {token_triplet_text(u)} · CACHE TAX {cache:.1f} · LOCAL SHARE {share}")
+        else:
+            models = cloud_models(cloud or {})
+            values["STATE/DATA"] = (cloud or {}).get("data_status") or "unavailable"
+        if cloud is not None:
+            values["LIFE %"] = cloud_value_text(cloud, "weekly_limit_percent", percent=True)
+            if row is not None:
+                extras.append("Cloud lifetime data: " + str(cloud.get("data_status") or "unavailable"))
+            if wide:
+                extras.append("Cloud lifetime 5H % " + cloud_value_text(cloud, "five_hour_limit_percent", True)
+                              + " · BALANCE CREDITS " + cloud_value_text(cloud, "balance_usage_credits"))
+        # Models may be absent from backend groups; do not invent one from the title.
+        models = [_terminal_label(model) for model in model_names(models)]
+        if "MODEL(S)" in headers:
+            i = headers.index("MODEL(S)")
+            model, continuation = model_cell_layout(models, widths[i], width) if models else ("—", [])
+            values["MODEL(S)"] = model
+        else:
+            continuation = []
+            if models:
+                extras.insert(0, "Models: " + model_label(models) + (" · TIER " + values.get("TIER(S)", "—") if row is not None else ""))
+            if row is not None:
+                extras.append("1H≈ " + values["1H≈"] + " · CREDITS* " + values["CREDITS*"])
+        if entry.get("local_rollup_parent"):
+            extras.append("Local tokens already rolled into " + short_sid(entry["local_rollup_parent"]) + "; lifetime not added again.")
+        lines.append(line([values[h] for h in headers], emphasis=emphasis))
+        lines.extend(color.wrap(part, color.DIM) for part in continuation)
+        for extra in extras:
+            lines.extend(color.wrap("  " + part, color.DIM)
+                         for part in wrap_display_words(_terminal_label(extra), width - 2))
+    if not entries:
+        lines.append("No local or Cloud sessions found." if include_local else "No Cloud sessions found.")
+    if include_local:
+        # Empty/no-price local totals stay unknown. Never fill them from Cloud.
+        total = known_total if any(row[2] is not None for row in local_rows) else None
+        burn = sum(row[7] for row in local_rows if row[7] is not None)
+        complete = all(row[3] for row in local_rows)
+        totals = {h: "" for h in headers}
+        totals.update(PROJECT="LOCAL TOTAL", SRC="LOCAL", **{
+            "PERIOD≈": weekly_percent_text(total, calibration, complete), "LIFE %": "—",
+            "CREDITS*": "—" if total is None else f"{total:.1f}" + ("" if complete else "+"),
+            "1H≈": weekly_percent_text(burn or None, calibration, all(row[9] for row in local_rows if row[7])),
+        })
+        lines += [color.wrap(separator, color.DIM), line([totals[h] for h in headers], heading=True)]
+        if wide:
+            usage = Usage()
+            for row in local_rows:
+                usage += row[1]
+            lines.extend(color.wrap("  " + part, color.DIM) for part in wrap_display_words(
+                "LOCAL TOTAL TOKENS I/C/O " + token_triplet_text(usage), width - 2))
+    lines.append("")
+    lines += note("No combined TOTAL: Cloud lifetime and local selected-period amounts may overlap and cannot be added.")
+    lines += note("SRC is the telemetry source, not the executor location. BOTH joins an exact thread ID, not its usage amounts.")
+    lines += note("Partial/unavailable data is not zero. Cloud token/time-window totals are unavailable; CREDITS* excludes Cloud balance credits.")
+    lines += note("Local STATE/DATA shows activity/health; Cloud shows availability, not running status. '?' marks partial local WEEKLY estimates.")
+    return lines
+
+
+def render_cloud_detail(entry: dict, report: dict, width: int, color: Colorizer, heading: bool = True) -> List[str]:
+    cloud = entry["cloud"]
+    lines: List[str] = []
+    def add(text):
+        lines.extend(wrap_display_words(_terminal_label(text), width))
+    if heading:
+        lines += ["", color.wrap("=" * width, color.BLUE)]
+        lines.append(color.wrap("DETAILS  " + truncate(_terminal_label(entry["title"]), width - 9), color.BOLD, color.CYAN))
+        add("session: " + str(entry["session_id"] or "unavailable"))
+        add("project: " + str(entry.get("project_name") or "—"))
+    lines.append(color.wrap("Cloud lifetime usage — backend amounts, not selected-period usage", color.BOLD, color.MAGENTA))
+    add("data: " + str(cloud.get("data_status") or "unavailable")
+        + " · Data as of: " + str(report.get("data_as_of") or "unavailable"))
+    add("LIFE WEEKLY % " + cloud_value_text(cloud, "weekly_limit_percent", True)
+        + " · LIFE 5H % " + cloud_value_text(cloud, "five_hour_limit_percent", True)
+        + " · BALANCE CREDITS " + cloud_value_text(cloud, "balance_usage_credits"))
+    if cloud.get("title") and cloud["title"] != entry["title"]:
+        add("Cloud title: " + str(cloud["title"]))
+    if cloud.get("cwd"):
+        add("Cloud cwd: " + str(cloud["cwd"]))
+    models = cloud_models(cloud)
+    if models:
+        add("Cloud models: " + model_label(models))
+    if entry.get("local_rollup_parent"):
+        add("Local tokens already rolled into " + entry["local_rollup_parent"] + "; Cloud remains individual lifetime usage.")
+    add("No Cloud period tokens, 1H burn or model credit breakdown available. Descendants are not rolled up.")
+    return lines
+
+
+def unified_json_sessions(local_report: dict, cloud_report: dict) -> List[dict]:
+    items = [{"session_id": row["session_id"], "title": row["title"],
+              "project_name": row.get("project_name"), "local": row,
+              "source_ids": [agent["session_id"] for agent in row.get("agent_breakdown", [])]}
+             for row in local_report["sessions"]]
+    return [{"session_id": e["session_id"], "title": e["title"], "project_name": e.get("project_name") or None,
+             "sources": e["sources"], "local_usage": e["local"], "cloud_usage": e["cloud"],
+             "local_rollup_parent": e.get("local_rollup_parent"),
+             "local_scope": "selected_period" if e["local"] is not None else None,
+             "cloud_scope": "lifetime" if e["cloud"] is not None else None}
+            for e in join_session_views(items, cloud_report)]
+
+
+def render_cloud_usage(report: dict, output: str = "table", details: bool = False,
+                       wide: bool = False, color: Optional[Colorizer] = None) -> str:
     if output == "json":
         return json.dumps(report, ensure_ascii=False, indent=2)
     fields = ["session_id", "title", "host", "scope", "data_status", "usage_source",
               "five_hour_limit_percent", "weekly_limit_percent", "balance_usage_credits"]
     if output == "csv":
         sio = io.StringIO()
-        writer = csv.DictWriter(sio, fieldnames=fields + ["data_as_of"], extrasaction="ignore")
+        writer = csv.DictWriter(sio, fieldnames=fields + ["data_as_of", "project_name", "cwd"], extrasaction="ignore")
         writer.writeheader()
         for row in report["sessions"]:
             writer.writerow({**row, "data_as_of": report["data_as_of"]})
         return sio.getvalue()
-    lines = ["Codex Cloud usage — lifetime (dot / durable sessions, including Mac execution)",
-             "Backend lifetime amounts; not part of the selected-period local token TOTAL.",
-             "Weekly/5h percentages compare lifetime usage with a full allowance; balance credits are separate.",
-             "Each listed thread is queried separately; descendants are not rolled up.",
-             "Data as of: " + (report["data_as_of"] or "unavailable"), ""]
-    widths = [48, 12, 12, 16, 14]
-    def line(values):
-        # Remote labels must not emit terminal commands. Keep raw JSON/CSV
-        # metadata intact; strip C0/C1 controls only at the terminal boundary.
-        return "  ".join(pad_display(truncate(re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(v)), w), w, right=i in (1, 2, 3))
-                         for i, (v, w) in enumerate(zip(values, widths)))
-    lines.append(line(["CLOUD SESSION", "WEEKLY %", "5H %", "BALANCE CREDITS", "DATA"]))
-    for row in report["sessions"]:
-        def amount(key):
-            value = row[key]
-            return "—" if value is None else f"{value:.4f}"
-        lines.append(line([_clean_thread_label(row["title"]), amount("weekly_limit_percent"),
-                           amount("five_hour_limit_percent"), amount("balance_usage_credits"),
-                           row["data_status"]]))
-    if not report["sessions"]:
-        lines.append("No Cloud sessions found.")
-    lines.append("Partial/unavailable data is not zero. Cloud token/time-window totals are unavailable.")
+    color = color or Colorizer("never")
+    width = max(80, min(REPORT_MAX_WIDTH, shutil.get_terminal_size(fallback=(120, 24)).columns))
+    lines = [color.wrap("Codex usage — Cloud lifetime (dot / durable sessions)", color.BOLD, color.CYAN)]
+    entries = join_session_views([], report)
+    lines.extend(render_unified_summary(entries, report, "not available", width, color, None, wide, include_local=False))
+    if details:
+        for entry in entries:
+            lines.extend(render_cloud_detail(entry, report, width, color))
     return "\n".join(lines)
 
 
@@ -4694,9 +4942,13 @@ def append_cloud_csv(local_csv: str, report: dict) -> str:
     sio = io.StringIO()
     writer = csv.DictWriter(sio, fieldnames=fields)
     writer.writeheader()
-    for row in local:
-        writer.writerow({**row, "host": "local", "scope": "selected_period"})
-    writer.writerows(cloud)
+    local_rows = [{"session_id": row["session_id"], "title": row["title"],
+                   "project_name": row.get("project_name"), "local": row} for row in local]
+    for entry in join_session_views(local_rows, {"sessions": list(cloud)}):
+        if entry["local"] is not None:
+            writer.writerow({**entry["local"], "host": "local", "scope": "selected_period"})
+        if entry["cloud"] is not None:
+            writer.writerow(entry["cloud"])
     return sio.getvalue()
 
 
@@ -4748,7 +5000,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--full-discovery", action="store_true", help="Force a full rollout tree walk instead of the warm-cache hot discovery path.")
     p.add_argument("--no-quota", action="store_true", help="Disable local ChatGPT plan/weekly quota discovery and WEEKLY≈ calibration.")
     p.add_argument("--cloud", action="store_true",
-                   help="Also query dot/durable sessions and show backend lifetime usage separately (requires network and ChatGPT login).")
+                   help="Show local period and Cloud lifetime usage in one session table (requires network and ChatGPT login).")
     p.add_argument("--cloud-thread", action="append", default=[], metavar="ID",
                    help="With cloud or --cloud, query only this thread ID (repeatable), bypassing discovery.")
     group = p.add_mutually_exclusive_group()
@@ -4773,7 +5025,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             eprint(str(exc))
             return 2
         if args.period == "cloud":
-            print(render_cloud_usage(cloud_report, "json" if args.json else "csv" if args.csv else "table"),
+            print(render_cloud_usage(cloud_report, "json" if args.json else "csv" if args.csv else "table",
+                                     details=args.details, wide=args.wide, color=Colorizer(args.color)),
                   end="" if args.csv else "\n")
             return 0
     if args.cloud_thread and not args.cloud:
@@ -4922,6 +5175,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if cloud_report is not None:
             result = json.loads(rendered)
             result["cloud_usage"] = cloud_report
+            result["unified_sessions"] = unified_json_sessions(result, cloud_report)
+            result["unified_session_order"] = "project_name_then_title_missing_data_last"
             rendered = json.dumps(result, ensure_ascii=False, indent=2)
         print(rendered)
     elif args.csv:
@@ -4937,10 +5192,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             top_agents=max(0, args.top_agents), all_agents=args.all_agents,
             auth_context=auth_context, quota_snapshot=quota_snapshot,
             quota_calibration=quota_calibration, quota_local_credits=quota_local_credits,
-            quota_local_complete=quota_complete,
+            quota_local_complete=quota_complete, cloud_report=cloud_report,
         ))
-        if cloud_report is not None:
-            print("\n" + render_cloud_usage(cloud_report))
 
     if malformed and not (args.json or args.csv):
         eprint(f"Warning: skipped {malformed} malformed/oversized JSONL line(s).")
