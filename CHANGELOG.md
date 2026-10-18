@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.9.0 — 2026-10-04
+
+- Add `cloud` and `--cloud` reports for dot-created durable sessions, including sessions whose tools execute on the user's Mac.
+- Discover current and archived threads through read-only authenticated app-server inventory; support `--no-archived` and repeated `--cloud-thread` selectors.
+- Read backend lifetime allowance percentages and balance credits, preserving partial/unavailable data and freshness in terminal, JSON and CSV output.
+- Keep lifetime amounts separate from local time-window token totals, reference credits and quota calibration; do not fabricate missing tokens or treat unknown usage as zero.
+- Keep ordinary commands offline and preserve the existing token cache. Cloud reads reuse the existing login without changing credentials or starting/resuming sessions.
+
 ## 1.8.2 — 2026-09-30
 
 - Add independent GPT-6.1 Sol Standard reference rates (50 / 2.5 / 250 credits per 1M uncached/cached/output tokens) and the `6.1 Sol` display label.

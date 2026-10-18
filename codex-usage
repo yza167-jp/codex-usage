@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-codex-usage: per-session Codex token/credit usage from local rollout JSONL files.
+codex-usage: local per-session token usage and opt-in durable lifetime usage.
 
 Reads:
   $CODEX_HOME/sessions/**/rollout-*.jsonl
@@ -27,6 +27,8 @@ Examples:
   codex-usage 24h --wide
   codex-usage 24h --details --all-agents
   codex-usage --cache-info
+  codex-usage cloud
+  codex-usage 24h --cloud
 
 Notes:
 - `input_tokens` in Codex usage includes cached input tokens. Credit estimation
@@ -38,6 +40,8 @@ Notes:
   to Standard, Fast/priority, Flex, or Unknown. `--fast` now applies only to
   unresolved historical segments; detected Standard/Fast segments are preserved.
 - Session JSONL is local telemetry, not the authoritative server-side meter.
+- Cloud/dot sessions can execute tools locally without producing local JSONL.
+  `cloud` / `--cloud` read backend lifetime amounts separately from period totals.
 - v1.4 adds native Windows support: Windows cache locations, Windows-safe
   SQLite read-only URIs, automatic VT/ANSI terminal enablement, PowerShell/CMD
   launchers, and Windows CI coverage. macOS and Linux behavior is preserved.
@@ -51,6 +55,7 @@ import math
 import base64
 import csv
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -61,7 +66,11 @@ import sys
 import time
 import shutil
 import statistics
+import struct
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
@@ -69,7 +78,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.8.2"
+VERSION = "1.9.0"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
 GPT6_RATE_CARD_AS_OF = "2026-09-30"
@@ -4372,16 +4381,335 @@ def render_csv(
     return sio.getvalue()
 
 
+class CloudUsageError(Exception):
+    """A cloud read failed; messages must not contain credentials or responses."""
+
+
+class _NoCloudRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Never forward the account's bearer token to a redirected destination.
+        return None
+
+
+def _cloud_credentials(codex_home: Path) -> Tuple[str, Optional[str]]:
+    try:
+        auth = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+        tokens = auth.get("tokens", {})
+        token = tokens.get("access_token")
+        account = tokens.get("account_id")
+        if not isinstance(token, str) or not token:
+            raise ValueError()
+    except (OSError, ValueError, AttributeError):
+        raise CloudUsageError("Cloud usage needs an existing Codex ChatGPT login (auth.json).") from None
+    return token, account if isinstance(account, str) and account else None
+
+
+def _cloud_request(codex_home: Path, path: str, body: dict) -> dict:
+    token, account = _cloud_credentials(codex_home)
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "User-Agent": "codex-usage/" + VERSION,
+    }
+    if isinstance(account, str) and account:
+        headers["ChatGPT-Account-ID"] = account
+    request = urllib.request.Request(
+        "https://chatgpt.com/backend-api" + path,
+        data=json.dumps(body).encode("utf-8"), headers=headers, method="POST",
+    )
+    try:
+        opener = urllib.request.build_opener(_NoCloudRedirects())
+        with opener.open(request, timeout=20) as response:
+            result = json.load(response)
+        if not isinstance(result, dict):
+            raise ValueError()
+        return result
+    except urllib.error.HTTPError as exc:
+        raise CloudUsageError(f"Cloud usage request failed (HTTP {exc.code}); check login and account access.") from None
+    except (OSError, ValueError):
+        raise CloudUsageError("Cloud usage request failed or returned invalid JSON; local statistics are unaffected.") from None
+
+
+class _CloudThreadReader:
+    """Bounded, read-only app-server RPC over its authenticated WebSocket.
+
+    This transport only sends initialize, initialized and thread/list. It never
+    resumes a thread, starts a turn, changes ownership, or runs a local executor.
+    """
+    MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+
+    def __init__(self, codex_home: Path):
+        self.connection = None
+        self.response = None
+        self.request_id = 0
+        token, account = _cloud_credentials(codex_home)
+        host = "codex-cloud-backend.chatgpt.com"
+        proxy = urllib.request.getproxies().get("https")
+        if proxy and not urllib.request.proxy_bypass(host):
+            parsed = urllib.parse.urlsplit(proxy)
+            if parsed.scheme != "http" or not parsed.hostname:
+                raise CloudUsageError("Cloud discovery requires a direct connection or an HTTP CONNECT proxy.")
+            self.connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 80, timeout=20)
+            tunnel_headers = {}
+            if parsed.username is not None:
+                credentials = urllib.parse.unquote(parsed.username) + ":" + urllib.parse.unquote(parsed.password or "")
+                tunnel_headers["Proxy-Authorization"] = "Basic " + base64.b64encode(credentials.encode()).decode()
+            self.connection.set_tunnel(host, 443, headers=tunnel_headers)
+        else:
+            self.connection = http.client.HTTPSConnection(host, timeout=20)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        headers = {
+            "Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Version": "13",
+            "Sec-WebSocket-Key": key,
+            "Sec-WebSocket-Protocol": "codex-app-server, codex-client.desktop, openai-bearer." + token,
+            "X-OpenAI-Product-Sku": "codex",
+        }
+        if account:
+            headers["ChatGPT-Account-Id"] = account
+        try:
+            self.connection.request("GET", "/", headers=headers)
+            self.response = self.connection.getresponse()
+            expected = base64.b64encode(hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()).decode()
+            if (self.response.status != 101
+                    or self.response.getheader("Sec-WebSocket-Accept") != expected
+                    or self.response.getheader("Sec-WebSocket-Protocol") != "codex-app-server"):
+                raise CloudUsageError("Cloud discovery handshake failed; check login and account access.")
+            self.call("initialize", {
+                "clientInfo": {"name": "codex_usage", "title": "Codex Usage", "version": VERSION},
+                "capabilities": {"experimentalApi": True},
+            })
+            self._send(json.dumps({"method": "initialized"}).encode())
+        except (OSError, ValueError, http.client.HTTPException, CloudUsageError):
+            self.close()
+            raise CloudUsageError("Cloud discovery connection failed; check login, proxy and account access.") from None
+
+    def close(self):
+        if self.response is not None:
+            self.response.close()
+        if self.connection is not None:
+            self.connection.close()
+
+    def _send(self, payload: bytes, opcode: int = 1):
+        mask = os.urandom(4)
+        n = len(payload)
+        header = bytes([0x80 | opcode])
+        header += (bytes([0x80 | n]) if n < 126 else
+                   bytes([0xfe]) + struct.pack("!H", n) if n <= 65535 else
+                   bytes([0xff]) + struct.pack("!Q", n))
+        self.connection.sock.sendall(header + mask + bytes(x ^ mask[i % 4] for i, x in enumerate(payload)))
+
+    def _read_exact(self, size: int) -> bytes:
+        result = self.response.fp.read(size)
+        if len(result) != size:
+            raise CloudUsageError("Cloud discovery connection closed before completing the response.")
+        return result
+
+    def _receive(self, deadline: float) -> dict:
+        chunks = []
+        size = 0
+        started = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CloudUsageError("Cloud discovery timed out.")
+            self.connection.sock.settimeout(remaining)
+            first, second = self._read_exact(2)
+            opcode = first & 15
+            if first & 0x70 or second & 0x80:
+                raise CloudUsageError("Cloud discovery returned unsupported WebSocket framing.")
+            length = second & 127
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8))[0]
+            if length + size > self.MAX_MESSAGE_BYTES:
+                raise CloudUsageError("Cloud discovery response exceeds the size limit.")
+            if opcode >= 8 and (length > 125 or not first & 0x80):
+                raise CloudUsageError("Cloud discovery returned invalid control framing.")
+            payload = self._read_exact(length)
+            if opcode == 8:
+                raise CloudUsageError("Cloud discovery connection closed.")
+            if opcode == 9:
+                self._send(payload, 10)
+                continue
+            if opcode == 10:
+                continue
+            if opcode not in (0, 1) or (opcode == 0) != started:
+                raise CloudUsageError("Cloud discovery returned an unsupported message.")
+            started = True
+            chunks.append(payload)
+            size += length
+            if first & 0x80:
+                result = json.loads(b"".join(chunks))
+                if not isinstance(result, dict):
+                    raise CloudUsageError("Cloud discovery returned an invalid RPC response.")
+                return result
+
+    def call(self, method: str, params: dict) -> dict:
+        if method not in ("initialize", "thread/list"):
+            raise CloudUsageError("Cloud discovery supports only read-only inventory requests.")
+        self.request_id += 1
+        try:
+            self._send(json.dumps({"id": self.request_id, "method": method, "params": params}).encode())
+            deadline = time.monotonic() + 20
+            while True:
+                message = self._receive(deadline)
+                if message.get("id") != self.request_id:
+                    continue
+                if "error" in message or not isinstance(message.get("result"), dict):
+                    raise CloudUsageError("Cloud discovery RPC failed; check account access and app compatibility.")
+                return message["result"]
+        except (OSError, ValueError, http.client.HTTPException):
+            raise CloudUsageError("Cloud discovery failed or timed out.") from None
+
+
+def discover_cloud_threads(codex_home: Path, include_archived: bool = True) -> List[dict]:
+    reader = _CloudThreadReader(codex_home)
+    threads = {}
+    try:
+        for archived in ([False, True] if include_archived else [False]):
+            cursor = None
+            seen = set()
+            for _ in range(100):
+                result = reader.call("thread/list", {
+                    "limit": 100, "cursor": cursor, "archived": archived, "sortKey": "updated_at",
+                })
+                rows = result.get("data")
+                if not isinstance(rows, list):
+                    raise CloudUsageError("Cloud discovery returned an invalid thread list.")
+                for row in rows:
+                    if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                        raise CloudUsageError("Cloud discovery returned an invalid thread.")
+                    created = _epoch_seconds(row.get("createdAt"))
+                    threads[row["id"]] = {
+                        "id": row["id"], "title": row.get("name") or row.get("title") or row.get("preview") or row["id"],
+                        "created_at": datetime.fromtimestamp(created, timezone.utc).isoformat() if created else None,
+                        "archived": archived,
+                    }
+                cursor = result.get("nextCursor")
+                if cursor is None:
+                    break
+                if not isinstance(cursor, str) or cursor in seen:
+                    raise CloudUsageError("Cloud discovery returned a repeated or invalid cursor.")
+                seen.add(cursor)
+            else:
+                raise CloudUsageError("Cloud discovery exceeded 100 pages; use --cloud-thread to narrow the query.")
+    finally:
+        reader.close()
+    return list(threads.values())
+
+
+def _cloud_amount(value: object) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        amount = float(value)
+        return amount if math.isfinite(amount) and amount >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def read_cloud_usage(codex_home: Path, threads: List[dict]) -> dict:
+    """Read backend lifetime amounts, never synthesize period token events."""
+    metadata = {str(t["id"]): t for t in threads}
+    amounts = {}
+    as_of = []
+    ids = list(metadata)
+    for offset in range(0, len(ids), 50):
+        batch = ids[offset:offset + 50]
+        result = _cloud_request(codex_home, "/wham/usage/thread_usage/query_v2", {
+            "threads": [{"thread_id": sid, "created_at": metadata[sid].get("created_at"),
+                         "descendant_thread_ids": []} for sid in batch],
+        })
+        rows = result.get("threads")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise CloudUsageError("Cloud usage returned an invalid thread list.")
+        for row in rows:
+            if row.get("thread_id") in batch:
+                amounts[row["thread_id"]] = row
+        as_of.append(parse_ts(result.get("data_as_of")))
+    sessions = []
+    fields = ("five_hour_limit_percent", "weekly_limit_percent", "balance_usage_credits")
+    for sid, meta in metadata.items():
+        row = amounts.get(sid, {})
+        status = row.get("data_status") or "unavailable"
+        sessions.append({
+            "session_id": sid, "title": meta.get("title") or sid,
+            "host": "cloud", "host_id": "durable", "scope": "lifetime", "data_status": status,
+            "usage_source": row.get("usage_source") or "unknown",
+            **{key: _cloud_amount(row.get(key)) if status != "unavailable" else None for key in fields},
+            "groups": row.get("groups") if isinstance(row.get("groups"), list) else [],
+        })
+    return {
+        "scope": "lifetime", "host": "cloud", "source": "thread_usage/query_v2",
+        "data_as_of": min(as_of).isoformat() if as_of and all(as_of) else None,
+        "includes_descendants": False, "period_attribution_available": False,
+        "token_counts_available": False, "sessions": sessions,
+    }
+
+
+def render_cloud_usage(report: dict, output: str = "table") -> str:
+    if output == "json":
+        return json.dumps(report, ensure_ascii=False, indent=2)
+    fields = ["session_id", "title", "host", "scope", "data_status", "usage_source",
+              "five_hour_limit_percent", "weekly_limit_percent", "balance_usage_credits"]
+    if output == "csv":
+        sio = io.StringIO()
+        writer = csv.DictWriter(sio, fieldnames=fields + ["data_as_of"], extrasaction="ignore")
+        writer.writeheader()
+        for row in report["sessions"]:
+            writer.writerow({**row, "data_as_of": report["data_as_of"]})
+        return sio.getvalue()
+    lines = ["Codex Cloud usage — lifetime (dot / durable sessions, including Mac execution)",
+             "Backend lifetime amounts; not part of the selected-period local token TOTAL.",
+             "Weekly/5h percentages compare lifetime usage with a full allowance; balance credits are separate.",
+             "Each listed thread is queried separately; descendants are not rolled up.",
+             "Data as of: " + (report["data_as_of"] or "unavailable"), ""]
+    widths = [48, 12, 12, 16, 14]
+    def line(values):
+        # Remote labels must not emit terminal commands. Keep raw JSON/CSV
+        # metadata intact; strip C0/C1 controls only at the terminal boundary.
+        return "  ".join(pad_display(truncate(re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(v)), w), w, right=i in (1, 2, 3))
+                         for i, (v, w) in enumerate(zip(values, widths)))
+    lines.append(line(["CLOUD SESSION", "WEEKLY %", "5H %", "BALANCE CREDITS", "DATA"]))
+    for row in report["sessions"]:
+        def amount(key):
+            value = row[key]
+            return "—" if value is None else f"{value:.4f}"
+        lines.append(line([_clean_thread_label(row["title"]), amount("weekly_limit_percent"),
+                           amount("five_hour_limit_percent"), amount("balance_usage_credits"),
+                           row["data_status"]]))
+    if not report["sessions"]:
+        lines.append("No Cloud sessions found.")
+    lines.append("Partial/unavailable data is not zero. Cloud token/time-window totals are unavailable.")
+    return "\n".join(lines)
+
+
+def append_cloud_csv(local_csv: str, report: dict) -> str:
+    local = csv.DictReader(io.StringIO(local_csv))
+    cloud = csv.DictReader(io.StringIO(render_cloud_usage(report, "csv")))
+    fields = list(dict.fromkeys(list(local.fieldnames or []) + list(cloud.fieldnames or [])))
+    sio = io.StringIO()
+    writer = csv.DictWriter(sio, fieldnames=fields)
+    writer.writeheader()
+    for row in local:
+        writer.writerow({**row, "host": "local", "scope": "selected_period"})
+    writer.writerows(cloud)
+    return sio.getvalue()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="codex-usage",
-        description="Show per-session Codex token/credit usage from local session transcripts.",
+        description="Show local per-session token usage or Cloud lifetime usage.",
     )
     p.add_argument(
         "period",
         nargs="?",
         default="today",
-        help="6h | 12h | 24h | 48h | any Nh | today | yesterday | week | 7d | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD",
+        help="cloud | 6h | 12h | 24h | 48h | any Nh | today | yesterday | week | 7d | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD",
     )
     p.add_argument(
         "--codex-home",
@@ -4419,6 +4747,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-path", help="Override the incremental SQLite cache path.")
     p.add_argument("--full-discovery", action="store_true", help="Force a full rollout tree walk instead of the warm-cache hot discovery path.")
     p.add_argument("--no-quota", action="store_true", help="Disable local ChatGPT plan/weekly quota discovery and WEEKLY≈ calibration.")
+    p.add_argument("--cloud", action="store_true",
+                   help="Also query dot/durable sessions and show backend lifetime usage separately (requires network and ChatGPT login).")
+    p.add_argument("--cloud-thread", action="append", default=[], metavar="ID",
+                   help="With cloud or --cloud, query only this thread ID (repeatable), bypassing discovery.")
     group = p.add_mutually_exclusive_group()
     group.add_argument("--json", action="store_true", help="Emit JSON.")
     group.add_argument("--csv", action="store_true", help="Emit CSV.")
@@ -4430,6 +4762,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     _ensure_utf8_stdio()
     args = build_parser().parse_args(argv)
     codex_home = Path(args.codex_home).expanduser()
+    cloud_report = None
+    if args.period == "cloud" or args.cloud:
+        try:
+            threads = [{"id": sid} for sid in dict.fromkeys(args.cloud_thread)]
+            if not threads:
+                threads = discover_cloud_threads(codex_home, include_archived=not args.no_archived)
+            cloud_report = read_cloud_usage(codex_home, threads)
+        except CloudUsageError as exc:
+            eprint(str(exc))
+            return 2
+        if args.period == "cloud":
+            print(render_cloud_usage(cloud_report, "json" if args.json else "csv" if args.csv else "table"),
+                  end="" if args.csv else "\n")
+            return 0
+    if args.cloud_thread and not args.cloud:
+        eprint("--cloud-thread requires the cloud lifetime report.")
+        return 2
     tz = get_tz(args.timezone)
     start, end, period_label = parse_period(args.period, tz)
 
@@ -4468,7 +4817,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         paths, discovery_mode, discovery_s = discover_rollouts(
             codex_home, include_archived=not args.no_archived
         )
-        if not paths:
+        if not paths and cloud_report is None:
             eprint(f"No session JSONL files found under {codex_home}")
             return 2
         # No-cache mode remains available for verification/debugging.
@@ -4504,7 +4853,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cache_conn=conn,
                 force_full=(args.rebuild_cache or args.full_discovery),
             )
-            if not paths:
+            if not paths and cloud_report is None:
                 eprint(f"No session JSONL files found under {codex_home}")
                 return 2
             perf_stats = sync_incremental_cache(
@@ -4566,15 +4915,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     color_mode = "never" if (args.json or args.csv) else args.color
     color = Colorizer(color_mode)
     if args.json:
-        print(render_json(
+        rendered = render_json(
             buckets, sessions, period_label, tz, args.fast, now, live_report,
             auth_context, quota_snapshot, quota_calibration, quota_local_credits,
-        ))
+        )
+        if cloud_report is not None:
+            result = json.loads(rendered)
+            result["cloud_usage"] = cloud_report
+            rendered = json.dumps(result, ensure_ascii=False, indent=2)
+        print(rendered)
     elif args.csv:
-        print(render_csv(
+        rendered = render_csv(
             buckets, sessions, args.fast, now, live_report,
             auth_context, quota_snapshot, quota_calibration,
-        ), end="")
+        )
+        print(append_cloud_csv(rendered, cloud_report) if cloud_report is not None else rendered, end="")
     else:
         print(render_table(
             buckets, sessions, period_label, tz, args.fast, args.details,
@@ -4584,6 +4939,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             quota_calibration=quota_calibration, quota_local_credits=quota_local_credits,
             quota_local_complete=quota_complete,
         ))
+        if cloud_report is not None:
+            print("\n" + render_cloud_usage(cloud_report))
 
     if malformed and not (args.json or args.csv):
         eprint(f"Warning: skipped {malformed} malformed/oversized JSONL line(s).")

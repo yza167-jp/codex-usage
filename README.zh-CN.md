@@ -1,5 +1,29 @@
 # codex-usage
 
+## v1.9.0：dot / Cloud 会话统计
+
+dot 发起的会话在 App 中标为 **Cloud**，链接中为 `hostId=durable`，
+但工具可以实际在你的 Mac 上执行。这些会话的历史由云端管理，未必有本机
+rollout JSONL，因此仅扫描 `~/.codex/sessions` 无法统计它们。
+
+```bash
+codex-usage 24h --cloud       # 本地时间窗口统计 + 独立的 Cloud 累计统计区
+codex-usage cloud            # 自动发现并查询当前账号的 durable 会话
+codex-usage cloud --json     # 也支持 --csv
+codex-usage cloud --no-archived
+codex-usage cloud --cloud-thread SESSION_ID  # 可重复指定，跳过自动发现
+```
+
+Cloud 区显示服务端提供的会话累计 weekly/5h allowance 百分比、余额 credits、
+`available` / `partial` / `unavailable` 状态及数据更新时间。
+**当前接口没有提供这些会话的逐时 token 明细**，因此不会把累计值加入 `24h`
+的 token、`CREDITS*`、TOTAL 或本地 quota 校准。余额 credits 为 0 也不代表
+订阅额度没有消耗。暂不可得的值显示 `—` / JSON `null`，不会当成 0。
+
+普通命令保持离线行为；`cloud` / `--cloud` 才会使用已有 Codex ChatGPT 登录，
+只读查询会话清单与用量，无需 App 保持打开，不会启动或接管会话。
+无需重建缓存。详见[数据范围与接口说明](docs/v1.9.0-cloud-usage.md)。
+
 ## v1.8.2：支持 GPT-6.1 Sol
 
 新增独立的 `gpt-6.1-sol`，显示为 **6.1 Sol**。每百万未缓存输入／缓存输入／

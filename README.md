@@ -1,5 +1,31 @@
 # codex-usage
 
+## v1.9.0: dot / Cloud sessions
+
+Dot-created sessions use the App's **Cloud** / `hostId=durable` conversation
+backend even when their tools execute on your Mac. They may have no local
+rollout JSONL, so a local directory scan cannot discover their usage.
+
+```bash
+codex-usage 24h --cloud       # Local window report plus separate Cloud lifetime usage
+codex-usage cloud            # Discover and query the account's durable sessions
+codex-usage cloud --json     # --csv also supported
+codex-usage cloud --no-archived
+codex-usage cloud --cloud-thread SESSION_ID  # Repeatable; bypass discovery
+```
+
+The Cloud report shows backend lifetime weekly/5h allowance percentages,
+balance credits, availability status and data freshness. **The endpoint does
+not provide timestamped token usage.** Lifetime amounts therefore remain
+separate from period token totals, `CREDITS*` and local quota calibration.
+Missing amounts stay unknown, and zero balance credits do not mean zero
+included-plan usage. Threads are queried individually without descendant rollup.
+
+Normal commands remain offline. `cloud` / `--cloud` explicitly use the existing
+Codex ChatGPT login for read-only inventory and usage requests; the App need not
+stay open. No session is started or resumed, and no cache rebuild is needed.
+See [scope and interface details](docs/v1.9.0-cloud-usage.md).
+
 ## v1.8.2: GPT-6.1 Sol
 
 Add distinct `gpt-6.1-sol` support, displayed as **6.1 Sol**. Standard reference
