@@ -4,7 +4,7 @@
 
 Cloud 详情展示模型／reasoning effort／speed 分组及已知累计额度，隐藏空 token 表。
 **2026-10-21 实测：`query_v2` 仍可用，单 ID 的 `/query` 仍返回 403；桌面内置官方
-客户端对已有 Cloud、Local 会话均返回 `threadUsage: null`。** 累计 tokens 和服务端
+客户端对已有 Cloud、Local 会话均未取得可用的 `threadUsage` 对象。** 累计 tokens 和服务端
 estimated credits 仅为条件可用的解析能力，不宣称当前账号已取得，也不把未知写成 0。
 
 ```bash

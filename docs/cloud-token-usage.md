@@ -58,8 +58,8 @@ Offline checks found different installed clients:
 | --- | --- | --- |
 | 1: v2 for one previously sampled Cloud ID, with discovered creation metadata | `available`, two model/effort/speed groups, positive weekly counter, allowance timestamp present; `comparison_plan: null` | Existing allowance/group data remains useful; comparison context is absent |
 | 2: direct `/query`, that single ID | HTTP 403, `application/json`; no allowlisted error type/code, no detected challenge feature or recognized request-ID header | Batch size is not sufficient to explain this denial; no cause is established |
-| 3: bundled app-server RPC, same Cloud ID | Initialize/initialized handshake succeeded; RPC result has `threadUsage: null` | No tokens or estimated credits obtained; RPC success is not usage success |
-| 4: same native RPC for one Local ID with positive tokens already in the local index | `threadUsage: null` | No successful Local backend control; do not infer account-wide permission policy from null |
+| 3: bundled app-server RPC, same Cloud ID | Initialize/initialized handshake and RPC succeeded; no usable `threadUsage` object | No tokens or estimated credits obtained; RPC success is not usage success |
+| 4: same native RPC for one Local ID with positive tokens already in the local index | No usable `threadUsage` object | No successful Local backend control; do not infer account-wide permission policy |
 | 5: v2 again with identical Cloud ID and metadata | `available`; same counters, same allowance watermark, `comparison_plan: null` again | Two observations about 318 seconds apart, but allowance differences remain unknown |
 
 The original `auth.json` bytes were unchanged after the native comparison. The
@@ -70,7 +70,9 @@ Because the comparison context is null, this validates refusal to fabricate a
 delta, **not live numeric weekly-difference support**. The sixth call was unused.
 
 The reference account processor maps underlying 403/404 to `threadUsage: null`.
-The installed RPC output cannot distinguish those statuses or other unavailable
+The diagnostic recorded object availability, not a separate field-presence bit:
+null and omitted `threadUsage` were both classified as unavailable. It therefore
+cannot prove literal null, distinguish underlying statuses or other unavailable
 conditions in that build. Stop here; tokens, server estimated credits, denial
 origin and real Fast behavior remain unverified. No native production fallback
 is added when it has not demonstrated additional usable data.

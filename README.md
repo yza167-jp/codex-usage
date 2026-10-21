@@ -5,7 +5,7 @@
 Cloud details now show model/effort/speed groups and available lifetime amounts
 without empty token tables. **Live verification on 2026-10-21:** `/query_v2`
 remains usable; a single-ID `/query` returns 403, and the installed official
-client returns `threadUsage: null` for both an existing Cloud and Local session.
+client yields no usable `threadUsage` object for either existing Cloud or Local session.
 Tokens and server estimated credits remain conditional, not verified live features.
 
 ```bash
