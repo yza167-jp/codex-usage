@@ -78,7 +78,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 # Existing models keep the v1.6.2 reference rates; GPT-6 is an additive entry.
 RATE_CARD_AS_OF = "2026-08-12"
 GPT6_RATE_CARD_AS_OF = "2026-09-30"
@@ -4402,6 +4402,46 @@ def render_csv(
 class CloudUsageError(Exception):
     """A cloud read failed; messages must not contain credentials or responses."""
 
+    def __init__(self, message: str, http_status: Optional[int] = None, reason: Optional[str] = None,
+                 diagnostics: Optional[dict] = None, cache_expires_at: Optional[float] = None):
+        super().__init__(message)
+        self.http_status = http_status
+        self.reason = reason
+        self.diagnostics = diagnostics
+        self.cache_expires_at = cache_expires_at
+
+
+def _cloud_error_diagnostics(response) -> dict:
+    """Classify a bounded response in memory; never retain arbitrary error text."""
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    body = b""
+    try:
+        body = response.read(8192)
+    except (OSError, http.client.HTTPException):
+        pass
+    out = {
+        "content_type": content_type if content_type in ("application/json", "text/html", "text/plain") else "other",
+        "structured_error_type": None, "structured_error_code": None,
+        "challenge_detected": response.headers.get("cf-mitigated", "").lower() == "challenge"
+            or (content_type == "text/html" and any(marker in body.lower() for marker in
+                (b"/cdn-cgi/challenge-platform/", b"cf-chl-", b"_cf_chl_opt"))),
+        "request_id_present": any(response.headers.get(key) for key in ("x-request-id", "request-id", "openai-request-id")),
+    }
+    allowed = {"access_denied", "permission_denied", "forbidden", "unauthorized", "invalid_request_error",
+               "authentication_error", "permission_error", "insufficient_permissions", "not_found",
+               "rate_limit_exceeded", "rate_limit_error", "server_error"}
+    try:
+        parsed = json.loads(body) if content_type == "application/json" else None
+        error = parsed.get("error", parsed) if isinstance(parsed, dict) else None
+        if isinstance(error, dict):
+            for field in ("type", "code"):
+                value = error.get(field)
+                if isinstance(value, str) and value in allowed:
+                    out["structured_error_" + field] = value
+    except (ValueError, UnicodeError):
+        pass
+    return out
+
 
 class _NoCloudRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -4443,8 +4483,16 @@ def _cloud_request(codex_home: Path, path: str, body: dict) -> dict:
             raise ValueError()
         return result
     except urllib.error.HTTPError as exc:
-        raise CloudUsageError(f"Cloud usage request failed (HTTP {exc.code}); check login and account access.") from None
-    except (OSError, ValueError):
+        try:
+            diagnostics = _cloud_error_diagnostics(exc)
+        finally:
+            exc.close()
+        raise CloudUsageError(f"Cloud usage request failed (HTTP {exc.code}); check login and account access.",
+                              http_status=exc.code, diagnostics=diagnostics) from None
+    except ValueError:
+        raise CloudUsageError("Cloud usage request returned invalid JSON; local statistics are unaffected.",
+                              reason="invalid_response") from None
+    except OSError:
         raise CloudUsageError("Cloud usage request failed or returned invalid JSON; local statistics are unaffected.") from None
 
 
@@ -4631,29 +4679,204 @@ def _cloud_amount(value: object) -> Optional[float]:
         return None
 
 
-def read_cloud_usage(codex_home: Path, threads: List[dict]) -> dict:
+CLOUD_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "uncached_input_tokens", "output_tokens", "total_tokens")
+CLOUD_ALLOWANCE_FIELDS = ("five_hour_limit_percent", "weekly_limit_percent", "balance_usage_credits")
+CLOUD_MICRO_FIELDS = ("estimated_usage_credits_micros", "estimated_usage_usd_micros", "native_usage_usd_micros")
+
+
+def _cloud_integer(value: object) -> Optional[int]:
+    # Keep integer counters exact, including values larger than float's 53 bits.
+    return value if type(value) is int and value >= 0 else None
+
+
+def _cloud_token_group(group: dict) -> dict:
+    out = dict(group)
+    for key in CLOUD_TOKEN_FIELDS:
+        out[key] = _cloud_integer(group.get("net_new_input_tokens" if key == "uncached_input_tokens" else key))
+    derived = []
+    for target, left, right, subtract in (
+        ("input_tokens", "uncached_input_tokens", "cached_input_tokens", False),
+        ("uncached_input_tokens", "input_tokens", "cached_input_tokens", True),
+        ("total_tokens", "input_tokens", "output_tokens", False),
+    ):
+        a, b = out[left], out[right]
+        if out[target] is None and a is not None and b is not None and (not subtract or a >= b):
+            out[target] = a - b if subtract else a + b
+            derived.append(target)
+    for key in CLOUD_MICRO_FIELDS:
+        out[key] = _cloud_integer(group.get(key))
+    out["estimated_credits"] = (out["estimated_usage_credits_micros"] / 1_000_000
+                                if out["estimated_usage_credits_micros"] is not None else None)
+    out["derived_token_fields"] = derived
+    inconsistent = []
+    for total, a, b in (("input_tokens", "uncached_input_tokens", "cached_input_tokens"),
+                        ("total_tokens", "input_tokens", "output_tokens")):
+        if all(out[key] is not None for key in (total, a, b)) and out[total] != out[a] + out[b]:
+            inconsistent.extend((total, a, b))
+    if out["input_tokens"] is not None and out["cached_input_tokens"] is not None and out["cached_input_tokens"] > out["input_tokens"]:
+        inconsistent.extend(("input_tokens", "cached_input_tokens", "uncached_input_tokens"))
+    out["inconsistent_token_fields"] = sorted(set(inconsistent))
+    return out
+
+
+def _cloud_usage_rows(result: dict, requested: List[str]) -> Dict[str, dict]:
+    rows = result.get("threads")
+    if not isinstance(rows, list):
+        raise CloudUsageError("Cloud usage returned an invalid thread list.", reason="invalid_response")
+    out = {}
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get("thread_id"), str)
+                or row["thread_id"] not in requested or row["thread_id"] in out):
+            raise CloudUsageError("Cloud usage returned invalid, duplicate or unexpected threads.", reason="invalid_response")
+        out[row["thread_id"]] = row
+    return out
+
+
+def _cloud_endpoint_error(exc: CloudUsageError) -> dict:
+    code = exc.http_status
+    reason = exc.reason or ("access_denied" if code in (401, 403) else "unsupported" if code in (404, 405, 501)
+              else "request_failed")
+    return {"status": reason, "http_status": code, "message": str(exc),
+            **({"diagnostics": exc.diagnostics} if exc.diagnostics is not None else {}),
+            **({"cached": True, "cache_expires_at": datetime.fromtimestamp(exc.cache_expires_at, timezone.utc).isoformat()}
+               if exc.cache_expires_at is not None else {})}
+
+
+CLOUD_DENIAL_TTL_SECONDS = 15 * 60
+
+
+def _cloud_denial_record(path: Path, key: str, record: Optional[dict] = None) -> Optional[dict]:
+    """Best-effort cache, separate from snapshots and the local token index."""
+    conn = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not path.exists()
+        conn = sqlite3.connect(str(path), timeout=5)
+        if new_file and os.name != "nt":
+            path.chmod(0o600)
+        conn.execute("CREATE TABLE IF NOT EXISTS cloud_denials (cache_key TEXT PRIMARY KEY, record TEXT NOT NULL)")
+        if record is not None:
+            conn.execute("INSERT OR REPLACE INTO cloud_denials VALUES (?,?)", (key, json.dumps(record)))
+            conn.commit()
+            return None
+        found = conn.execute("SELECT record FROM cloud_denials WHERE cache_key=?", (key,)).fetchone()
+        return json.loads(found[0]) if found else None
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _cloud_client_context(codex_home: Path) -> str:
+    try:
+        auth = (codex_home / "auth.json").stat()
+        auth_revision = (auth.st_mtime_ns, auth.st_size)
+    except OSError:
+        auth_revision = None
+    # Proxy values are hashed in memory, never stored; new credentials/version
+    # or proxy configuration must not inherit an old client's refusal.
+    context = [VERSION, sys.version, urllib.request.getproxies(), auth_revision]
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:24]
+
+
+def _cloud_cached_request(codex_home: Path, path: str, body: dict, cache_path: Optional[Path],
+                          account_key: Optional[str], client_context: Optional[str]) -> dict:
+    key = None
+    if cache_path is not None and account_key:
+        # Scope refusals to the exact request as well as account/endpoint/client.
+        # A denied thread must not disable unrelated threads or a whole API.
+        key = hashlib.sha256(json.dumps([account_key, client_context, path, body], sort_keys=True).encode()).hexdigest()
+        cached = _cloud_denial_record(cache_path, key)
+        if (isinstance(cached, dict) and isinstance(cached.get("expires_at"), (int, float))
+                and 0 < cached["expires_at"] - time.time() <= CLOUD_DENIAL_TTL_SECONDS):
+            raise CloudUsageError("Cloud request was recently denied; retry after cache expiry or use --no-cache.",
+                                  http_status=403, diagnostics=cached.get("diagnostics"), cache_expires_at=cached["expires_at"])
+    try:
+        return _cloud_request(codex_home, path, body)
+    except CloudUsageError as exc:
+        if key is not None and exc.http_status == 403:
+            _cloud_denial_record(cache_path, key, {"expires_at": time.time() + CLOUD_DENIAL_TTL_SECONDS,
+                                                  "diagnostics": exc.diagnostics})
+        raise
+
+
+def read_cloud_usage(codex_home: Path, threads: List[dict], cache_path: Optional[Path] = None,
+                     account_key: Optional[str] = None) -> dict:
     """Read backend lifetime amounts, never synthesize period token events."""
     metadata = {str(t["id"]): t for t in threads}
     amounts = {}
+    token_amounts = {}
+    endpoint_errors = {}
+    comparison_keys = {}
     as_of = []
-    ids = list(metadata)
+    ids = sorted(metadata)
+    client_context = _cloud_client_context(codex_home) if cache_path is not None and account_key else None
     for offset in range(0, len(ids), 50):
         batch = ids[offset:offset + 50]
-        result = _cloud_request(codex_home, "/wham/usage/thread_usage/query_v2", {
-            "threads": [{"thread_id": sid, "created_at": metadata[sid].get("created_at"),
-                         "descendant_thread_ids": []} for sid in batch],
-        })
-        rows = result.get("threads")
-        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-            raise CloudUsageError("Cloud usage returned an invalid thread list.")
-        for row in rows:
-            if row.get("thread_id") in batch:
-                amounts[row["thread_id"]] = row
-        as_of.append(parse_ts(result.get("data_as_of")))
+        for endpoint in ("query_v2", "query"):
+            if endpoint in endpoint_errors:
+                continue  # One failure per endpoint/report; no retry storm across batches.
+            body = ({"threads": [{"thread_id": sid, "created_at": metadata[sid].get("created_at"),
+                                  "descendant_thread_ids": []} for sid in batch]}
+                    if endpoint == "query_v2" else {"thread_ids": batch})
+            try:
+                result = _cloud_cached_request(codex_home, "/wham/usage/thread_usage/" + endpoint, body,
+                                               cache_path, account_key, client_context)
+                rows = _cloud_usage_rows(result, batch)
+            except CloudUsageError as exc:
+                endpoint_errors[endpoint] = _cloud_endpoint_error(exc)
+                if endpoint == "query_v2":
+                    as_of.append(None)
+                continue
+            if endpoint == "query_v2":
+                fresh = parse_ts(result.get("data_as_of"))
+                context = result.get("comparison_plan")
+                comparison = None
+                if isinstance(context, (str, dict)) and context:
+                    encoded = json.dumps(context, sort_keys=True, separators=(",", ":"))
+                    if encoded not in comparison_keys:
+                        comparison_keys[encoded] = hashlib.sha256(encoded.encode()).hexdigest()[:24]
+                    comparison = comparison_keys[encoded]
+                for row in rows.values():
+                    row["allowance_data_as_of"] = fresh.isoformat() if fresh else None
+                    row["comparison_plan"] = comparison
+                amounts.update(rows)
+                as_of.append(fresh)
+            else:
+                token_amounts.update(rows)
+    if ids and len(endpoint_errors) == 2 and not amounts and not token_amounts:
+        raise CloudUsageError("Both Cloud usage interfaces failed: " + "; ".join(
+            endpoint + ": " + error["message"] for endpoint, error in endpoint_errors.items()))
     sessions = []
-    fields = ("five_hour_limit_percent", "weekly_limit_percent", "balance_usage_credits")
     for sid, meta in metadata.items():
         row = amounts.get(sid, {})
+        tokens = token_amounts.get(sid, {})
+        raw_groups = tokens.get("groups")
+        groups = [_cloud_token_group(g) for g in raw_groups if isinstance(g, dict)] if isinstance(raw_groups, list) else []
+        totals = {}
+        completeness = {}
+        for key in CLOUD_TOKEN_FIELDS:
+            known = [g[key] for g in groups if g[key] is not None]
+            totals[key] = sum(known) if known else None
+            completeness[key] = (bool(groups) and len(known) == len(groups) and len(groups) == len(raw_groups)
+                                 and not any(key in g["inconsistent_token_fields"] for g in groups))
+        token_status = ("available" if all(completeness.values()) else "partial"
+                        if any(v is not None for v in totals.values()) else "unavailable")
+        micros = {key: _cloud_integer(tokens.get(key)) for key in CLOUD_MICRO_FIELDS}
+        allowance_groups = row.get("groups") if isinstance(row.get("groups"), list) else []
+        def group_key(g):
+            return tuple(str(g.get(key)) for key in ("model", "reasoning_effort", "speed"))
+        remaining_groups = [dict(g) for g in allowance_groups if isinstance(g, dict)]
+        merged_groups = []
+        for group in groups:
+            matching = next((g for g in remaining_groups if group_key(g) == group_key(group)), None)
+            if matching is None:
+                merged_groups.append(dict(group))
+            else:
+                remaining_groups.remove(matching)
+                merged_groups.append({**matching, **group})
+        merged_groups.extend(remaining_groups)
         status = row.get("data_status") or "unavailable"
         sessions.append({
             "session_id": sid, "title": meta.get("title") or sid,
@@ -4661,20 +4884,204 @@ def read_cloud_usage(codex_home: Path, threads: List[dict]) -> dict:
             "cwd": meta.get("cwd"),
             "host": "cloud", "host_id": "durable", "scope": "lifetime", "data_status": status,
             "usage_source": row.get("usage_source") or "unknown",
-            **{key: _cloud_amount(row.get(key)) if status != "unavailable" else None for key in fields},
-            "groups": row.get("groups") if isinstance(row.get("groups"), list) else [],
+            **{key: _cloud_amount(row.get(key)) if status != "unavailable" else None for key in CLOUD_ALLOWANCE_FIELDS},
+            "allowance_data_as_of": row.get("allowance_data_as_of"),
+            "comparison_plan": row.get("comparison_plan"),
+            "groups": merged_groups,
+            "allowance_groups": allowance_groups,
+            "token_groups": groups,
+            **totals, **micros,
+            "estimated_credits": micros["estimated_usage_credits_micros"] / 1_000_000
+                if micros["estimated_usage_credits_micros"] is not None else None,
+            "token_data_status": token_status, "token_fields_complete": completeness,
+            "token_usage_source": "thread_usage/query",
+            "token_unavailable_reason": (endpoint_errors.get("query", {}).get("status") or
+                ("row_omitted" if sid not in token_amounts else "fields_missing")) if token_status == "unavailable" else None,
         })
     return {
         "scope": "lifetime", "host": "cloud", "source": "thread_usage/query_v2",
+        "sources": ["thread_usage/query_v2", "thread_usage/query"],
         "data_as_of": min(as_of).isoformat() if as_of and all(as_of) else None,
+        "data_as_of_scope": "allowance_only",
         "includes_descendants": False, "period_attribution_available": False,
-        "token_counts_available": False, "sessions": sessions,
+        "token_counts_available": any(s["token_data_status"] != "unavailable" for s in sessions),
+        "endpoint_errors": endpoint_errors, "sessions": sessions,
     }
 
 
 def _terminal_label(value: object) -> str:
     """Sanitize untrusted metadata only at the terminal boundary."""
     return _clean_thread_label(re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(value or "")))
+
+
+def record_cloud_snapshots(report: dict, path: Path, account_key: str, observed_at: datetime,
+                           selected_period: Optional[Tuple[datetime, datetime]] = None) -> None:
+    """Retain minimal counters; measure only whole observation intervals.
+
+    Query times bound when a server counter change was observed, not when a
+    task ran. Never interpolate an interval across a requested window boundary.
+    Missing values, decreasing counters and changed comparison plans break a
+    metric's continuity. No transcripts, titles, credentials or groups are kept.
+    """
+    observed_at = observed_at.astimezone(timezone.utc)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not path.exists()
+    conn = sqlite3.connect(str(path), timeout=5)
+    try:
+        if new_file and os.name != "nt":
+            path.chmod(0o600)
+        conn.execute("""CREATE TABLE IF NOT EXISTS cloud_counter_snapshots (
+            account_key TEXT NOT NULL, thread_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+            counters TEXT NOT NULL, PRIMARY KEY(account_key, thread_id, observed_at))""")
+        windows = {label: (observed_at - timedelta(hours=hours), observed_at)
+                   for label, hours in (("1h", 1), ("12h", 12), ("24h", 24), ("7d", 168))}
+        if selected_period:
+            windows["selected_period"] = tuple(ts.astimezone(timezone.utc) for ts in selected_period)
+        earliest = min(start for start, _ in windows.values()).isoformat()
+        for row in report["sessions"]:
+            counters = {key: row.get(key) if row.get("token_fields_complete", {}).get(key) else None
+                        for key in CLOUD_TOKEN_FIELDS}
+            counters.update({key: cloud_value(row, key) for key in CLOUD_ALLOWANCE_FIELDS})
+            counters["estimated_usage_credits_micros"] = row.get("estimated_usage_credits_micros")
+            counters["comparison_plan"] = row.get("comparison_plan")
+            counters["allowance_data_as_of"] = row.get("allowance_data_as_of")
+            for prefix, status in (("allowance", "data_status"), ("token", "token_data_status")):
+                counters[status] = row.get(status)
+                groups = row.get(prefix + "_groups")
+                counters[prefix + "_group_count"] = len(groups) if isinstance(groups, list) else None
+            # Only retain known complete measurements; partial token sums are
+            # visible in reports but cannot form trustworthy counter deltas.
+            previous = conn.execute(
+                "SELECT observed_at, counters FROM cloud_counter_snapshots "
+                "WHERE account_key=? AND thread_id=? AND observed_at>=? AND observed_at<? ORDER BY observed_at",
+                (account_key, row["session_id"], earliest, observed_at.isoformat()),
+            ).fetchall()
+            # One indexed predecessor supports "since last observation" even
+            # after a long gap; it never fills an uncovered trailing window.
+            predecessor = conn.execute(
+                "SELECT observed_at, counters FROM cloud_counter_snapshots "
+                "WHERE account_key=? AND thread_id=? AND observed_at<? ORDER BY observed_at DESC LIMIT 1",
+                (account_key, row["session_id"], min(earliest, observed_at.isoformat())),
+            ).fetchall()
+            previous = predecessor + previous
+            inserted = conn.execute("INSERT OR IGNORE INTO cloud_counter_snapshots VALUES(?,?,?,?)",
+                                    (account_key, row["session_id"], observed_at.isoformat(), json.dumps(counters)))
+            if not inserted.rowcount:
+                counters = json.loads(conn.execute(
+                    "SELECT counters FROM cloud_counter_snapshots WHERE account_key=? AND thread_id=? AND observed_at=?",
+                    (account_key, row["session_id"], observed_at.isoformat())).fetchone()[0])
+            points = [(parse_ts(ts), json.loads(values)) for ts, values in previous] + [(observed_at, counters)]
+            metrics = (*CLOUD_TOKEN_FIELDS, *CLOUD_ALLOWANCE_FIELDS, "estimated_usage_credits_micros")
+            row["snapshot_observed_at"] = observed_at.isoformat()
+            row["posting_windows"] = {}
+            last_start = points[-2][0] if len(points) > 1 else observed_at
+            for label, (start, end) in {**windows, "observed_change": (last_start, observed_at)}.items():
+                deltas = {}
+                for key in metrics:
+                    intervals = []
+                    reasons = set()
+                    for (a_ts, a), (b_ts, b) in zip(points, points[1:]):
+                        if not (start <= a_ts < b_ts <= end):
+                            continue
+                        a_value, b_value = a.get(key), b.get(key)
+                        prefix, status = (("allowance", "data_status") if key in CLOUD_ALLOWANCE_FIELDS
+                                          else ("token", "token_data_status"))
+                        reason = None
+                        if a_value is None or b_value is None:
+                            reason = "counter_missing"
+                        elif b_value < a_value:
+                            reason = "counter_decreased"
+                        elif a.get(status) != b.get(status):
+                            reason = "availability_changed"
+                        elif a.get(prefix + "_group_count") != b.get(prefix + "_group_count"):
+                            reason = "group_coverage_changed"
+                        if key in CLOUD_ALLOWANCE_FIELDS:
+                            if not a.get("comparison_plan") or not b.get("comparison_plan"):
+                                reason = "comparison_context_missing"
+                            elif a["comparison_plan"] != b["comparison_plan"]:
+                                reason = "comparison_context_changed"
+                            a_fresh, b_fresh = parse_ts(a.get("allowance_data_as_of")), parse_ts(b.get("allowance_data_as_of"))
+                            if a_fresh and b_fresh and b_fresh < a_fresh:
+                                reason = "server_watermark_regressed"
+                        if reason:
+                            reasons.add(reason)
+                            continue
+                        intervals.append((a_ts, b_ts, b_value - a_value))
+                    covered = sum((b-a).total_seconds() for a, b, _ in intervals)
+                    deltas[key] = {
+                        "value": sum(x[2] for x in intervals) if intervals else None,
+                        "covered_seconds": covered,
+                        "uncovered_seconds": max(0, (end-start).total_seconds() - covered),
+                        "intervals": len(intervals),
+                        "complete_window": bool(intervals) and not reasons and intervals[0][0] == start and intervals[-1][1] == end,
+                        "discontinuity": bool(reasons),
+                        "unavailable_reasons": sorted(reasons) if reasons else ([] if intervals else ["insufficient_observations"]),
+                    }
+                inside = [values for ts, values in points if start <= ts <= end]
+                first_fresh = inside[0].get("allowance_data_as_of") if inside else None
+                last_fresh = inside[-1].get("allowance_data_as_of") if inside else None
+                a_fresh, b_fresh = parse_ts(first_fresh), parse_ts(last_fresh)
+                window = {
+                    "scope": "observed_server_posting_delta", "start": start.isoformat(), "end": end.isoformat(),
+                    "semantics": "nonnegative_changes_in_comparable_segments", "execution_time_attribution": False,
+                    "freshness": {"allowance_data_as_of_start": first_fresh, "allowance_data_as_of_end": last_fresh,
+                                  "allowance_watermark_advanced": b_fresh > a_fresh if len(inside) > 1 and a_fresh and b_fresh else None,
+                                  "token_data_as_of": None},
+                    "metrics": deltas,
+                }
+                if label == "observed_change":
+                    row[label] = window
+                else:
+                    row["posting_windows"][label] = window
+        conn.commit()
+        report["snapshot_status"] = "recorded"
+        report["posting_deltas_available"] = any(
+            metric["value"] is not None for row in report["sessions"]
+            for window in [row["observed_change"], *row["posting_windows"].values()] for metric in window["metrics"].values())
+    finally:
+        conn.close()
+
+
+def cloud_tiers(row: dict) -> str:
+    keys = [usage_key(g.get("model"), g.get("speed") or SERVICE_TIER_UNKNOWN)
+            for g in row.get("groups", []) if isinstance(g, dict)]
+    return tier_label(keys) if keys else "—"
+
+
+def cloud_token_text(row: dict, key: str) -> str:
+    value = _cloud_integer(row.get(key))
+    if value is None:
+        return "—"
+    return f"{value:,}" + ("+?" if not row.get("token_fields_complete", {}).get(key, True) else "")
+
+
+def cloud_posting_text(window: dict) -> str:
+    metrics = window["metrics"]
+    parts = []
+    fields = [("total_tokens", "tokens"), ("estimated_usage_credits_micros", "EST CREDITS"),
+              ("weekly_limit_percent", "weekly pp"), ("five_hour_limit_percent", "5h pp"),
+              ("balance_usage_credits", "balance credits")]
+    if metrics["total_tokens"]["value"] is None:
+        fields[:1] = [(key, key.replace("_tokens", "")) for key in CLOUD_TOKEN_FIELDS if key != "total_tokens"]
+    for key, label in fields:
+        metric = metrics[key]
+        if metric["value"] is not None:
+            value = metric["value"] / 1_000_000 if key.endswith("_micros") else metric["value"]
+            text = str(value) if type(value) is int else f"{value:.6f}".rstrip("0").rstrip(".")
+            seconds = metric["covered_seconds"]
+            coverage = f"{seconds:.0f}s" if seconds >= 1 else "<1s"
+            quality = "" if metric["complete_window"] else f"; {metric.get('uncovered_seconds', 0):.0f}s unknown"
+            if metric["discontinuity"]:
+                quality += "; comparable segments only, not net change"
+            parts.append(f"{label} +{text} ({coverage} observed{quality})")
+    if parts:
+        return " · ".join(parts)
+    reasons = {reason for metric in metrics.values() for reason in metric.get("unavailable_reasons", [])}
+    unknown = max((metric.get("uncovered_seconds", 0) for metric in metrics.values()), default=0)
+    coverage = f"0s comparable; {unknown:.0f}s unknown; " if unknown else ""
+    if "comparison_context_missing" in reasons:
+        return "— (" + coverage + "comparison context missing; allowance change unknown)"
+    return "— (" + coverage + "need two comparable observations inside this window)"
 
 
 def cloud_models(row: dict) -> List[str]:
@@ -4684,12 +5091,16 @@ def cloud_models(row: dict) -> List[str]:
 
 
 def cloud_value(row: dict, key: str) -> Optional[float]:
-    if row.get("data_status") == "unavailable":
+    if key in CLOUD_ALLOWANCE_FIELDS and row.get("data_status") == "unavailable":
         return None
     return _cloud_amount(row.get(key))
 
 
 def cloud_value_text(row: dict, key: str, percent: bool = False) -> str:
+    if key == "estimated_credits":
+        micros = _cloud_integer(row.get("estimated_usage_credits_micros"))
+        if micros is not None:
+            return f"{micros // 1_000_000}.{micros % 1_000_000:06d}"
     value = cloud_value(row, key)
     if value is None:
         return "—"
@@ -4735,7 +5146,7 @@ def join_session_views(local_items: Iterable[dict], cloud_report: dict) -> List[
         cloud = entry["cloud"] or {}
         has_data = entry["local"] is not None or any(
             cloud_value(cloud, key) is not None
-            for key in ("weekly_limit_percent", "five_hour_limit_percent", "balance_usage_credits")
+            for key in (*CLOUD_ALLOWANCE_FIELDS, "estimated_credits", *CLOUD_TOKEN_FIELDS)
         )
         return (not has_data, _terminal_label(entry.get("project_name")).casefold() or "\uffff",
                 _terminal_label(entry["title"]).casefold(), str(entry["session_id"] or ""))
@@ -4786,7 +5197,11 @@ def render_unified_summary(
         return [color.wrap(part, color.DIM) for part in wrap_display_words(_terminal_label(text), width)]
     lines = note("Sessions — local and Cloud together; ordered by project/name, missing-data-only entries last.")
     lines += note(f"PERIOD≈ = local weekly equivalent for {period_label}; LIFE % = Cloud lifetime weekly amount (not current week).")
-    lines += note("Cloud Data as of: " + (report.get("data_as_of") or "unavailable"))
+    lines += note("Cloud allowance Data as of: " + (report.get("data_as_of") or "unavailable") + "; token freshness is not supplied.")
+    for endpoint, error in report.get("endpoint_errors", {}).items():
+        lines += note(f"Cloud {endpoint}: {error['status']}" +
+                      (f" (HTTP {error['http_status']})" if error.get("http_status") else "") +
+                      ("; cached until " + error["cache_expires_at"] if error.get("cached") else "") + "; other metrics remain separate.")
     separator = (" " * gap).join("-" * w for w in widths)
     lines += ["", line(headers, heading=True), color.wrap(separator, color.DIM)]
     local_rows = [e["local"] for e in entries if e["local"] is not None]
@@ -4814,7 +5229,10 @@ def render_unified_summary(
                 extras.append(f"TOKENS I/C/O {token_triplet_text(u)} · CACHE TAX {cache:.1f} · LOCAL SHARE {share}")
         else:
             models = cloud_models(cloud or {})
+            values["TIER(S)"] = cloud_tiers(cloud or {})
             values["STATE/DATA"] = (cloud or {}).get("data_status") or "unavailable"
+            if values["STATE/DATA"] == "unavailable" and (cloud or {}).get("token_data_status") in ("available", "partial"):
+                values["STATE/DATA"] = "tokens/" + cloud["token_data_status"]
         if cloud is not None:
             values["LIFE %"] = cloud_value_text(cloud, "weekly_limit_percent", percent=True)
             if row is not None:
@@ -4822,6 +5240,14 @@ def render_unified_summary(
             if wide:
                 extras.append("Cloud lifetime 5H % " + cloud_value_text(cloud, "five_hour_limit_percent", True)
                               + " · BALANCE CREDITS " + cloud_value_text(cloud, "balance_usage_credits"))
+                if any(cloud.get(key) is not None for key in (*CLOUD_TOKEN_FIELDS, "estimated_credits")):
+                    extras.append("Cloud lifetime TOKENS I/C/O " + "/".join(
+                        cloud_token_text(cloud, key) for key in ("input_tokens", "cached_input_tokens", "output_tokens"))
+                        + " · EST CREDITS " + cloud_value_text(cloud, "estimated_credits"))
+            if "selected_period" in cloud.get("posting_windows", {}):
+                extras.append("Cloud selected-window observed change: " + cloud_posting_text(cloud["posting_windows"]["selected_period"]))
+            elif any(m["value"] is not None for m in cloud.get("observed_change", {}).get("metrics", {}).values()):
+                extras.append("Cloud since previous observation: " + cloud_posting_text(cloud["observed_change"]))
         # Models may be absent from backend groups; do not invent one from the title.
         models = [_terminal_label(model) for model in model_names(models)]
         if "MODEL(S)" in headers:
@@ -4831,7 +5257,7 @@ def render_unified_summary(
         else:
             continuation = []
             if models:
-                extras.insert(0, "Models: " + model_label(models) + (" · TIER " + values.get("TIER(S)", "—") if row is not None else ""))
+                extras.insert(0, "Models: " + model_label(models) + " · TIER " + values.get("TIER(S)", "—"))
             if row is not None:
                 extras.append("1H≈ " + values["1H≈"] + " · CREDITS* " + values["CREDITS*"])
         if entry.get("local_rollup_parent"):
@@ -4864,7 +5290,9 @@ def render_unified_summary(
     lines.append("")
     lines += note("No combined TOTAL: Cloud lifetime and local selected-period amounts may overlap and cannot be added.")
     lines += note("SRC is the telemetry source, not the executor location. BOTH joins an exact thread ID, not its usage amounts.")
-    lines += note("Partial/unavailable data is not zero. Cloud token/time-window totals are unavailable; CREDITS* excludes Cloud balance credits.")
+    lines += note("Partial/unavailable data is not zero. Cloud EST CREDITS is the server estimate; CREDITS* is the local reference, separate from balance credits.")
+    lines += note("Cloud changes are nonnegative differences within comparable observations, not execution-time usage or net consumption after corrections. Lifetime is never recent usage.")
+    lines += note("Cloud snapshots: " + str(report.get("snapshot_status") or "not recorded") + "; no scheduled monitoring.")
     lines += note("Local STATE/DATA shows activity/health; Cloud shows availability, not running status. '?' marks partial local WEEKLY estimates.")
     return lines
 
@@ -4880,8 +5308,8 @@ def render_cloud_detail(entry: dict, report: dict, width: int, color: Colorizer,
         add("session: " + str(entry["session_id"] or "unavailable"))
         add("project: " + str(entry.get("project_name") or "—"))
     lines.append(color.wrap("Cloud lifetime usage — backend amounts, not selected-period usage", color.BOLD, color.MAGENTA))
-    add("data: " + str(cloud.get("data_status") or "unavailable")
-        + " · Data as of: " + str(report.get("data_as_of") or "unavailable"))
+    add("allowance data: " + str(cloud.get("data_status") or "unavailable")
+        + " · Data as of: " + str(cloud.get("allowance_data_as_of") or report.get("data_as_of") or "unavailable"))
     add("LIFE WEEKLY % " + cloud_value_text(cloud, "weekly_limit_percent", True)
         + " · LIFE 5H % " + cloud_value_text(cloud, "five_hour_limit_percent", True)
         + " · BALANCE CREDITS " + cloud_value_text(cloud, "balance_usage_credits"))
@@ -4892,9 +5320,44 @@ def render_cloud_detail(entry: dict, report: dict, width: int, color: Colorizer,
     models = cloud_models(cloud)
     if models:
         add("Cloud models: " + model_label(models))
+        add("Cloud tiers: " + cloud_tiers(cloud))
+    if any(cloud.get(key) is not None for key in CLOUD_TOKEN_FIELDS):
+        add("Cloud lifetime tokens: " + " · ".join(label + " " + cloud_token_text(cloud, key)
+            for label, key in (("INPUT", "input_tokens"), ("CACHED", "cached_input_tokens"),
+                               ("UNCACHED", "uncached_input_tokens"), ("OUTPUT", "output_tokens"), ("TOTAL", "total_tokens"))))
+    add("Cloud token data: " + str(cloud.get("token_data_status") or "unavailable") +
+        (" (" + str(cloud["token_unavailable_reason"]) + ")" if cloud.get("token_unavailable_reason") else ""))
+    if cloud.get("estimated_credits") is not None:
+        add("EST CREDITS " + cloud_value_text(cloud, "estimated_credits") + " (server estimate, separate from local CREDITS* and balance credits)")
+    for group in sorted((g for g in cloud.get("groups", []) if isinstance(g, dict)),
+                        key=lambda g: (model_display_sort_key(str(g.get("model") or "unknown")),
+                                       str(g.get("reasoning_effort") or ""), str(g.get("speed") or ""))):
+        text = ("  " + pretty_model(str(group.get("model") or "unknown")) +
+            " · effort " + str(group.get("reasoning_effort") or "—") +
+            " · speed " + str(group.get("speed") or "—"))
+        if any(group.get(key) is not None for key in CLOUD_TOKEN_FIELDS):
+            text += " · I/C/O " + "/".join(cloud_token_text(group, key) for key in ("input_tokens", "cached_input_tokens", "output_tokens"))
+        if group.get("estimated_credits") is not None:
+            text += " · EST CREDITS " + cloud_value_text(group, "estimated_credits")
+        if cloud_value(group, "weekly_limit_percent") is not None:
+            text += " · lifetime weekly " + cloud_value_text(group, "weekly_limit_percent", True)
+        add(text)
+    if cloud.get("observed_change"):
+        change = cloud["observed_change"]
+        add("Cloud observed change since previous observation: " + cloud_posting_text(change))
+        add("Observed: " + change["start"] + " → " + change["end"])
+        freshness = change["freshness"]
+        advanced = freshness["allowance_watermark_advanced"]
+        add("Allowance updated: " + str(freshness["allowance_data_as_of_end"] or "unknown") +
+            " · watermark advanced: " + ("unknown" if advanced is None else "yes" if advanced else "no") + "; token freshness unknown")
+        if not cloud.get("comparison_plan"):
+            add("Comparison context missing; allowance/balance changes remain unknown.")
+    selected = cloud.get("posting_windows", {}).get("selected_period")
+    if selected:
+        add("Selected-window observed change: " + cloud_posting_text(selected))
     if entry.get("local_rollup_parent"):
         add("Local tokens already rolled into " + entry["local_rollup_parent"] + "; Cloud remains individual lifetime usage.")
-    add("No Cloud period tokens, 1H burn or model credit breakdown available. Descendants are not rolled up.")
+    add("Only whole comparable observation intervals count; uncovered time is unknown. Unchanged counters do not confirm no consumption; corrections/backfill can change counters. '+?' marks partial tokens.")
     return lines
 
 
@@ -4919,10 +5382,22 @@ def render_cloud_usage(report: dict, output: str = "table", details: bool = Fals
               "five_hour_limit_percent", "weekly_limit_percent", "balance_usage_credits"]
     if output == "csv":
         sio = io.StringIO()
-        writer = csv.DictWriter(sio, fieldnames=fields + ["data_as_of", "project_name", "cwd"], extrasaction="ignore")
+        extra_fields = [*CLOUD_TOKEN_FIELDS, *CLOUD_MICRO_FIELDS, "estimated_credits", "token_data_status",
+                        "token_unavailable_reason", "token_usage_source", "models", "service_tiers",
+                        "token_fields_complete_json", "groups_json", "token_groups_json", "allowance_groups_json",
+                        "posting_windows_json", "cloud_endpoint_errors_json", "snapshot_status",
+                        "snapshot_observed_at", "allowance_data_as_of", "comparison_plan", "observed_change_json"]
+        writer = csv.DictWriter(sio, fieldnames=fields + ["data_as_of", "project_name", "cwd"] + extra_fields, extrasaction="ignore")
         writer.writeheader()
         for row in report["sessions"]:
-            writer.writerow({**row, "data_as_of": report["data_as_of"]})
+            writer.writerow({**row, "data_as_of": report["data_as_of"],
+                             "models": ",".join(cloud_models(row)),
+                             "service_tiers": ",".join(service_tiers(usage_key(g.get("model"), g.get("speed") or SERVICE_TIER_UNKNOWN)
+                                 for g in row.get("groups", []) if isinstance(g, dict))),
+                             **{key + "_json": json.dumps(row.get(key), ensure_ascii=False) for key in
+                                ("token_fields_complete", "groups", "token_groups", "allowance_groups", "posting_windows", "observed_change")},
+                             "cloud_endpoint_errors_json": json.dumps(report.get("endpoint_errors", {})),
+                             "snapshot_status": report.get("snapshot_status")})
         return sio.getvalue()
     color = color or Colorizer("never")
     width = max(80, min(REPORT_MAX_WIDTH, shutil.get_terminal_size(fallback=(120, 24)).columns))
@@ -4993,7 +5468,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all-agents", action="store_true", help="With --details, show every agent instead of truncating the agent table.")
     p.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="ANSI color mode for terminal output (default: auto; NO_COLOR is respected).")
     p.add_argument("--perf", action="store_true", help="Show index/read timing and bytes scanned.")
-    p.add_argument("--no-cache", action="store_true", help="Bypass the persistent incremental index and parse JSONL directly.")
+    p.add_argument("--no-cache", action="store_true", help="Bypass the incremental index and Cloud snapshots; parse local JSONL directly.")
     p.add_argument("--rebuild-cache", action="store_true", help="Clear and rebuild the incremental index from all discovered rollouts.")
     p.add_argument("--cache-info", action="store_true", help="Show cache path/size/index counts and exit.")
     p.add_argument("--cache-path", help="Override the incremental SQLite cache path.")
@@ -5016,14 +5491,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     codex_home = Path(args.codex_home).expanduser()
     cloud_report = None
     if args.period == "cloud" or args.cloud:
+        account_key = None
+        snapshot_path = None
+        if not args.no_cache:
+            try:
+                token, account = _cloud_credentials(codex_home)
+                identity = account or (_decode_jwt_payload_unverified(token) or {}).get("sub")
+                if isinstance(identity, str) and identity:
+                    account_key = hashlib.sha256((str(codex_home.resolve()) + "\0" + identity).encode()).hexdigest()[:24]
+                    cache_path = Path(args.cache_path).expanduser() if args.cache_path else default_cache_path()
+                    snapshot_path = cache_path.with_name(cache_path.stem + "-cloud.sqlite3")
+            except CloudUsageError:
+                pass  # Mocked/offline transports may have no real account scope.
         try:
             threads = [{"id": sid} for sid in dict.fromkeys(args.cloud_thread)]
             if not threads:
                 threads = discover_cloud_threads(codex_home, include_archived=not args.no_archived)
-            cloud_report = read_cloud_usage(codex_home, threads)
+            cloud_report = read_cloud_usage(codex_home, threads, snapshot_path, account_key)
         except CloudUsageError as exc:
             eprint(str(exc))
             return 2
+        cloud_report["snapshot_status"] = "disabled" if args.no_cache else "unavailable_account_scope"
+        if snapshot_path is not None and threads:
+            try:
+                cloud_now = datetime.now(timezone.utc)
+                selected = parse_period(args.period, get_tz(args.timezone))[:2] if args.period != "cloud" else None
+                record_cloud_snapshots(cloud_report, snapshot_path, account_key, cloud_now, selected)
+            except (OSError, sqlite3.Error):
+                cloud_report["snapshot_status"] = "storage_unavailable"
         if args.period == "cloud":
             print(render_cloud_usage(cloud_report, "json" if args.json else "csv" if args.csv else "table",
                                      details=args.details, wide=args.wide, color=Colorizer(args.color)),

@@ -99,7 +99,7 @@ class CloudUsageTests(unittest.TestCase):
         self.assertEqual(session["scope"], "lifetime")
         self.assertEqual(session["host"], "cloud")
         self.assertEqual(session["weekly_limit_percent"], 34.0)
-        self.assertNotIn("input_tokens", session)
+        self.assertIsNone(session["input_tokens"])
 
     def test_partial_response_preserves_real_zero_and_missing_amounts(self):
         row = {
@@ -151,9 +151,9 @@ class CloudUsageTests(unittest.TestCase):
         report = json.loads(stdout.getvalue())
         self.assertEqual(len(report["sessions"]), 1)
         self.assertEqual(report["sessions"][0]["session_id"], "duplicate")
-        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_count, 2)
         self.assertEqual(
-            [item["thread_id"] for item in request.call_args.args[2]["threads"]],
+            [item["thread_id"] for item in request.call_args_list[0].args[2]["threads"]],
             ["duplicate"],
         )
 
@@ -162,6 +162,8 @@ class CloudUsageTests(unittest.TestCase):
         requests = []
 
         def fake_request(_home, _path, body):
+            if _path.endswith("/query"):
+                return self.response([])
             batch = body["threads"]
             requests.append(batch)
             return self.response([
@@ -368,8 +370,8 @@ class CloudUsageTests(unittest.TestCase):
         self.assertEqual(threads[0]["title"], "Archived title")
         self.assertTrue(threads[0]["archived"])
         self.assertEqual(len(report["sessions"]), 1)
-        self.assertEqual(request.call_count, 1)
-        self.assertEqual(request.call_args.args[2]["threads"], [{
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].args[2]["threads"], [{
             "thread_id": "shared", "created_at": None, "descendant_thread_ids": [],
         }])
 

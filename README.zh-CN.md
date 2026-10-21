@@ -1,5 +1,39 @@
 # codex-usage
 
+## v1.10.0：Cloud 分组、能力状态与观测历史
+
+Cloud 详情展示模型／reasoning effort／speed 分组及已知累计额度，隐藏空 token 表。
+**2026-10-21 实测：`query_v2` 仍可用，单 ID 的 `/query` 仍返回 403；桌面内置官方
+客户端对已有 Cloud、Local 会话均未取得可用的 `threadUsage` 对象。** 累计 tokens 和服务端
+estimated credits 仅为条件可用的解析能力，不宣称当前账号已取得，也不把未知写成 0。
+
+```bash
+codex-usage cloud --details       # 累计分组、状态与上次观测以来的变化
+codex-usage 12h --cloud --wide    # 统一 PROJECT/SESSION/SRC；显示所选窗口实际可比覆盖
+codex-usage 24h --cloud --json    # tokens、原始 credits micros、完整性与 posting_windows
+codex-usage cloud --csv          # 旧字段保留，追加累计 tokens/estimated credits/分组/窗口
+codex-usage cloud --no-cache     # 绕过拒绝缓存，并禁用快照读写
+```
+
+可用账号的 `/query` 累计 tokens 包括 input、cached input、uncached input、output、total。
+缺失值仍未知；只在等式所需字段均已知时推导 input/uncached/total。部分分组的小计标
+`+?`，JSON 带逐字段完整性。**EST CREDITS** 保留服务端估算及原始百万分之一单位，
+与 Local **CREDITS\***、订阅 lifetime weekly %、购买／余额 credits 分开。
+
+普通 Local 命令仍离线；只有 `cloud` / `--cloud` 联网。最小快照分别记录本机观测时间
+和服务端额度更新时间；默认只展示上次观测以来的变化，导出保留四个窗口、覆盖时间、
+未覆盖时间和断点原因。差分是**可比片段内的非负计数变化**，不等于执行时刻的消耗，
+发生统计修正后也不等于整个窗口的净变化。不插值、不把 lifetime 填入 12h/24h；旧
+统计未变化不代表已确认零消耗。没有定时后台服务，不修改 Local 费率或 quota 校准。
+
+**真实样本两次均返回 `comparison_plan: null`**，因此其额度差分继续显示未知。
+有效数值差分已用 mock 验证，尚未宣称当前账号可用。403 按账号、客户端环境、接口和
+具体请求缓存 15 分钟；单个会话缺数据不会禁用整个接口。缓存不保存凭证、原始响应
+或标题，已有 token cache 和历史均保留。真实 Fast 样本仍未验证。
+
+同 ID 仍只合并展示，不重复加总；JSON/CSV 保留独立 host/scope。
+详见[实测、字段语义与时间窗口限制](docs/cloud-token-usage.md)。
+
 ## v1.9.1：Cloud / Local 会话统一显示
 
 `codex-usage 12h --cloud --details` 现在先在**同一张表里显示全部会话**，再进入
