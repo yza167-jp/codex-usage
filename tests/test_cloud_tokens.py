@@ -189,6 +189,8 @@ class CloudTokenTests(unittest.TestCase):
         self.assertEqual(key, comparison_key(dict(reversed(list(plan.items())))))
         self.assertNotEqual(key, comparison_key({"plan_type": "plus"}))
         self.assertNotIn("plan_type", key)
+        for missing in (None, "", {}, False, 123):
+            self.assertIsNone(comparison_key(missing))
 
     def test_omitted_rows_and_duplicate_or_unexpected_ids(self):
         with patch.object(self.m, "_cloud_request", return_value={"threads": []}):
@@ -249,6 +251,118 @@ class CloudTokenTests(unittest.TestCase):
         for secret in ("secret-token", "secret-account", "private-response"):
             self.assertNotIn(secret, str(caught.exception))
 
+    def test_safe_http_diagnostics_allowlist_and_bounded_body(self):
+        class BoundedBody(io.BytesIO):
+            def read(self, size=-1):
+                self.assert_size = size
+                return super().read(size)
+        body = BoundedBody(json.dumps({"error": {"type": "permission_error", "code": "secret-account",
+                                                 "message": "private conversation"}}).encode())
+        error = urllib.error.HTTPError("https://chatgpt.com", 403, "Denied",
+            {"Content-Type": "application/json; charset=utf-8", "x-request-id": "private-request"}, body)
+        info = self.m._cloud_error_diagnostics(error)
+        error.close()
+        self.assertEqual(body.assert_size, 8192)
+        self.assertEqual(info["structured_error_type"], "permission_error")
+        self.assertIsNone(info["structured_error_code"])
+        self.assertTrue(info["request_id_present"])
+        self.assertFalse(info["challenge_detected"])
+        self.assertNotIn("private", json.dumps(info))
+        self.assertNotIn("secret", json.dumps(info))
+
+    def test_cloudflare_headers_alone_do_not_establish_a_challenge(self):
+        for body, expected in ((b"denied", False), (b"<script src='/cdn-cgi/challenge-platform/a.js'>", True)):
+            error = urllib.error.HTTPError("https://chatgpt.com", 403, "Denied",
+                {"Content-Type": "text/html", "Server": "cloudflare", "cf-ray": "private"}, io.BytesIO(body))
+            self.assertEqual(self.m._cloud_error_diagnostics(error)["challenge_detected"], expected)
+            error.close()
+
+    def test_unavailable_tokens_do_not_render_empty_token_tables_or_four_windows(self):
+        report, _ = self.report(error=self.m.CloudUsageError("denied", http_status=403))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.m.record_cloud_snapshots(report, Path(tmp)/"cache.sqlite3", "account", datetime.now(timezone.utc))
+        for width in (80, 100, 144):
+            with patch.object(self.m.shutil, "get_terminal_size", return_value=os.terminal_size((width, 40))):
+                text = self.m.render_cloud_usage(report, details=True, wide=True)
+            self.assertNotIn("I/C/O", text)
+            self.assertNotIn("INPUT —", text)
+            self.assertNotIn("Cloud posting delta 7d", text)
+            self.assertEqual(text.count("Cloud observed change since previous observation:"), 1)
+            self.assertIn("effort xhigh", text)
+            for line in text.splitlines():
+                self.assertLessEqual(self.m.display_width(line), width)
+
+
+class CloudDenialCacheTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_module()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name)/"cloud.sqlite3"
+
+    def request(self, account="a", context="client", endpoint="query", sid="same", enabled=True):
+        return self.m._cloud_cached_request(Path(self.tmp.name), "/"+endpoint, {"thread_ids": [sid]},
+                                           self.path if enabled else None, account, context)
+
+    def test_expiry_request_scope_account_client_and_endpoint_isolation(self):
+        denied = self.m.CloudUsageError("denied", http_status=403, diagnostics={"content_type": "application/json"})
+        with patch.object(self.m, "_cloud_request", side_effect=denied) as network, patch.object(self.m.time, "time", return_value=1000):
+            with self.assertRaises(self.m.CloudUsageError): self.request()
+            with self.assertRaises(self.m.CloudUsageError) as hit: self.request()
+            self.assertEqual(network.call_count, 1)
+            self.assertTrue(self.m._cloud_endpoint_error(hit.exception)["cached"])
+            for kwargs in ({"account":"b"}, {"context":"new"}, {"endpoint":"query_v2"}, {"sid":"other"}):
+                with self.assertRaises(self.m.CloudUsageError): self.request(**kwargs)
+            self.assertEqual(network.call_count, 5)
+        with patch.object(self.m, "_cloud_request", return_value={"threads": []}) as network, \
+             patch.object(self.m.time, "time", return_value=1900):
+            self.assertEqual(self.request(), {"threads": []})
+            network.assert_called_once()
+
+    def test_no_cache_bypasses_existing_denial_and_writes_nothing(self):
+        self.path.mkdir()  # Unusable cache is also harmless to network reads.
+        with patch.object(self.m, "_cloud_request", return_value={"threads": []}) as network, \
+             patch.object(self.m, "_cloud_denial_record") as storage:
+            self.request(enabled=False)
+            storage.assert_not_called()
+            network.assert_called_once()
+        with patch.object(self.m, "_cloud_request", return_value={"threads": []}):
+            self.assertEqual(self.request(), {"threads": []})
+
+    def test_missing_rows_and_non_403_errors_do_not_cache_capability_denials(self):
+        for status in (None, 401, 404, 429, 500):
+            result = {"threads": []} if status is None else self.m.CloudUsageError("unavailable", http_status=status)
+            with patch.object(self.m, "_cloud_request", side_effect=[result, result]) as network:
+                for _ in range(2):
+                    if status is None: self.request()
+                    else:
+                        with self.assertRaises(self.m.CloudUsageError): self.request()
+                self.assertEqual(network.call_count, 2)
+
+    def test_auth_revision_invalidates_client_context_without_storing_credentials(self):
+        home = Path(self.tmp.name)
+        (home/"auth.json").write_text("private-login")
+        before = self.m._cloud_client_context(home)
+        (home/"auth.json").write_text("changed-private-login")
+        after = self.m._cloud_client_context(home)
+        self.assertNotEqual(before, after)
+        self.assertNotIn("private", after)
+
+    def test_reordered_inventory_reuses_denial_but_keeps_v2_live(self):
+        def request(home, path, body):
+            if path.endswith("/query"):
+                raise self.m.CloudUsageError("denied", http_status=403)
+            return {"threads": [{"thread_id": t["thread_id"], "data_status": "available"} for t in body["threads"]]}
+        with patch.object(self.m, "_cloud_request", side_effect=request) as network:
+            for ids in (("a", "b"), ("b", "a")):
+                report = self.m.read_cloud_usage(Path(self.tmp.name), [{"id": sid} for sid in ids], self.path, "account")
+            self.assertEqual(network.call_count, 3)
+            self.assertTrue(report["endpoint_errors"]["query"]["cached"])
+            self.assertEqual([r["data_status"] for r in report["sessions"]], ["available", "available"])
+
 
 class CloudSnapshotTests(unittest.TestCase):
     @classmethod
@@ -261,9 +375,11 @@ class CloudSnapshotTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "cloud.sqlite3"
         self.now = datetime(2026, 10, 18, 8, tzinfo=timezone.utc)
 
-    def record(self, value, ts, account="account-a", plan="pro", partial=False, selected=None):
+    def record(self, value, ts, account="account-a", plan="pro", partial=False, selected=None,
+               freshness=None, status="available", group_count=1):
         report = {"sessions": [{"session_id": "same", "title": "must-not-persist",
-            "data_status": "available", "weekly_limit_percent": value, "comparison_plan": plan,
+            "data_status": status, "weekly_limit_percent": value, "comparison_plan": plan,
+            "allowance_data_as_of": freshness, "allowance_groups": [{}] * group_count,
             "estimated_usage_credits_micros": value * 1_000_000 if value is not None else None,
             **{key: value for key in self.m.CLOUD_TOKEN_FIELDS},
             "token_fields_complete": {key: not partial for key in self.m.CLOUD_TOKEN_FIELDS}}]}
@@ -321,6 +437,59 @@ class CloudSnapshotTests(unittest.TestCase):
     def test_same_counter_is_known_zero_posting_delta(self):
         self.record(100, self.now - timedelta(minutes=20))
         self.assertEqual(self.metric(self.record(100, self.now))["value"], 0)
+
+    def test_stale_watermark_is_observation_coverage_not_execution_confirmation(self):
+        watermark = (self.now - timedelta(hours=2)).isoformat()
+        self.record(100, self.now - timedelta(hours=1), freshness=watermark)
+        report = self.record(100, self.now, freshness=watermark)
+        row = report["sessions"][0]
+        self.assertTrue(self.metric(report, "weekly_limit_percent")["complete_window"])
+        change = row["observed_change"]
+        self.assertFalse(change["freshness"]["allowance_watermark_advanced"])
+        self.assertIsNone(change["freshness"]["token_data_as_of"])
+        self.assertFalse(change["execution_time_attribution"])
+        self.assertEqual(row["snapshot_observed_at"], self.now.isoformat())
+        with closing(sqlite3.connect(self.path)) as db:
+            saved=json.loads(db.execute("SELECT counters FROM cloud_counter_snapshots ORDER BY observed_at DESC LIMIT 1").fetchone()[0])
+        self.assertEqual(saved["allowance_data_as_of"], watermark)
+
+    def test_availability_and_group_coverage_changes_break_allowance_comparison(self):
+        self.record(100, self.now - timedelta(minutes=40), status="partial")
+        report = self.record(110, self.now - timedelta(minutes=20))
+        metric = self.metric(report, "weekly_limit_percent")
+        self.assertIsNone(metric["value"])
+        self.assertIn("availability_changed", metric["unavailable_reasons"])
+        report = self.record(120, self.now, group_count=2)
+        self.assertIsNone(self.metric(report, "weekly_limit_percent")["value"])
+        self.assertIn("group_coverage_changed", self.metric(report, "weekly_limit_percent")["unavailable_reasons"])
+
+    def test_server_watermark_regression_breaks_allowance_comparison(self):
+        self.record(100, self.now - timedelta(minutes=20), freshness=self.now.isoformat())
+        report = self.record(120, self.now, freshness=(self.now-timedelta(hours=1)).isoformat())
+        self.assertIn("server_watermark_regressed", self.metric(report, "weekly_limit_percent")["unavailable_reasons"])
+
+    def test_latest_observation_beyond_seven_days_does_not_fill_recent_windows(self):
+        self.record(100, self.now - timedelta(days=10))
+        report = self.record(120, self.now)
+        self.assertEqual(report["sessions"][0]["observed_change"]["metrics"]["total_tokens"]["value"], 20)
+        self.assertIsNone(self.metric(report, window="7d")["value"])
+
+    def test_recent_change_does_not_reuse_an_older_interval_across_a_gap(self):
+        self.record(100, self.now - timedelta(minutes=40))
+        self.record(110, self.now - timedelta(minutes=20))
+        report = self.record(None, self.now)
+        self.assertIsNone(report["sessions"][0]["observed_change"]["metrics"]["total_tokens"]["value"])
+        self.assertEqual(self.metric(report)["value"], 10)
+        self.assertIn("comparable segments only, not net change", self.m.cloud_posting_text(report["sessions"][0]["posting_windows"]["1h"]))
+
+    def test_missing_context_reason_and_additive_csv_freshness(self):
+        self.record(100, self.now - timedelta(minutes=20), plan=None)
+        report = self.record(120, self.now, plan=None)
+        self.assertIn("comparison_context_missing", self.metric(report, "weekly_limit_percent")["unavailable_reasons"])
+        report["data_as_of"] = None
+        row = next(csv.DictReader(io.StringIO(self.m.render_cloud_usage(report, "csv"))))
+        self.assertEqual(row["snapshot_observed_at"], self.now.isoformat())
+        self.assertEqual(json.loads(row["observed_change_json"])["metrics"]["total_tokens"]["value"], 20)
 
     def test_account_isolation_and_changed_plan_percentages(self):
         self.record(100, self.now - timedelta(minutes=20))

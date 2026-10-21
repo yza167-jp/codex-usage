@@ -1,19 +1,19 @@
 # codex-usage
 
-## In development: Cloud tokens, tiers and observed posting deltas
+## v1.10.0: Cloud groups, capability status and observation history
 
-**v1.10.0 release is blocked:** the signed-in account returned HTTP 403 from
-the official `/query` interface on 2026-10-18. `/query_v2` worked for all three
-sampled sessions, with model/effort/speed groups but no tokens or estimated
-credits. Token parsing is covered by official-schema mocks; values appear only
-when the server supplies them. Access denial is explicit, never a zero.
+Cloud details now show model/effort/speed groups and available lifetime amounts
+without empty token tables. **Live verification on 2026-10-21:** `/query_v2`
+remains usable; a single-ID `/query` returns 403, and the installed official
+client returns `threadUsage: null` for both an existing Cloud and Local session.
+Tokens and server estimated credits remain conditional, not verified live features.
 
 ```bash
-codex-usage cloud --details       # Lifetime metrics, model/effort/speed, availability and posting windows
+codex-usage cloud --details       # Lifetime groups/status and change since the previous observation
 codex-usage 12h --cloud --wide     # Unified PROJECT/SESSION/SRC with separate measurement scopes
 codex-usage 24h --cloud --json     # Additive tokens, credit micros, completeness and posting_windows
 codex-usage cloud --csv           # Existing columns plus tokens, estimated credits, groups and windows
-codex-usage cloud --no-cache      # Disable Cloud snapshot reads/writes
+codex-usage cloud --no-cache      # Bypass denial cache and disable snapshot reads/writes
 ```
 
 When `/query` is available, input/cached/uncached/output/total tokens and server
@@ -22,13 +22,18 @@ Missing fields stay unknown; partial token sums use `+?` and per-field
 completeness flags. Server credit estimates remain separate from Local
 `CREDITS*`, lifetime allowance percentages and purchased/balance credits.
 
-Explicit Cloud queries save minimal cumulative snapshots. Subsequent queries
-can show `1h/12h/24h/7d` and selected-period **observed server posting deltas**,
-including coverage seconds. These are not execution-time usage: the first query
-has no history, only whole observation intervals inside each window count, and
-boundary-crossing intervals are never interpolated. Lifetime is never recent
-usage. No scheduled service is installed. Titles, content and credentials are
-not stored; existing token cache, rates and quota history are preserved.
+Explicit queries save minimal snapshots with separate observation and allowance
+update timestamps. Details show the latest observation interval; exports retain
+`1h/12h/24h/7d` windows, coverage, unknown time and discontinuity reasons. Changes
+are nonnegative differences in comparable segments, not execution-time usage or
+net consumption after corrections. No interpolation, lifetime-as-recent totals
+or scheduled service is used. Unchanged stale counters do not confirm no usage.
+
+**The live sample returned `comparison_plan: null` twice**, so its allowance
+change remains unknown even after two snapshots. Valid numeric differences are
+mock-tested, not claimed as live weekly accounting. HTTP 403 is cached for 15
+minutes per account, client context, endpoint and exact request; missing rows
+never disable an interface. No credentials, response bodies or titles are cached.
 
 Local queries remain offline; Cloud remains opt-in. Exact-ID matching still
 joins presentation only, with separate host/scope measurements and no combined

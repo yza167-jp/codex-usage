@@ -1,18 +1,18 @@
 # codex-usage
 
-## 开发中：Cloud tokens、档位与入账增量
+## v1.10.0：Cloud 分组、能力状态与观测历史
 
-**v1.10.0 暂缓发布：2026-10-18 当前账号的官方 `/query` 接口返回 HTTP 403。**
-已有 `/query_v2` 仍可读，3 个实测会话有模型／reasoning effort／speed 分组，但没有
-tokens 或 estimated credits。下面的 token 功能已用官方格式的 mock 回归验证，
-仅在服务端实际返回字段时显示；403 会明确提示，不会变成 0 或本地参考估值。
+Cloud 详情展示模型／reasoning effort／speed 分组及已知累计额度，隐藏空 token 表。
+**2026-10-21 实测：`query_v2` 仍可用，单 ID 的 `/query` 仍返回 403；桌面内置官方
+客户端对已有 Cloud、Local 会话均返回 `threadUsage: null`。** 累计 tokens 和服务端
+estimated credits 仅为条件可用的解析能力，不宣称当前账号已取得，也不把未知写成 0。
 
 ```bash
-codex-usage cloud --details       # 累计数据、模型/effort/speed、接口可用性和四个入账窗口
-codex-usage 12h --cloud --wide    # 统一 PROJECT/SESSION/SRC；本地时段与 Cloud 入账增量分开
+codex-usage cloud --details       # 累计分组、状态与上次观测以来的变化
+codex-usage 12h --cloud --wide    # 统一 PROJECT/SESSION/SRC；显示所选窗口实际可比覆盖
 codex-usage 24h --cloud --json    # tokens、原始 credits micros、完整性与 posting_windows
 codex-usage cloud --csv          # 旧字段保留，追加累计 tokens/estimated credits/分组/窗口
-codex-usage cloud --no-cache     # 查询但不读写 Cloud 快照
+codex-usage cloud --no-cache     # 绕过拒绝缓存，并禁用快照读写
 ```
 
 可用账号的 `/query` 累计 tokens 包括 input、cached input、uncached input、output、total。
@@ -20,11 +20,16 @@ codex-usage cloud --no-cache     # 查询但不读写 Cloud 快照
 `+?`，JSON 带逐字段完整性。**EST CREDITS** 保留服务端估算及原始百万分之一单位，
 与 Local **CREDITS\***、订阅 lifetime weekly %、购买／余额 credits 分开。
 
-普通 Local 命令仍离线；只有 `cloud` / `--cloud` 联网。每次显式 Cloud 查询默认保存
-最小累计快照，后续提供 `1h/12h/24h/7d` 和所选时段的**服务端统计入账观测增量**。
-首次查询没有历史；只计算两端均在窗口内的完整观测区间，显示覆盖秒数和部分覆盖，
-不插值、不把 lifetime 填入 12h/24h，也不等于任务执行时间。没有定时后台服务。
-快照不存标题、内容或凭证，不修改原 token cache、费率或 quota 记录。
+普通 Local 命令仍离线；只有 `cloud` / `--cloud` 联网。最小快照分别记录本机观测时间
+和服务端额度更新时间；默认只展示上次观测以来的变化，导出保留四个窗口、覆盖时间、
+未覆盖时间和断点原因。差分是**可比片段内的非负计数变化**，不等于执行时刻的消耗，
+发生统计修正后也不等于整个窗口的净变化。不插值、不把 lifetime 填入 12h/24h；旧
+统计未变化不代表已确认零消耗。没有定时后台服务，不修改 Local 费率或 quota 校准。
+
+**真实样本两次均返回 `comparison_plan: null`**，因此其额度差分继续显示未知。
+有效数值差分已用 mock 验证，尚未宣称当前账号可用。403 按账号、客户端环境、接口和
+具体请求缓存 15 分钟；单个会话缺数据不会禁用整个接口。缓存不保存凭证、原始响应
+或标题，已有 token cache 和历史均保留。真实 Fast 样本仍未验证。
 
 同 ID 仍只合并展示，不重复加总；JSON/CSV 保留独立 host/scope。
 详见[实测、字段语义与时间窗口限制](docs/cloud-token-usage.md)。

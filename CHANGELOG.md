@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased — Cloud usage capability work (v1.10.0 blocked)
+## 1.10.0 — 2026-10-21
 
 - Add the official bounded `/query` request and token/estimated-credit parser alongside `/query_v2`; retain usable metrics when either endpoint is denied, unsupported or unavailable. Stop querying a failed interface for the remaining batches.
 - Preserve integer token counters and credit micros, algebraically derive only supported missing totals, mark partial or inconsistent fields, and expose model/effort/speed groups using existing model names and price order.
 - Add Cloud token/EST CREDITS details and additive JSON/CSV fields while keeping exact-ID presentation joins, separate scopes, local totals, 144-cell widths, local rates/Fast/quota policy and offline defaults.
-- Save minimal account-scoped Cloud counter snapshots on explicit queries, separately from the local token index. Report only whole-interval observed posting increments for 1h/12h/24h/7d and selected periods; keep coverage, gaps, decreases and unknowns explicit. No background monitoring or historical reconstruction.
-- Live read-only verification found `/query_v2` usable for three existing sessions, but `/query` returned HTTP 403. No real token/estimated-credit availability is claimed; version remains 1.9.1 pending resolution and live confirmation.
+- Cache HTTP 403 for 15 minutes per account/client/endpoint/exact request, with expiry and `--no-cache` bypass. Keep only allowlisted error categories, response type and challenge/request-ID presence; never store response bodies or credentials.
+- Save minimal account-scoped Cloud snapshots separately from the local index, including observation time, allowance freshness, comparison context, data status and group counts. Default to change since the preceding observation; retain whole-interval 1h/12h/24h/7d/selected-window exports with coverage and unknown time. Mark corrections, status/group changes and regressions; never claim execution-time or corrected net consumption. No background monitoring or historical reconstruction.
+- Hide empty token tables while preserving useful model/effort/speed and lifetime allowance groups. Keep token/estimated-credit parsing conditional on real returned fields.
+- Bounded live diagnosis used five active usage calls: fixed-metadata v2 twice, single-ID `/query` once, official bundled-client RPC for one existing Cloud and one used Local session. `/query` returned JSON HTTP 403; both RPCs returned `threadUsage: null`. V2 remained available but `comparison_plan` was null and its watermark unchanged, so live allowance differences remain unknown. Release verified groups/status/export/snapshot safeguards without claiming live tokens, estimated credits, Fast validation or exact time windows.
 
 ## 1.9.1 — 2026-10-18
 
